@@ -13,7 +13,7 @@ for every plugin here.
 
 ```bash
 # once per machine
-claude plugin marketplace add cjleaird/agent-marketplace
+claude plugin marketplace add StreakBank/agent-marketplace
 
 # per plugin — user scope (all projects on this machine)
 claude plugin install android-device@agent-marketplace
