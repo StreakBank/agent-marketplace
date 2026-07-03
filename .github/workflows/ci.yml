@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  admission-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Coupling + manifest gate
+        run: sh scripts/check-coupling.sh
+
+      - name: Shellcheck plugin + repo scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find . -name '*.sh' -not -path './.git/*' -print0 \
+            | xargs -0 shellcheck -S warning
+
+      - name: Validate JSON manifests
+        run: |
+          find . \( -name 'plugin.json' -o -name 'marketplace.json' \) -not -path './.git/*' -print0 \
+            | xargs -0 -I{} sh -c 'python3 -m json.tool "{}" >/dev/null && echo "ok {}"'

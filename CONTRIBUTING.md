@@ -85,7 +85,32 @@ before it enters this repo, and re-scanned on every refresh.
 - The README quickstart must make sense to a stranger with none of the authoring
   project's context.
 
-## 8. Validation before merge
+## 8. Feeding learnings back (the compounding loop)
+
+Plugins improve by *use*, not just at authoring time — this is the return edge that
+makes learnings compound across projects instead of dying in whatever project
+happened to hit the gotcha. When a session (in ANY consuming project) discovers a
+**generic** fact about a plugin's tool — a new CLI gotcha, a flag that behaves
+differently than documented, an installer bug, a better protocol — it belongs in the
+**plugin**, not in the consuming project's notes:
+
+1. Clone the marketplace if it isn't already local: `gh repo clone StreakBank/agent-marketplace`.
+2. Edit the owning plugin's `SKILL.md` (behavior/protocol), `scripts/` (installer/tool
+   bug), or `PROVENANCE.md` (validation/version facts).
+3. Bump the plugin's `plugin.json` semver + add a `CHANGELOG.md` line.
+4. Run `scripts/check-coupling.sh <plugin>` and push. CI re-gates on merge.
+
+The discriminator is the same core/shim test (§1): if the learning is true for any
+project using the tool, it's generic → upstream to the plugin. If it's true only for
+this project (which AVD, which package, an ownership ruling), it's a **shim** fact →
+it stays in the consuming project's `.claude/rules/` and never comes here.
+
+A consuming project that captures agent learnings in its own always-loaded knowledge
+file (e.g. a `.claude/agent-learnings.md`) should carry a carve-out telling sessions
+to route generic tool learnings here instead of into the project silo — otherwise the
+force-loaded "log it locally" instruction silently swallows every generic discovery.
+
+## 9. Validation before merge
 
 - Run the grep test (§1).
 - Exercise every documented command against a real target (device, emulator, repo —

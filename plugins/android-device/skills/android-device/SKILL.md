@@ -155,4 +155,15 @@ fast, and versioned.
   emulator before debugging the app.
 - Projects typically carry their own policy for which device/AVD to use and
   how this tool divides labor with other device tooling — check the project's
-  rules before assuming defaults.
+  rules before assuming defaults. If the project has no such rule yet, offer to
+  create one from `$CLAUDE_PLUGIN_ROOT/SHIM-TEMPLATE.md` (canonical AVD,
+  ownership boundary, journeys policy).
+
+## Improving this skill
+
+If you discover a **generic** fact about the Android CLI while using this skill
+— a gotcha, a flag that behaves differently than documented, an installer bug
+— it belongs in THIS plugin, not in the project's notes. Upstream it to the
+marketplace (`gh repo clone StreakBank/agent-marketplace`; edit this SKILL.md /
+`scripts/` / `PROVENANCE.md`; bump semver + CHANGELOG; push). Project-specific
+facts (which AVD, which package, ownership rulings) stay in the project shim.

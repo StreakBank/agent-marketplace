@@ -44,10 +44,30 @@ sha256() {
   else sha256sum "$1" | cut -d' ' -f1; fi
 }
 
-# Already installed at the pinned version?
+# Is $1 the Android AGENT CLI (not the deprecated SDK tools/ `android` avdmanager
+# shim, which also lives on many PATHs)? The agent CLI answers --version with a
+# dotted numeric version; the old SDK tool errors or prints a usage banner.
+is_agent_cli() {
+  v="$("$1" --version 2>/dev/null | head -1 || true)"
+  case "$v" in
+    [0-9]*.[0-9]*.[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Already installed at the pinned version? Only trust a binary that IS the agent CLI.
 EXISTING=""
-if command -v android >/dev/null 2>&1; then EXISTING="$(command -v android)"
-elif [ -x "$DEST" ]; then EXISTING="$DEST"; fi
+if command -v android >/dev/null 2>&1 && is_agent_cli "$(command -v android)"; then
+  EXISTING="$(command -v android)"
+elif [ -x "$DEST" ] && is_agent_cli "$DEST"; then
+  EXISTING="$DEST"
+fi
+# Warn if PATH has an `android` that is NOT the agent CLI — the skill resolves PATH
+# first, so a stale SDK tool there would shadow the one we install.
+if command -v android >/dev/null 2>&1 && ! is_agent_cli "$(command -v android)"; then
+  echo "warning: '$(command -v android)' on PATH is NOT the Android agent CLI (likely the deprecated SDK tool)." >&2
+  echo "         installing the agent CLI to ${DEST}; invoke it explicitly or put ${DEST_DIR} ahead on PATH." >&2
+fi
 if [ -n "$EXISTING" ] && [ "$FORCE" -eq 0 ]; then
   CURRENT_VERSION="$("$EXISTING" --version 2>/dev/null | head -1 || true)"
   if [ "$CURRENT_VERSION" = "$PINNED_VERSION" ]; then
@@ -86,19 +106,31 @@ if [ "$ALLOW_METRICS" -eq 0 ]; then
   fi
 fi
 
-# First run bootstraps the payload into ~/.android/{bin,cli}.
+# First run bootstraps the payload (main.jar + a bundled JRE) into ~/.android/{bin,cli}.
+# NOTE: only the ~3.6 MB launcher is SHA-pinned. The launcher fetches its payload on
+# first run; whether that payload is launcher-version-locked or floats to latest is
+# NOT controlled here (see PROVENANCE.md § "Pin scope"). We record the resolved
+# launcher version + the on-disk payload bundle id so drift is at least auditable.
 "$DEST" --version >/dev/null 2>&1 || true
+LAUNCHER_VERSION="$("$DEST" --version 2>/dev/null | head -1 || echo unknown)"
+BUNDLE_ID="$(ls -1 "${HOME}/.android/cli/bundles" 2>/dev/null | head -1 || echo none)"
 
 RECEIPT="${HOME}/.android/cli-install-receipt.txt"
 mkdir -p "${HOME}/.android"
 {
-  echo "version: ${PINNED_VERSION}"
+  echo "pinned_version: ${PINNED_VERSION}"
+  echo "launcher_version: ${LAUNCHER_VERSION}"
+  echo "payload_bundle_id: ${BUNDLE_ID}"
   echo "platform: ${PLATFORM}"
   echo "url: ${URL}"
-  echo "sha256: ${ACTUAL_SHA}"
+  echo "launcher_sha256: ${ACTUAL_SHA}"
   echo "installed_to: ${DEST}"
   echo "installed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$RECEIPT"
+
+if [ "$LAUNCHER_VERSION" != "$PINNED_VERSION" ] && [ "$LAUNCHER_VERSION" != "unknown" ]; then
+  echo "warning: installed launcher reports ${LAUNCHER_VERSION}, pin is ${PINNED_VERSION} — investigate before trusting" >&2
+fi
 
 echo "installed android CLI ${PINNED_VERSION} -> ${DEST} (receipt: ${RECEIPT})"
 case ":${PATH}:" in

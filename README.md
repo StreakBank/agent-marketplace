@@ -24,8 +24,37 @@ claude plugin install android-device@agent-marketplace --scope project
 
 Then write your project's shim: a short rule in your project's `.claude/rules/`
 stating the project facts and policies the generic skill deliberately doesn't know
-(e.g. which AVD is your e2e device, how the plugin divides labor with your other
-device tooling).
+(e.g. which AVD is your test device, how the plugin divides labor with your other
+device tooling). Plugins that need a shim ship a `SHIM-TEMPLATE.md` to copy.
+
+If `claude plugin marketplace add StreakBank/agent-marketplace` fails on a machine
+without SSH keys (the CLI may resolve a github repo over SSH), register the https URL
+explicitly instead: `claude plugin marketplace add https://github.com/StreakBank/agent-marketplace.git`.
+
+### Fresh-machine bootstrap
+
+The two commands above, plus — once, per machine — anchor the authoring discipline so
+sessions in *any* project know these plugins exist and how new tooling should be
+built. Add ~5 lines to `~/.claude/CLAUDE.md` (user-level, loads in every project):
+
+```
+## Reusable agent tooling
+New Claude plugins/skills/CLIs are built for cross-project reuse: generic core in a
+marketplace (StreakBank/agent-marketplace; cmp-marketplace for CMP) + a thin project
+shim in .claude/rules/. Full discipline + the learning-return loop:
+~/.claude/plugins/marketplaces/agent-marketplace/CONTRIBUTING.md (cloned by install).
+Writable clone to contribute: gh repo clone StreakBank/agent-marketplace.
+```
+
+The pointer target is cloned onto every machine by the install, so it resolves
+everywhere the marketplace is registered.
+
+### Contributing back
+
+Plugins compound by use. A **generic** discovery about a plugin's tool goes back into
+the plugin (see [CONTRIBUTING §8](CONTRIBUTING.md)); project-specific facts stay in
+your shim. This return edge is the point — learnings don't die in whatever project
+first hit them.
 
 ## Plugins
 

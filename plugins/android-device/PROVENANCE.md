@@ -30,9 +30,27 @@
   is derived from `references/interact.md` at the commit above; refresh by
   diffing that file against the recorded commit.
 
-## Empirical basis
+## Pin scope (what the SHA-256 actually covers)
 
-Command set, timings, and cautions (blocking start ~15 s warm, `layout --diff`
-context savings, `describe` Gradle injection, annotation noise, journeys
-verdict) were established by an empirical trial against a live emulator +
-debug APK on 2026-07-03, CLI version `1.0.15498356`.
+The pinned + checksummed artifact is **only the ~3.6 MB launcher binary**. On first
+run the launcher fetches its payload (`main.jar` + a bundled JRE) into
+`~/.android/cli/bundles/<id>/`. Whether that payload is locked to the launcher
+version or floats to latest is **not controlled by this plugin** and was not
+verifiable without a clean host (on the trial machine the pinned launcher reused the
+already-present bundle `d0f57656…`). Consequence: the pin guarantees a reproducible
+*launcher*, not a fully reproducible *toolchain*. The installer records the resolved
+launcher version + on-disk bundle id in `~/.android/cli-install-receipt.txt` so drift
+is auditable; treat a changed bundle id across installs as a re-validate signal. The
+`docs` knowledge base is likewise a server-fetched, evolving corpus, not pinned.
+
+## Validation + revalidation
+
+- **Validated:** 2026-07-03, launcher `1.0.15498356`, live emulator + debug APK.
+  Command set, timings, and cautions (blocking start ~15 s warm, `layout --diff`
+  context savings, `describe` Gradle injection, annotation noise, journeys verdict,
+  `screen resolve --screenshot` flag, no `--device` on `screen`, grouped `--diff`).
+- **Revalidate by / on:** the next launcher pin bump, or if the bundle id changes, or
+  ~2026-10 (quarterly) — whichever first. Revalidation = re-run the documented command
+  set against a live device, update timings/cautions, then re-pin.
+- **Upstream refresh (`android/skills`):** diff `devtools/android-cli/references/interact.md`
+  at HEAD against recorded commit `07302ca…`; re-derive the protocol if it moved.

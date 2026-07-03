@@ -42,11 +42,27 @@ also install one via `android sdk`, which this skill leaves to you).
 ## Project shim
 
 This plugin knows *how* to drive Android devices; it deliberately doesn't know *your*
-project. Add a short rule to your project's `.claude/rules/` covering: which AVD is
-your canonical test device, where this tool's ownership ends if you run other device
-tooling (e.g. an MCP server that owns iOS or crash logs), and your policy on
-model-judged tests (journeys are out of scope here and shouldn't silently become a QA
-gate). Keep it thin — state facts and policy, don't restate this skill's mechanics.
+project. Add a short rule to your project's `.claude/rules/` — copy
+[`SHIM-TEMPLATE.md`](SHIM-TEMPLATE.md) and fill in the four facts it lists:
+
+1. **Canonical device** — which AVD is your test device, identified by name (serials
+   drift by boot order).
+2. **Ownership boundary** — where this tool's job ends if you run other device tooling
+   (e.g. an MCP server that owns iOS, crash logs, or typing).
+3. **Journeys policy** — whether model-judged journeys may be used, and the explicit
+   statement that they are not a regression gate.
+4. **Build/deploy facts** — package id + debug APK path, IF not already stated in your
+   project's top-level context; don't duplicate a fact your `CLAUDE.md` already owns.
+
+Keep it thin — state facts and policy, don't restate this skill's mechanics. If a
+project has no such rule yet, offer to create one from the template.
+
+## Improving this plugin
+
+Found a *generic* fact about the Android CLI while using this skill — a gotcha, a flag
+that behaves differently than documented, an installer bug? It belongs **here**, not
+in your project's notes: see the marketplace [CONTRIBUTING §8](../../CONTRIBUTING.md)
+for the return path. Project-specific facts stay in your shim.
 
 ## Scope boundaries
 

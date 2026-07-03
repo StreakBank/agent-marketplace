@@ -1,6 +1,6 @@
 {
   "name": "android-device",
   "description": "Android emulator + device control and offline Android/Compose docs search, via the pinned Android agent CLI — AVD lifecycle (blocking start/stop/list), UI layout inspection with change diffs, annotated screenshots with label→coordinate resolution, one-command APK install+launch, and a local documentation knowledge base.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": { "name": "StreakBank" }
 }
