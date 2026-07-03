@@ -22,6 +22,12 @@ grep -rE '\.claude/(rules|skills)/[a-z0-9._-]+' plugins/<name>/  # zero NAMED pr
 (Telling the consumer "write a shim in your project's `.claude/rules/`" is fine —
 that's the discipline. Citing a *named* rule file is coupling.)
 
+**Exempt from the grep test:** the hosting org's name in repo-address lines of
+install docs (`claude plugin marketplace add <org>/agent-marketplace` must name the
+org) and `author`/`owner` attribution fields in `.claude-plugin/*.json`. Those are
+distribution metadata, not content. Everything the model reads as instructions —
+SKILL.md, scripts, references, PROVENANCE — gets zero exemptions.
+
 Instance identifiers are the subtle case: an emulator serial, an AVD name, an
 applicationId are project facts even when they look like tool arguments. The core
 writes `<avd>` / `<serial>` / `<applicationId>`; the caller supplies values.
