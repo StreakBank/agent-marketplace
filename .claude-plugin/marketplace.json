@@ -1,0 +1,17 @@
+{
+  "name": "agent-marketplace",
+  "owner": {
+    "name": "cjleaird"
+  },
+  "metadata": {
+    "description": "General-purpose Claude Code plugins built to the core/shim reusability discipline — generic cores with zero project coupling; project policy lives in thin shims on the consuming side",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "android-device",
+      "source": "./plugins/android-device",
+      "description": "Android emulator + device control and offline Android/Compose docs search via the pinned Android agent CLI — AVD lifecycle, UI layout diffs, annotated screenshots, one-command APK deploy"
+    }
+  ]
+}
