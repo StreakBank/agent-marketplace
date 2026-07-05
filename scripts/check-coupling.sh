@@ -40,10 +40,18 @@ for p in $PLUGINS; do
     \( -name '*.md' -o -path '*/skills/*' -o -path '*/scripts/*' -o -path '*/references/*' \) \
     -not -path '*/.git/*' | sort -u)"
 
-  # Carve-out (CONTRIBUTING §1): the hosting org's name is allowed in repo-address
-  # lines (clone/install addresses reference the marketplace's own repo). Strip those
-  # lines before the project-name grep. Repo-address lines are recognized by the
-  # marketplace's own slug appearing on them.
+  # Carve-out (CONTRIBUTING §1): distribution metadata is not model-facing content.
+  # Two kinds, handled differently:
+  #  (a) whole install/clone lines — the marketplace's own slug + clone/install verbs.
+  #      Dropped whole via ADDR_RE (case-insensitively).
+  #  (b) attribution / schema URLs (any scheme:// URL, and bare github.com /
+  #      raw.githubusercontent.com hosts) — only the URL TOKEN is exempt, so a plugin's
+  #      own repo/schema URL may name the org while coupling PROSE sharing that SAME
+  #      physical line is still caught. Blanked per-token (case-folded) before the name
+  #      grep, NOT dropped as a whole line.
+  # The name grep is case-INSENSITIVE, so mixed-case "StreakBank" in prose is caught;
+  # the URL blanking folds case identically so a "GitHub.com" attribution URL is not
+  # spuriously flagged.
   ADDR_RE='(agent-marketplace(\.git)?|repo clone |marketplace add )'
 
   # *TEMPLATE* files are shim templates by design — they legitimately show shim SHAPE,
@@ -51,7 +59,11 @@ for p in $PLUGINS; do
   # named-rule-ref check (but NOT from project-name / absolute-path checks; a template
   # must still never hardcode a real project name or a real /Users path).
   scan_no_addr() { printf '%s\n' "$content_files" | while IFS= read -r f; do
-    [ -n "$f" ] && grep -InE "$1" "$f" 2>/dev/null | grep -vE "$ADDR_RE" | sed "s|^|$f:|"
+    [ -n "$f" ] && sed -E \
+        -e 's#[A-Za-z][A-Za-z0-9+.-]*://[^ )"]*##g' \
+        -e 's#[Gg]it[Hh]ub\.com/[^ )"]*##g' \
+        -e 's#[Rr]aw\.[Gg]ithubusercontent\.com/[^ )"]*##g' \
+        "$f" 2>/dev/null | grep -IniE "$1" | grep -viE "$ADDR_RE" | sed "s|^|$f:|"
   done; }
 
   # 1) project names (case-insensitive) in content, excluding repo-address lines

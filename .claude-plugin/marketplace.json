@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "General-purpose Claude Code plugins built to the core/shim reusability discipline — generic cores with zero project coupling; project policy lives in thin shims on the consuming side",
-    "version": "0.2.0"
+    "version": "0.2.1"
   },
   "plugins": [
     {

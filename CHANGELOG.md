@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.1 — 2026-07-04
+
+### Fixed — coupling admission gate
+- **`scripts/check-coupling.sh`** — the project-name grep is now case-INSENSITIVE
+  (`grep -IniE`), so a mixed-case brand name in prose (`StreakBank`, `LadderPicks`) is
+  caught, not just the lowercase spelling. Attribution/schema URLs are exempted by
+  blanking only the URL TOKEN (any `scheme://` URL + bare `github.com` /
+  `raw.githubusercontent.com` hosts, case-folded) before the grep — so a plugin's own
+  repo/schema URL may name the org while coupling PROSE sharing that line is still
+  caught, and a capitalized `GitHub.com` URL is not spuriously flagged. (Same fix as
+  cmp-marketplace 2.12.0; surfaced by the cmp-arch-gates adversarial audit.)
+
 ## 0.2.0 — 2026-07-03
 
 Hardening from the adversarial reuse-path audit (same day).
