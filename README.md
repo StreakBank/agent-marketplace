@@ -61,6 +61,7 @@ first hit them.
 | Plugin | What it does |
 |---|---|
 | [`android-device`](plugins/android-device/) | Android emulator + device control and offline Android/Compose docs search via the pinned Android agent CLI: blocking AVD start/stop/list, UI layout inspection with change diffs (`layout --diff`), annotated screenshots with label→coordinate resolution, one-command APK install+launch, local docs knowledge base. |
+| [`migration-harness`](plugins/migration-harness/) | Staged, ledger-tracked codebase migrations: discover → classify (mechanical vs judgment) → batch-escalate contested decisions behind a mechanical block-until-signed-off gate → fan out transforms over partitioned file sets → verify each site mechanically → gate completion. Ships a zero-dep ledger CLI + the extracted stage spine, recipe contract, and escalation-packet format. |
 
 ## Versioning
 

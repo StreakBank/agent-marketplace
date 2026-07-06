@@ -1,0 +1,6 @@
+{
+  "name": "migration-harness",
+  "description": "Staged, ledger-tracked codebase migrations — discover sites, classify mechanical vs judgment, batch-escalate contested decisions with a mechanical block-until-signed-off gate, fan out transforms over partitioned file sets, verify each site mechanically, and gate completion. Use when migrating many call sites/modules/configs to a new invariant: rename or removal sweeps, boundary re-authoring, config reconciliation, visibility sweeps.",
+  "version": "0.1.0",
+  "author": { "name": "StreakBank" }
+}

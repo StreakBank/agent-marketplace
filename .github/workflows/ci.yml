@@ -24,3 +24,13 @@ jobs:
         run: |
           find . \( -name 'plugin.json' -o -name 'marketplace.json' \) -not -path './.git/*' -print0 \
             | xargs -0 -I{} sh -c 'python3 -m json.tool "{}" >/dev/null && echo "ok {}"'
+
+      - name: Node unit tests (plugin scripts)
+        run: |
+          tests=$(find plugins -name '*.test.mjs' -not -path '*/node_modules/*')
+          if [ -n "$tests" ]; then
+            # shellcheck disable=SC2086
+            node --test $tests
+          else
+            echo "no *.test.mjs found — skipping"
+          fi

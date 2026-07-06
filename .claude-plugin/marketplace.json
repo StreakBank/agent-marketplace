@@ -5,13 +5,18 @@
   },
   "metadata": {
     "description": "General-purpose Claude Code plugins built to the core/shim reusability discipline — generic cores with zero project coupling; project policy lives in thin shims on the consuming side",
-    "version": "0.2.1"
+    "version": "0.3.0"
   },
   "plugins": [
     {
       "name": "android-device",
       "source": "./plugins/android-device",
       "description": "Android emulator + device control and offline Android/Compose docs search via the pinned Android agent CLI — AVD lifecycle, UI layout diffs, annotated screenshots, one-command APK deploy"
+    },
+    {
+      "name": "migration-harness",
+      "source": "./plugins/migration-harness",
+      "description": "Staged, ledger-tracked codebase migrations — discover/classify sites, batch-escalate contested decisions behind a mechanical block-until-signed-off gate, fan out transforms over partitioned file sets, verify each site mechanically, gate completion"
     }
   ]
 }
