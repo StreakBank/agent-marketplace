@@ -62,6 +62,7 @@ first hit them.
 |---|---|
 | [`android-device`](plugins/android-device/) | Android emulator + device control and offline Android/Compose docs search via the pinned Android agent CLI: blocking AVD start/stop/list, UI layout inspection with change diffs (`layout --diff`), annotated screenshots with label→coordinate resolution, one-command APK install+launch, local docs knowledge base. |
 | [`migration-harness`](plugins/migration-harness/) | Staged, ledger-tracked codebase migrations: discover → classify (mechanical vs judgment) → batch-escalate contested decisions behind a mechanical block-until-signed-off gate → fan out transforms over partitioned file sets → verify each site mechanically → gate completion. Ships a zero-dep ledger CLI + the extracted stage spine, recipe contract, and escalation-packet format. |
+| [`audit-fleet`](plugins/audit-fleet/) | Adversarial verification for an audit or measurement fan-out, as a dynamic workflow: per lane, one finder (mandatory coverage manifest) → two independent, mutually blind default-REFUTE skeptics whose brief is to kill each finding → one promoter per money-path or legal-obligation refutation, dispatched to overturn it. Ships the finder/skeptic brief template and the measured cost, verification-mix and blind-reader lessons from the run it was extracted from. |
 
 ## Versioning
 

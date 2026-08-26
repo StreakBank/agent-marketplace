@@ -35,10 +35,13 @@ for p in $PLUGINS; do
   [ -d "$dir" ] || { echo "FAIL[$p]: no such plugin dir ($dir)"; fail=1; continue; }
 
   # Model-facing content = everything EXCEPT the manifest json (author/owner exempt).
-  # We scan skills/, scripts/, references/, PROVENANCE.md, README.md, and any *.md.
+  # Enumerated by EXCLUSION, not by an allow-list of known subdirs: an allow-list of
+  # skills/scripts/references silently skipped whole content types as plugin layouts
+  # grew (workflows/*.js prompt text and hooks/*.sh were unscanned until 0.4.0 — a
+  # planted coupling string in a workflow passed the gate). Anything a plugin ships
+  # that is not the manifest is model-facing until proven otherwise.
   content_files="$(find "$dir" -type f \
-    \( -name '*.md' -o -path '*/skills/*' -o -path '*/scripts/*' -o -path '*/references/*' \) \
-    -not -path '*/.git/*' | sort -u)"
+    -not -path '*/.claude-plugin/*' -not -path '*/.git/*' | sort -u)"
 
   # Carve-out (CONTRIBUTING §1): distribution metadata is not model-facing content.
   # Two kinds, handled differently:

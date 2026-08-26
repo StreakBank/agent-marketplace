@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0 — 2026-08-26
+
+### New plugin — audit-fleet 0.1.0
+- **`plugins/audit-fleet/`** — adversarial verification for an audit/measurement
+  fan-out. Ships one dynamic workflow, `lens-triple-audit`: per lane, one **finder**
+  (mandatory coverage manifest — `files_examined: 0` is a failure, not a result) → two
+  independent, mutually blind **default-REFUTE skeptics** whose brief is to kill each
+  finding, not grade it → one **promoter** per money-path or legal-obligation
+  refutation, whose brief is to overturn it (a refutation on those surfaces is itself a
+  decision, so it gets an adversary too). Lanes pipeline independently; the two-skeptic
+  barrier is within a lane only.
+- **Extracted, not invented.** The script is byte-for-byte the workflow that ran a
+  production standing-tree audit fleet, with exactly two edits — both citations of an
+  internal planning document, generalized to statements of the same rule (2 changed
+  lines of 46; diff recorded in `PROVENANCE.md`). Every project-shaped input already
+  travelled through `args` (`lanes`, `briefsPath`, `outDir`, `contextNote`), so the
+  extraction needed no parameterization work.
+- **`BRIEFS-TEMPLATE.md`** — the generic `§A FINDER` / `§B SKEPTIC` skeletons the
+  workflow points `briefsPath` at, plus `§C`, the calling session's synthesis gate.
+  Without it the plugin would be unusable by a stranger; with it the core is complete
+  with no shim.
+- **The lessons are the payload.** README records the **blind-reader ordering defect**
+  (a skeptic brief whose "read the finder's report" step preceded its scoring step
+  voided a multi-reader criterion **fleet-wide** — hand skeptics the drawn list
+  separately, score before the report is opened, never a finder's report before
+  scoring); the seeded-draw rejection rule (`printf` not `echo`; reject a degenerate
+  modulus); and that a **diff-derived verification mix does not transfer to a
+  standing-tree audit** (66/29/6/0 measured on diffs vs **32.6/49.4/15.7/2.2** measured
+  over 178 standing-tree verdict slots).
+- **Measured cost: ≈0.9M subagent tokens per lane triple on Opus** — 31 agents /
+  8,112,759 subagent tokens on the validating run. A ~0.55M diff-derived estimate
+  under-predicted by ~40%; the README says so, because a fleet sized from the low number
+  runs out of budget mid-campaign.
+- **Known gaps, documented not hidden (0.1.0):** no argument validation (a malformed
+  `args` fails with a raw `TypeError`, and there is no traversal/flag guard on
+  `briefsPath` / `outDir` before they reach prompts), and `args` is assumed pre-parsed.
+  Shipped as validated rather than hardened-in-flight; queued for 0.1.1.
+
+### Fixed — coupling gate was blind to whole content types
+- **`scripts/check-coupling.sh`** now enumerates model-facing content by **exclusion**
+  (everything under a plugin except `.claude-plugin/`) rather than by an allow-list of
+  `skills/` + `scripts/` + `references/` + `*.md`. The allow-list silently skipped
+  content types as plugin layouts grew: `workflows/*.js` (whose prompt strings are pure
+  model-facing instruction) and `hooks/*.sh` were **entirely unscanned**. Verified by
+  positive control — a planted `streakbank` / `/Users/` / named-rule string in a
+  workflow file **passed** the old gate and **fails** the new one on all three checks.
+  All three existing plugins stay clean under the wider scan.
+
 ## 0.3.0 — 2026-07-06
 
 ### New plugin — migration-harness 0.1.0
