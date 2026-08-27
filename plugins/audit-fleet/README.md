@@ -76,7 +76,9 @@ skeptics and fans out one promoter per id.
       "units":    "<what this lane covers>",   // your ledger aliases / ids
       "paths":    "<the paths the finder must read>",
       "loc":      7592,                        // tracked source LOC — sizes the manifest expectation
-      "criteria": "1,2,3,7,8,9,11",            // which of YOUR bar's criteria this lane grades
+      "criteria": "1,2,3,7,8,9,11",            // which of YOUR bar's criteria this lane grades.
+                                               //   ENUMERATE them: blindProtocol matches whole
+                                               //   tokens, so a range ("1-9") silently misses.
       "baseSha":  "9c4d3cf",                   // frozen base; every citation is against this
       "note":     "optional per-lane note"     // thresholds, the governing rule, a known trap
     }
@@ -147,7 +149,17 @@ lane's own unit — a unit split across lanes draws per half and is graded per h
 because neither half's skeptics can enumerate the other half's files to reproduce a union
 draw blind.
 
-Omit `blindProtocol` and the pipeline is byte-for-byte the one that shipped in 0.1.0.
+`blindProtocol.criteria` is matched as **whole tokens** against `lanes[].criteria` (both
+split on non-alphanumerics), so `"7"` fires on a lane grading `"1,2,3,7"` and not on one
+grading `"17,27"`. The corollary is a caller obligation: a lane must **enumerate** its
+criteria. A lane that writes them as a range or a shorthand — `"1-9"`, `"all"` — will
+**silently skip the blind stage**, because no token in it equals `7`. Silently: there is
+no warning, and that criterion is then scored non-blind.
+
+Omit `blindProtocol` and the blind stage is absent and the stage graph is 0.1.0's. The
+emitted prompts are 0.1.0's but for one word — 0.1.1 points the finder at "your
+register's row schema" where 0.1.0 named an artifact only the authoring project had (see
+`PROVENANCE.md`) — and `args` that 0.1.0 accepted malformed now throw.
 
 ## Lessons the shape is built on
 
