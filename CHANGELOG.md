@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.4.1 — 2026-08-26
+
+### audit-fleet 0.1.1 — the blind-reader protocol is now enforced, not just documented
+
+- **`blindProtocol` (optional arg).** 0.1.0 shipped the blind-reader ordering defect as a
+  README *lesson*: if a criterion is scored by several readers, a skeptic brief that says
+  "read the finder's report" before it says "score" voids every such column. A lesson in a
+  README is only as good as the brief someone writes from it — so the ordering is now in
+  the prompts the workflow emits. Declare
+  `{ criteria, dimensions, poolPredicate, scale?, drawCount?, poolScope?, multiplier?,
+  fallbackMultiplier? }` and, for each lane whose `criteria` include one of yours:
+  - the **finder** is told it is reader 1 of three, writes the seeded draw to
+    `30-finder-<lane>-draw.md` (seed string, `H` in **hex and decimal**, `M`, the pool
+    predicate stated mechanically, the enumeration command it actually ran, the
+    `<multiplier> mod M ∉ {0,1}` degeneracy check with the fallback declared if used,
+    every index, the drawn `file:line item` list — and **nothing** about scores) and its
+    own column to `30-finder-<lane>-scores.md`; every score, sub-score, aggregate and
+    median is **banned from its main report and final text** (a *finding* is not a score);
+  - each **skeptic** gets a **STEP 0 that precedes opening the finder's report**: open
+    only the draw file, reproduce `H`/`M`/the indices, score blind from source, write
+    `31-skeptic-<lane>-<k>-scores.md` carrying the literal line
+    `scored before reading any report` — then, and only then, read the report, with no
+    revision of the step-0 numbers. Skeptic 2 also reproduces the draw byte-for-byte; a
+    draw that does not reproduce **invalidates the sample** rather than licensing a
+    substitute. A skeptic that read anything first declares its column **VOID** — void is
+    recoverable, contaminated silently corrupts the median.
+  - the skeptic's returned data gains `BLIND: clean` / `BLIND: VOID — <why>` (and skeptic
+    2's `DRAW:` line), so contamination is visible in the workflow's own output instead of
+    only in a file someone has to open.
+- **The gate is mechanical.** Whether a lane runs the blind stage is computed from
+  `lanes[].criteria`, not asked of the agent — the source project's local version left
+  that to model judgement.
+- **Two measured facts folded into the README:** an `H` published hex-only is where a
+  production draw stopped reproducing, and a **union pool across split lanes is
+  unexecutable** under blind scoring (neither half's skeptics can enumerate the other
+  half's files, so no one can reproduce the draw blind) — draw per half, grade per half.
+  On the re-run with the enforced protocol, the criterion that had been voided fleet-wide
+  produced **three clean columns** and a byte-for-byte reproduced draw.
+- **`BRIEFS-TEMPLATE.md`** rewritten to match: §A.3 is now the two-file split plus the
+  score ban, §B leads with STEP 0 (blind scoring) ahead of the REFUTE posture and the
+  numbered method, §B's old in-line item 10 becomes a back-reference plus "report a score
+  in the finder's main report as a protocol breach", and §C's single bullet becomes five —
+  three columns in three files, **median over clean columns only**, VOID never averaged,
+  fewer than three clean columns ⇒ NOT SCORED, draw reproduced, split units graded per
+  half.
+
+### audit-fleet 0.1.1 — both documented 0.1.0 gaps closed
+
+- **Argument validation before the first dispatch.** Every field of `lanes[]`
+  (`id/repo/units/paths/loc/criteria/baseSha/note`) plus `briefsPath`, `outDir`,
+  `contextNote` and `blindProtocol` is checked for presence and type, and a failure throws
+  **naming the field and the value** — `lens-triple-audit: args.lanes[2].loc must be a
+  positive finite number — got "7592"`. A fan-out this expensive must not die on a raw
+  `TypeError` three agents deep. `lanes[].id` must be filename-safe and unique (it is
+  interpolated into every output path, and two lanes sharing an id overwrite each other's
+  reports). A raw JSON string for `args` now gets a diagnostic that says exactly that.
+- **Path-traversal guard.** `briefsPath` / `outDir` must be absolute and are rejected for
+  `..` segments, control characters (a newline breaks the prompt line it lands in) and
+  shell metacharacters (agents paste these paths into shell commands). New optional
+  **`allowedRoot`** confines both inside a declared root. The guard is lexical — the
+  runtime is not guaranteed to expose Node's `path`/`fs` — so it does not resolve
+  symlinks; the README says so.
+- **`scripts/lens-triple-audit.test.mjs`** — 14 tests, no subagent tokens, runs in CI on
+  the existing `node --test` step. It reproduces the dynamic-workflow runtime's function
+  wrapper and drives the pipeline with stub agents, which makes it the **syntax gate** for
+  a file `node --check` cannot meaningfully check (its top-level `return` is legal only
+  inside the runtime's wrapper) as well as the behaviour gate: stage graph and model
+  pinning, the promoter id-union across skeptics, every
+  validation message, all five path-rejection classes, `allowedRoot` confinement, the
+  deterministic blind gate, and `STEP 0` preceding the report read in both skeptic prompts.
+- **One coupling-adjacent wording fix:** the finder prompt said "findings in
+  REGISTER-SCHEMA shape", naming an artifact only the authoring project has; it now points
+  at the caller's own row schema, matching `BRIEFS-TEMPLATE.md`.
+- **Compatibility:** with `blindProtocol` omitted, the emitted prompts are 0.1.0's (that
+  wording fix aside) and the stage graph is unchanged — asserted by a test.
+
 ## 0.4.0 — 2026-08-26
 
 ### New plugin — audit-fleet 0.1.0

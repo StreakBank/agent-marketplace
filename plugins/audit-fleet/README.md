@@ -83,12 +83,31 @@ skeptics and fans out one promoter per id.
   ],
   "briefsPath":  "/abs/path/to/briefs.md",     // must contain §A FINDER and §B SKEPTIC skeletons
   "outDir":      "/abs/path/to/durable/dir",   // every report is written here
-  "contextNote": "one paragraph: working dir, read-only posture, where the bar / schema / severity / dedup list live, and the never-do rules"
+  "contextNote": "one paragraph: working dir, read-only posture, where the bar / schema / severity / dedup list live, and the never-do rules",
+
+  // ---- optional ----
+  "allowedRoot": "/abs/path/to/records",       // if set, briefsPath + outDir must live inside it
+  "blindProtocol": {                           // omit unless a criterion has MULTIPLE readers
+    "criteria":      "7",                      // criterion id(s) in YOUR bar that are multi-reader ("7", "7,12", or [7,12])
+    "dimensions":    "naming / abstraction-level / comprehensibility",  // the sub-scores each reader records
+    "poolPredicate": "<mechanical statement of what enters the pool>",  // quotable verbatim by a skeptic re-deriving M
+    "scale":         "0-2",                    // default "0-2"
+    "drawCount":     8,                        // default 8
+    "poolScope":     "<override the per-lane pool rule>",
+    "multiplier":    2654435761,               // draw multiplier; default Knuth 32-bit
+    "fallbackMultiplier": 2654435789           // used when the degeneracy check rejects the first
+  }
 }
 ```
 
-Every field is interpolated into agent prompts verbatim. Both paths must be
-**absolute** — subagent working directories reset between calls.
+Every field is interpolated into agent prompts verbatim. **Arguments are validated
+before the first agent is dispatched** and a bad one throws naming itself
+(`lens-triple-audit: args.lanes[2].loc must be a positive finite number — got "7592"`)
+rather than failing three agents deep. `briefsPath` / `outDir` must be **absolute**
+(subagent working directories reset between calls) and are rejected if they carry a `..`
+segment, a control character, or a shell metacharacter — they reach prompts that agents
+turn into shell commands. `lanes[].id` must be filename-safe and unique: it is
+interpolated into every output path.
 
 Output files, per lane:
 
@@ -97,6 +116,38 @@ Output files, per lane:
 | `<outDir>/30-finder-<laneId>.md` | the finder |
 | `<outDir>/31-skeptic-<laneId>-1.md`, `…-2.md` | each skeptic |
 | `<outDir>/32-promoter-<laneId>-<findingId>.md` | each promoter |
+| `<outDir>/30-finder-<laneId>-draw.md` | the finder — `blindProtocol` only: the draw, **no scores** |
+| `<outDir>/30-finder-<laneId>-scores.md` | the finder — `blindProtocol` only: its reader-1 column |
+| `<outDir>/31-skeptic-<laneId>-<k>-scores.md` | each skeptic — `blindProtocol` only: its blind column |
+
+### The blind-reader protocol (`blindProtocol`)
+
+Declaring it makes the workflow **enforce** the ordering the next section's first lesson
+is about, instead of merely documenting it. When a lane's `criteria` include a declared
+blind criterion — matched mechanically against `lanes[].criteria`, never left to the
+agent to judge — the workflow:
+
+- tells the **finder** it is reader 1 of three, to write the draw and its own column to
+  two **separate** files, and bans every score, sub-score, aggregate and median from its
+  main report and final text (a *finding* on that criterion is not a score, and still
+  belongs in the findings section);
+- gives each **skeptic** a STEP 0 that runs *before* the finder's report is opened: open
+  only the draw file, reproduce `H`/`M`/the indices, score blind from source, write the
+  column with the literal line `scored before reading any report` — then, and only then,
+  read the report, with no revision of the step-0 numbers afterwards. Skeptic 2 also
+  reproduces the draw byte-for-byte; a draw that does not reproduce invalidates the
+  sample rather than licensing a substitute;
+- adds `BLIND: clean` / `BLIND: VOID — <why>` (and skeptic 2's `DRAW:` line) to the
+  skeptic's returned data, so contamination is visible in the workflow's own output.
+
+Adjudication stays with the calling session: **median of the three readers per sub-score,
+clean columns only.** A void column is never averaged in, and fewer than three clean
+columns means the unit is NOT SCORED, not scored on two. Pool scope defaults to the
+lane's own unit — a unit split across lanes draws per half and is graded per half,
+because neither half's skeptics can enumerate the other half's files to reproduce a union
+draw blind.
+
+Omit `blindProtocol` and the pipeline is byte-for-byte the one that shipped in 0.1.0.
 
 ## Lessons the shape is built on
 
@@ -108,13 +159,26 @@ this was caught only after the fleet had finished: the multi-reader criterion ha
 be marked NOT SCORED fleet-wide. If a criterion needs blind readers, the brief must
 hand skeptics the **drawn item list separately**, require the score to be recorded
 **before** the finder's report is opened, and define the sampling predicate
-mechanically. A finder's column is reader-1 data, never a score.
+mechanically. A finder's column is reader-1 data, never a score. **Since 0.1.1 the
+workflow enforces this** — declare `blindProtocol` and the ordering is in the prompts,
+not left to a brief the agent may read out of order.
+
+The re-run that first used the enforced protocol produced **three clean blind columns**
+and a draw reproduced byte-for-byte on a criterion that had been unscorable before it —
+which is the whole return: the lesson only stops costing you once the tool carries it.
 
 **Seeded draws need a rejection rule.** A modular-arithmetic draw
 (`seed mod M`) produces a degenerate contiguous block for some `M` — reject any `M`
 where the multiplier's residue is `0` or `1`, and publish `H`, `M` and the selected
-indices so the draw reproduces. Seed with `printf`, never `echo`: a trailing newline
-changes the digest.
+indices so the draw reproduces. Publish `H` in **hex and decimal**: a hex-only `H` is
+where one production draw stopped reproducing. Seed with `printf`, never `echo`: a
+trailing newline changes the digest.
+
+**A union pool across split lanes is unexecutable under blind scoring.** If a unit is
+split across two lanes, neither half's skeptics can enumerate the other half's files
+from their own coverage manifest, so no skeptic can reproduce a union draw blind —
+handing one lane the other's file list is exactly the contamination the protocol exists
+to stop. Draw per half and grade per half.
 
 **Two skeptics pay for themselves.** Measured across two campaigns: severity
 *inflation* is the single most common thing skeptics fix, and a finding refuted by
@@ -142,22 +206,37 @@ estimate of ~0.55M per triple, derived from diff-scoped waves, **under-predicted
 The workflow pins `model: 'opus'` on every stage. Skeptics that read cheaply do not
 refute; the cost is the point of the tool.
 
-## Known gaps (0.1.0)
+## Known gaps (0.1.1)
 
-- **No argument validation.** The workflow destructures `args` directly. A missing or
-  malformed `args` fails with a raw `TypeError` rather than a diagnostic, and there is
-  no traversal/flag guard on `briefsPath` / `outDir` before they land in prompts. The
-  script is shipped byte-for-byte as validated in production; hardening is queued.
-- **`args` is assumed pre-parsed.** Some runtimes hand a workflow the caller's raw JSON
-  string instead of an object. Validated only against a runtime that parses it.
+Both 0.1.0 gaps are closed: `args` is validated field by field before any dispatch, and
+`briefsPath` / `outDir` are guarded for absoluteness, `..` segments, control characters,
+shell metacharacters and (optionally) an `allowedRoot` — see the `args` contract above.
+`scripts/lens-triple-audit.test.mjs` covers both, and runs in CI.
+
+Remaining:
+
+- **`args` is still assumed pre-parsed.** A runtime that hands the workflow the caller's
+  raw JSON string now gets a diagnostic that says exactly that instead of a raw
+  `TypeError`, but the workflow does not parse it for you.
+- **The path guard is lexical, not filesystem-resolved.** The workflow runtime is not
+  guaranteed to expose Node's `path`/`fs`, so the guard is pure string logic: it rejects
+  `..` segments and confines to `allowedRoot` by prefix, but does **not** resolve
+  symlinks. A symlinked `outDir` still writes wherever the link points.
+- **UNVERIFIED: the blind protocol has not been run through the plugin install path.**
+  It was validated as a project-local workflow with identical script text — see
+  `PROVENANCE.md`.
 
 ## Improving this workflow
 
 Generic discoveries — a stage-ordering trap, a better skeptic posture, a runtime
 gotcha — belong **here**, so every project using the plugin compounds them. Clone the
 marketplace (`gh repo clone StreakBank/agent-marketplace`), edit this plugin, bump
-`plugin.json` semver plus a CHANGELOG line, run `scripts/check-coupling.sh audit-fleet`,
-and push. See CONTRIBUTING §8.
+`plugin.json` semver plus a CHANGELOG line, run `scripts/check-coupling.sh audit-fleet`
+and `node --test plugins/audit-fleet/scripts/lens-triple-audit.test.mjs` — which
+reproduces the runtime's function wrapper and is therefore the real syntax gate:
+`node --check` on the `.js` path passes without exercising anything, and the same bytes
+checked as ESM fail on the workflow's (legal, runtime-provided) top-level `return`. Then
+push. See CONTRIBUTING §8.
 
 Project-specific facts — your bar, your severity taxonomy, which surfaces count as
 money-path, your dedup denominator — are **not** generic. They stay on your side, in

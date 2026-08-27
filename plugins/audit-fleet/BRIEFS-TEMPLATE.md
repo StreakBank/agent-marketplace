@@ -14,6 +14,16 @@ path as `briefsPath`. `§C` is not a brief — it is the calling session's synth
 document, your finding-row schema, your severity taxonomy, your dedup denominator, your
 never-do rules.
 
+**If any criterion in your bar is scored by more than one reader**, declare it in the
+workflow's `blindProtocol` arg and keep §A.3 / §B STEP 0 / §C below as written. The three
+files those sections name are *derived* from `{records_dir}` + `{lane}`, not new
+placeholders: `{records_dir}/30-finder-{lane}-draw.md` ·
+`{records_dir}/30-finder-{lane}-scores.md` · `{records_dir}/31-skeptic-{lane}-{k}-scores.md`.
+Your dispatch must pass a `{records_dir}` **equal to the workflow's `outDir`**, or the
+finder's write path and the skeptics' step-0 read path diverge (a workflow-driven fleet
+is safe — it interpolates `outDir` into both). If no criterion of yours is multi-reader,
+omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
+
 ---
 
 ## A. FINDER brief skeleton
@@ -39,12 +49,37 @@ never-do rules.
 >    required evidence form. **`file:line`, command output, or a counted assertion — an
 >    adjective is not evidence.** "Looks reasonable", "generally clean", "somewhat
 >    coupled" are rejected on sight.
-> 3. **For any multi-reader criterion:** publish the seeded draw (`H`, `M`, the selected
->    indices) and the drawn `file:line` list, then score every sub-score with one line of
->    justification each. You are **reader 1 of three**. Do **not** report an aggregate
->    verdict — the calling session takes the median of the three readers per sub-score.
->    Seed with `printf`, never `echo` (a trailing newline changes the digest and the draw
->    will not reproduce), and reject any modulus whose multiplier residue is 0 or 1.
+> 3. **For any multi-reader criterion — TWO SEPARATE FILES, and no score in your main
+>    report.** You are **reader 1 of three**; the two skeptics are readers 2 and 3 and
+>    must score **before** they can see your column, so your column cannot travel in a
+>    file they open first.
+>
+>    **(i) `{records_dir}/30-finder-{lane}-draw.md` — the draw ONLY.** Per sampled unit:
+>    the exact seed string; **`H` as hex AND decimal** (hex-only does not reproduce);
+>    `M`; **the pool predicate stated mechanically** ({your predicate — e.g. an AST
+>    property with a numeric threshold, or a regex quoted verbatim}, with your
+>    generated/vendored/test-file exclusions); **the pool-enumeration command you
+>    actually ran**, copy-pasteable, so a skeptic can re-derive `M` without asking you;
+>    the **pool scope rule** ({default: this lane's own unit only — a unit split across
+>    lanes draws per half and is graded per half, because neither half's skeptics can
+>    enumerate the other half's files to reproduce a union draw blind}); the
+>    **degeneracy check** `<multiplier> mod M ∉ {0,1}` stated explicitly, with the
+>    fallback multiplier declared **in this file** if it was used and re-checked the same
+>    way; **every index**; and the **drawn `file:line item` entries in draw order**. Seed
+>    with `printf`, never `echo` — a trailing newline changes the digest and the draw will
+>    not reproduce. This file carries **nothing** about scores, findings, verdicts or your
+>    coverage manifest: both skeptics open it first, and anything else in it destroys
+>    their blindness.
+>
+>    **(ii) `{records_dir}/30-finder-{lane}-scores.md` — your reader-1 column alone.**
+>    Every sub-score per drawn item, one justification line each, and **no aggregate,
+>    mean, median or pass/fail**. The calling session takes the **median of the three
+>    readers per sub-score**, mechanically — no adjudicator agent, no discussion round.
+>
+>    **(iii) Score ban.** Your **main report and your final text** must contain no score,
+>    sub-score, aggregate, median or pass/fail for that criterion — not in a table, not in
+>    prose, not in a summary line. A **finding is not a score**: findings on that
+>    criterion still belong in your findings section as normal.
 > 4. **Findings**, each in {your finding-row schema}: provisional `id` · `title` (the
 >    defect — not the symptom, not the fix) · `unit` · `dimension` · `severity` · `shape`
 >    (`instance` | `class`) · `evidence` · `reach` · `effort` · `failure_scenario` ·
@@ -80,9 +115,40 @@ never-do rules.
 ## B. SKEPTIC brief skeleton
 
 > You are **skeptic {1|2} of 2** for finder lane **{lane}** ({repo}, units {units}, base
-> SHA `{base_sha}`). The finder's report is at `{finder_report_path}`. **You have not
-> seen — and must not ask for — the other skeptic's output.** Read-only.
-> {your never-do rules.}
+> SHA `{base_sha}`). The finder's report is at `{finder_report_path}` — **but do STEP 0
+> before you open it.** **You have not seen — and must not ask for — the other skeptic's
+> output.** Read-only. {your never-do rules.}
+>
+> ### STEP 0 — BLIND SCORING (multi-reader criteria only; delete this block if you have none)
+>
+> You are **blind reader {2|3} of three** for those criteria. Do this **first**, before
+> anything else in this brief:
+>
+> - **0.1** Open **ONLY** `{records_dir}/30-finder-{lane}-draw.md`. Do **NOT** open
+>   `{finder_report_path}`, do **NOT** open `{records_dir}/30-finder-{lane}-scores.md` —
+>   not to skim, not for the coverage manifest, not for context.
+> - **0.2** Reproduce the draw from that file yourself: `H` (hex **and** decimal),
+>   re-enumerate the pool with the published predicate and command to get `M`, re-check
+>   `<multiplier> mod M ∉ {0,1}` (and the declared fallback multiplier the same way), and
+>   recompute every index.
+> - **0.3** Score the drawn items **blind from the source**, every sub-score, one line of
+>   justification each.
+> - **0.4** Write them to `{records_dir}/31-skeptic-{lane}-{k}-scores.md`, including the
+>   literal line **`scored before reading any report`**. That line is the column's
+>   admission ticket.
+> - **0.5** Only now open the finder's report.
+>
+> **VOID self-declaration.** If you opened the finder's report, the finder's scores file,
+> or the other skeptic's output before finishing 0.4, declare that criterion's column
+> **`VOID`** in one line at the top of your report. A void column is recoverable; a
+> contaminated column silently corrupts the median. Never score from memory of a number
+> you have already seen, and never revise your step-0 numbers afterwards — disagreement
+> between readers is exactly what the median is for.
+>
+> **Skeptic 2 additionally reproduces the draw byte-for-byte** and reports `H` (hex +
+> decimal), `M`, the multiplier, `<multiplier> mod M` and every index, plus whether they
+> match the finder's list. **A draw that does not reproduce invalidates the sample** — it
+> does not license a substitute draw.
 >
 > **Your default posture is REFUTE.** Your brief is to **kill each finding**, not to
 > grade it. A finding survives only what you cannot break.
@@ -112,16 +178,11 @@ never-do rules.
 >    verification is not required.
 > 9. **You may inject your own adversarial evidence** — a targeted test run, a static
 >    check, an arithmetic reproduction, a fresh grep. Read-only with respect to the tree.
-> 10. **For any multi-reader criterion you are a BLIND reader** — skeptic 1 is reader 2,
->     skeptic 2 is reader 3. Score the *drawn item list* yourself (handed to you in this
->     brief, not taken from the finder's report), every sub-score, one line of
->     justification each. **Write your scores down BEFORE you open the finder's report**,
->     and state in one line that you did. A reader who has seen a prior score is no longer
->     independent and that column is **voided, not averaged in**. Adjudication is the
->     median of the three readers per sub-score, computed by the calling session — you are
->     not resolving disagreement, you are supplying an independent number. **Skeptic 2
->     additionally re-runs the seeded draw** and confirms the modulus and indices
->     reproduce; a draw that does not reproduce invalidates the sample.
+> 10. **Multi-reader criteria are already done — they were STEP 0.** Do not re-score and
+>     do not revise those numbers now that you have read the finder's report. You supplied
+>     an independent number; you are not resolving disagreement, the median is. **If the
+>     finder's main report does contain a score for such a criterion, report it as a
+>     protocol breach** and state whether you saw it before you scored.
 >
 > **Verdict per finding: `CONFIRMED` · `ADJUSTED` · `REFUTED`.** Where you adjust, **your
 > number is authoritative** — state the corrected severity/scope/count explicitly, because
@@ -138,7 +199,10 @@ never-do rules.
 > **Also required:** no time estimates · `UNVERIFIED:` markers on anything you could not
 > settle · a one-line note where the finder's **coverage manifest** looks too thin to
 > support its conclusions (a thin manifest on a money-path unit means another lens-triple
-> is owed, not a better adjective).
+> is owed, not a better adjective) · for multi-reader criteria, `BLIND: clean` or
+> `BLIND: VOID — <why>` (skeptic 2 also `DRAW: reproduces (…)` / `DRAW: does NOT
+> reproduce — …`), **no sub-scores in the message**, both lines placed **before** the
+> workflow's mandated final `MONEY_LEGAL_REFUTES:` line, whose contract is unchanged.
 
 ---
 
@@ -148,10 +212,18 @@ never-do rules.
 - [ ] Every finding carries **2 independent skeptic verdicts**; the skeptics' numbers are
       recorded, not the finder's.
 - [ ] Every `PROMOTER-REQUIRED` flag dispatched, and its outcome recorded.
-- [ ] Multi-reader criteria: **three blind readers** per drawn item, each confirming in
-      writing that it scored before reading the finder's table; **median per sub-score**
-      computed by the session; the seeded draw reproduced by skeptic 2 per sampled unit.
-      Any column from a reader that admits reading a prior score first is **voided**.
+- [ ] Multi-reader criteria — **three columns in three files**, each carrying the literal
+      `scored before reading any report` line; and **grep the finder's main report for a
+      score** (its column belongs in its own scores file, nowhere else).
+- [ ] **Median per sub-score over the CLEAN columns only**, summed per item — never a mean
+      of totals, never an adjudicator agent, never a discussion round. The finder's column
+      is reader-1 data, not a verdict.
+- [ ] A **VOID column is never averaged in**; fewer than three clean columns ⇒ the unit is
+      **NOT SCORED** and a re-dispatch is owed. A two-column median is a mean.
+- [ ] **The draw reproduced** by skeptic 2 (`H` hex + decimal, `M`, multiplier, degeneracy
+      value, every index). Non-reproducing or degenerate ⇒ **NOT SCORED** and a redraw at
+      the next legal pool. Never "close enough".
+- [ ] **Split units graded per half** — no half presented as the whole unit.
 - [ ] Every surviving finding routed into the one register that owns it — **no parallel
       register is opened**. Refuted findings stay, marked REFUTED with the refutation
       quoted, so a later session does not re-find them.
