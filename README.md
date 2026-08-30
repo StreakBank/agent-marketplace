@@ -7,7 +7,11 @@ policy (which tool owns which niche in your estate, instance names, QA-layer rul
 lives in a thin shim on *your* side, in your project's `.claude/` rules.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the discipline; it is the admission gate
-for every plugin here.
+for every plugin here. It also carries
+[§10 Known Claude Code harness traps](CONTRIBUTING.md#10-known-claude-code-harness-traps)
+— harness-level gotchas (prompt-text `@path` expansion, `SendMessage` to a
+workflow-internal agent, the bundled `grep`) that any plugin driving greps, credentials or
+teammates has to be written around.
 
 ## Install
 
