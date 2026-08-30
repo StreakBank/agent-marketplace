@@ -1,6 +1,6 @@
 {
   "name": "audit-fleet",
   "description": "Adversarial verification for an audit or measurement fan-out: per lane, one finder produces evidence-cited findings, two independent default-REFUTE skeptics try to kill each one, and a promoter is dispatched for every money-path or legal-obligation finding a skeptic refuted, whose brief is to overturn the refutation. Use when findings must survive adversarial verification before they are recorded or drive a code change — standing-tree audits, coverage-ledger measurement, conformance grading against a frozen bar.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": { "name": "StreakBank" }
 }

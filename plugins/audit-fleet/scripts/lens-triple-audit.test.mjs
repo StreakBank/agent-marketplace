@@ -88,6 +88,22 @@ test('promoter fans out once per money/legal refute, union across skeptics', asy
   assert.deepEqual(promos.map((p) => p.label).sort(), ['promote:F1:A1', 'promote:F1:A2'])
 })
 
+test('promoter must end its report with the greppable PROMOTER-VERDICT line', async () => {
+  const s = stubs()
+  const agent = async (prompt, opts) => {
+    s.prompts.push({ prompt, ...opts })
+    return opts.phase === 'Refute' ? 'MANIFEST: ok\nMONEY_LEGAL_REFUTES: A1' : 'ok'
+  }
+  await build()(OK, agent, s.pipeline, s.parallel, s.log)
+  const promo = s.prompts.find((p) => p.phase === 'Promote').prompt
+  assert.match(promo, /'PROMOTER-VERDICT: A1 \| OVERTURNED\|UPHELD-REFUTATION \| P<0-3> \| <reach>'/)
+  assert.match(promo, /LAST LINE/)
+  // The lead-consumption rationale must travel in the prompt: a re-worded outcome
+  // inverts and no downstream gate can catch an inverted disposition.
+  assert.match(promo, /verbatim/)
+  assert.match(promo, /FINAL TEXT \(data\): that same 'PROMOTER-VERDICT: …' line/)
+})
+
 test('args must be a parsed object, and the error says so', async () => {
   await rejects(JSON.stringify(OK), /RAW JSON STRING/)
   await rejects(undefined, /args must be an object/)
@@ -151,6 +167,18 @@ test('allowedRoot confines both paths and is itself guarded', async () => {
 // --- blind multi-reader protocol -------------------------------------------
 
 const BLIND = { criteria: '7', dimensions: 'naming / abstraction / clarity', poolPredicate: 'bodies of >= 3 statements' }
+
+test('finder must publish a nearest_gate column — out-of-unit and believed-non-covering included, blind stage or not', async () => {
+  for (const args of [OK, { ...OK, blindProtocol: BLIND }]) {
+    const { prompts } = await run(args)
+    const f = prompts[0].prompt
+    assert.match(f, /NEAREST-GATE INDEX — MANDATORY, a COLUMN of the coverage manifest and not prose/)
+    assert.match(f, /nearest_gate: <artifact — a test \/ lint \/ CI step, as file:line or a named CI step> \| covers: yes\/no \| why not/)
+    assert.match(f, /EVEN WHEN it lives outside the unit you were given and EVEN WHEN you believe it does not cover the case/)
+    assert.match(f, /nearest_gate: none found — searched:/)
+    assert.match(f, /makes your manifest DEFICIENT/)
+  }
+})
 
 test('no blindProtocol → prompts carry no blind stage at all (0.1.0 behaviour)', async () => {
   const { prompts } = await run(OK)

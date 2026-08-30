@@ -16,7 +16,9 @@ Per lane, three stages — the "lens triple" is the finder plus its two skeptics
   FIND      1 finder per lane
             grades the lane against a frozen bar, cites file:line or command output,
             publishes a MANDATORY coverage manifest (files_examined: 0 is a failure,
-            not a result)
+            not a result) whose nearest_gate column names, per claim, the nearest
+            test/lint/CI artifact — even one outside the unit, even one it believes
+            does not cover the case
               |
   REFUTE    2 skeptics per finder, dispatched in parallel, mutually blind
             default posture REFUTE — the brief is to KILL each finding, not grade it;
@@ -39,6 +41,31 @@ is one agent per money/legal refute — a handful per campaign, not per finding.
 Skeptics signal this to the workflow with a final line
 `MONEY_LEGAL_REFUTES: <ids>` (or `none`); the workflow takes the **union** across both
 skeptics and fans out one promoter per id.
+
+### How the lead consumes a promoter (since 0.1.2)
+
+Every promoter report **ends with one greppable line**, alone, in this shape:
+
+```
+PROMOTER-VERDICT: <finding-id> | OVERTURNED|UPHELD-REFUTATION | P<0-3> | <reach>
+```
+
+(The `P<n>` field is the finding's priority in **your** taxonomy as it stands after the
+promoter; `<reach>` is where it lands in production. The workflow carries no taxonomy —
+keep the four fields and the `PROMOTER-VERDICT:` prefix and write your own scale.)
+
+**The lead pastes that line verbatim into the register block. It does not re-describe the
+outcome.** `grep -h '^PROMOTER-VERDICT:' <outDir>/32-promoter-*.md`, paste, then re-grep
+the register and diff the two sets.
+
+This exists because of a measured failure: in one five-promoter sitting, **two outcomes
+were transcribed into the register inverted** — an `UPHELD-REFUTATION` recorded as
+overturned and the reverse — and **no gate could catch it**. Nothing downstream re-reads
+the promoter's argument; a tally script reads the register's disposition field and
+believes it, so an inverted disposition survives every subsequent check and silently
+re-prioritises a money-path finding. A verbatim quote of a machine-shaped line is the only
+step in the chain that is mechanically checkable, which is why it is a requirement on the
+promoter's output rather than advice to the lead.
 
 ## What it does NOT do
 
@@ -156,10 +183,12 @@ criteria. A lane that writes them as a range or a shorthand — `"1-9"`, `"all"`
 **silently skip the blind stage**, because no token in it equals `7`. Silently: there is
 no warning, and that criterion is then scored non-blind.
 
-Omit `blindProtocol` and the blind stage is absent and the stage graph is 0.1.0's. The
-emitted prompts are 0.1.0's but for one word — 0.1.1 points the finder at "your
-register's row schema" where 0.1.0 named an artifact only the authoring project had (see
-`PROVENANCE.md`) — and `args` that 0.1.0 accepted malformed now throw.
+Omit `blindProtocol` and the blind stage is absent and the stage graph is 0.1.0's. Three
+prompt changes are unconditional and apply with it omitted: 0.1.1 points the finder at
+"your register's row schema" where 0.1.0 named an artifact only the authoring project had
+(see `PROVENANCE.md`); 0.1.2 adds the finder's mandatory `nearest_gate` manifest column
+and the promoter's `PROMOTER-VERDICT:` line. `args` that 0.1.0 accepted malformed throw
+since 0.1.1.
 
 ## Lessons the shape is built on
 
@@ -178,6 +207,19 @@ not left to a brief the agent may read out of order.
 The re-run that first used the enforced protocol produced **three clean blind columns**
 and a draw reproduced byte-for-byte on a criterion that had been unscorable before it —
 which is the whole return: the lesson only stops costing you once the tool carries it.
+
+**"No gate covers this" must name the gate it means.** A finder that answers the
+nearest-gate question in prose — "no existing test covers this path" — hands the skeptic
+an adjective instead of an artifact, and the skeptic then has to guess which gate the
+finder had in mind before it can agree or refute. On one production fleet **11 of 12 lanes
+were called `MANIFEST: deficient` on exactly this**, and essentially every skeptic verdict
+turned on it. So since 0.1.2 the finder prompt makes it a **manifest column, not prose**:
+one `nearest_gate:` line per claim, naming a test / lint / CI artifact as `file:line` or a
+named CI step, **even when the artifact is outside the audited unit** and **even when the
+finder believes it does not cover the case** — those are precisely the two excuses that
+produced the blank column. The only legal empty value names the searches that came back
+empty. The corollary for consumers: a finder cannot answer this well on a unit whose gates
+live elsewhere in the repo, so give lanes read access beyond their own `paths`.
 
 **Seeded draws need a rejection rule.** A modular-arithmetic draw
 (`seed mod M`) produces a degenerate contiguous block for some `M` — reject any `M`
@@ -207,6 +249,22 @@ a non-zero kill rate. Do not carry a diff-derived calibration into a standing-tr
 quoted. That is the "do not re-find" mechanism that makes prior coverage load-bearing
 across sessions.
 
+### Manifest sanity
+
+**A lane's own proposed finding ids are always wrong.** Lanes run concurrently and each
+one numbers its findings against the denominator it saw when it started — which the rest
+of the fleet is moving underneath it the whole time. Two lanes will hand you the same id
+for different defects, and every lane's ids will collide with whatever landed in the
+register while the fleet ran. Treat a finder's ids as **lane-local labels**, never as
+register ids: **the lead renumbers at synthesis**, in one pass, rewriting every
+cross-reference (including the skeptics' and promoters' verdict lines) to the assigned
+ids. Do not ask lanes to coordinate ids with each other — that is a barrier between lanes,
+and the whole point of the shape is that lanes do not wait on each other.
+
+The same caution applies to a finder's own counts: `files_examined` and a class finding's
+`instances` are the finder's arithmetic, and both are re-derived by the skeptics. Take the
+skeptics' numbers into the register, not the finder's.
+
 ## Cost
 
 **≈0.9M subagent tokens per lane triple on Opus** (1 finder + 2 skeptics), measured on
@@ -218,7 +276,7 @@ estimate of ~0.55M per triple, derived from diff-scoped waves, **under-predicted
 The workflow pins `model: 'opus'` on every stage. Skeptics that read cheaply do not
 refute; the cost is the point of the tool.
 
-## Known gaps (0.1.1)
+## Known gaps (0.1.2)
 
 Both 0.1.0 gaps are closed: `args` is validated field by field before any dispatch, and
 `briefsPath` / `outDir` are guarded for absoluteness, `..` segments, control characters,
@@ -234,6 +292,10 @@ Remaining:
   guaranteed to expose Node's `path`/`fs`, so the guard is pure string logic: it rejects
   `..` segments and confines to `allowedRoot` by prefix, but does **not** resolve
   symlinks. A symlinked `outDir` still writes wherever the link points.
+- **The `PROMOTER-VERDICT:` line is enforced on the promoter, not on the register.** The
+  workflow can require the line, and it comes back in the workflow's own output — but it
+  cannot see what the lead then writes down. The grep-and-diff step in the briefs
+  template's §C is the only check on the transcription itself.
 - **UNVERIFIED: the blind protocol has not been run through the plugin install path.**
   It was validated as a project-local workflow with identical script text — see
   `PROVENANCE.md`.

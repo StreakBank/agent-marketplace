@@ -44,6 +44,32 @@ With `blindProtocol` omitted, the emitted prompts are the 0.1.0 prompts (that wo
 aside) and the stage graph is unchanged — asserted by
 `scripts/lens-triple-audit.test.mjs`.
 
+**0.1.2 — two prompt requirements added, both sourced from a post-fleet synthesis.** Both
+come from the authoring project's **s18 session, records 45 and 47** (the post-fleet
+synthesis and the refute pass over it), and both are measurements from that fleet rather
+than authored advice:
+
+1. **The promoter's `PROMOTER-VERDICT:` last line.** In a five-promoter sitting, two
+   promoter outcomes reached the register **inverted** — transcribed by hand, in the
+   opposite disposition — and no gate downstream could catch it, because nothing
+   downstream re-reads a promoter's argument and the tally reads the register's
+   disposition field. Generalized here as a machine-shaped final line the lead quotes
+   verbatim; the field set (`OVERTURNED|UPHELD-REFUTATION`, a priority token, a reach
+   token) is the generic part, the priority *scale* remains the caller's.
+2. **The finder's mandatory `nearest_gate` manifest column.** 11 of the 12 lanes in that
+   fleet were called manifest-deficient on the nearest-gate question specifically, and
+   skeptic verdicts turned on it more often than on any other manifest field. 0.1.1
+   already asked the question, as prose in the finder brief's rules list; 0.1.2 makes it a
+   column and names the two excuses that produced blank answers (the artifact is outside
+   the audited unit; the finder believes it does not cover the case) as explicitly
+   insufficient.
+
+The lead-side halves — grep-and-diff the transcription, renumber lane-local ids at
+synthesis — went into `BRIEFS-TEMPLATE.md` §C and the README, since the workflow can
+require a promoter's *output* but cannot see what a lead writes down. Both additions are
+unconditional: they are in the emitted prompts with `blindProtocol` omitted, so from 0.1.2
+the finder and promoter prompts are no longer 0.1.0's.
+
 ## scripts/lens-triple-audit.test.mjs
 
 Authored-original, added at 0.1.1. It reproduces the dynamic-workflow runtime's function
@@ -118,6 +144,20 @@ No wrapped binary, no pinned external tool, no runtime fetch.
   dimensions / predicate) has not yet driven a live fleet — only the project-local
   hard-coded equivalent has. Confirm on the first plugin-resolved run with
   `blindProtocol` set.
+- **2026-08-30 — 0.1.2 (promoter verdict line + mandatory nearest-gate column).**
+  `scripts/check-coupling.sh audit-fleet` clean; `node --test
+  plugins/audit-fleet/scripts/lens-triple-audit.test.mjs` **16/16 pass** on Node 23.10.0
+  (the 14 prior tests plus two asserting the new prompt text: the promoter's
+  `PROMOTER-VERDICT:` line with its verbatim-transcription rationale, and the finder's
+  `nearest_gate` column with and without `blindProtocol`).
+- **Sourced from real use, not authored (2026-08-30, the authoring project's s18 session,
+  records 45 and 47):** both requirements are outcomes of a fleet's post-run synthesis and
+  the refute pass over that synthesis — the two inverted promoter transcriptions out of
+  five, and the 11-of-12 lanes called manifest-deficient on the nearest-gate question.
+  **UNVERIFIED at 0.1.2:** neither requirement has yet driven a fleet in the amended form;
+  they are corrections derived from a completed run, not re-measured on a new one. Confirm
+  on the next fleet — specifically that the promoter reports' last lines grep cleanly and
+  that the `nearest_gate` column moves the `MANIFEST:` verdict rate.
 - **Revalidate by:** the next plugin version bump, or whenever the dynamic-workflow
   runtime's `args` handling changes (the workflow now validates `args` but still assumes
   the runtime hands it a parsed object; see the README's "Known gaps").

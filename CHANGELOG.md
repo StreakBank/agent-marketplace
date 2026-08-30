@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.2 — 2026-08-30
+
+### audit-fleet 0.1.2 — the promoter's verdict is machine-shaped, and "no gate covers this" must name a gate
+
+- **`PROMOTER-VERDICT:` — a greppable last line on every promoter report.** The promoter
+  prompt now requires the report to END with, and to return as its final text, one line
+  alone: `PROMOTER-VERDICT: <finding-id> | OVERTURNED|UPHELD-REFUTATION | P<0-3> | <reach>`.
+  The briefs template's §C synthesis gate says what the lead does with it: `grep -h
+  '^PROMOTER-VERDICT:'` over the promoter reports, **paste verbatim** into the register
+  block, re-grep the register and diff the two sets — never re-describe the outcome.
+  *Why:* measured on a five-promoter sitting, **two outcomes were transcribed into the
+  register inverted** (an `UPHELD-REFUTATION` recorded as overturned, and the reverse) and
+  **no gate could catch it** — nothing downstream re-reads the promoter's argument, so a
+  tally script reads the register's disposition field and believes it. A verbatim quote of
+  a machine-shaped line is the only mechanically checkable step in that chain, which is
+  why the requirement sits on the promoter's output rather than in advice to the lead.
+  The workflow can enforce the line's *production*, not its transcription — the README's
+  "Known gaps" now says so.
+- **`nearest_gate` is a MANDATORY manifest column for finders, not prose.** Every claim
+  carries one line
+  `nearest_gate: <artifact — test/lint/CI step, as file:line or a named CI step> | covers: yes/no | why not`,
+  and the artifact must be named **even when it lives outside the audited unit** and
+  **even when the finder believes it does not cover the case**; the only legal empty value
+  is `none found — searched: <commands>`. A missing or prose-only answer makes the manifest
+  **deficient** however many files it lists, and skeptics are told to return
+  `MANIFEST: deficient` for it and to refuse to fill the column in on the finder's behalf.
+  *Why:* on one production fleet **11 of 12 lanes were called manifest-deficient on exactly
+  this**, and essentially every skeptic verdict turned on it — an unnamed gate cannot be
+  re-read, so the verdict turns on the finder's adjective instead of on an artifact. The
+  0.1.1 wording ("answer why the nearest existing gate does not cover this") was prose in
+  the rules list and produced blank answers; the two excuses it produced (out of unit /
+  believed non-covering) are now named and refused in the prompt itself.
+- **README "Manifest sanity".** A lane's own proposed finding ids are **always wrong** —
+  lanes run concurrently and each numbers against a denominator the rest of the fleet is
+  moving underneath it. Finder ids are lane-local labels; **the lead renumbers at
+  synthesis** in one pass, rewriting every cross-reference. Do not make lanes coordinate
+  ids — that reintroduces a barrier between lanes. Same caution for `files_examined` and a
+  class finding's `instances`: take the skeptics' re-derived numbers, not the finder's.
+- **Compatibility.** The stage graph, the `args` contract, `blindProtocol` and the
+  `MONEY_LEGAL_REFUTES:` contract are unchanged. Two prompt additions are unconditional
+  (they apply with `blindProtocol` omitted): the finder's nearest-gate paragraph and the
+  promoter's verdict line. A lead that parses the promoter's final text against 0.1.1's
+  bare `<id> | OVERTURNED|…` shape must accept the `PROMOTER-VERDICT: ` prefix.
+- **Tests: 14 → 16**, both new ones asserting prompt text (the promoter verdict line and
+  its rationale; the finder's nearest-gate column with and without `blindProtocol`).
+
 ## 0.4.1 — 2026-08-26
 
 ### audit-fleet 0.1.1 — the blind-reader protocol is now enforced, not just documented

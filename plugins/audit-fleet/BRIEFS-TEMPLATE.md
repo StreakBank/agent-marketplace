@@ -45,6 +45,17 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 >    opened or grepped, one per line, with the command(s) used for greps, and the count.
 >    `files_examined: 0` is a **failure, not a result**. A thin manifest is visible and
 >    acceptable; a fabricated one is not.
+>
+>    **Nearest-gate index — a MANDATORY COLUMN of this manifest, one line per claim**
+>    (not a sentence buried in a finding):
+>    `nearest_gate: {artifact — a test / lint / CI step, as file:line or a named CI step} | covers: yes/no | why not`.
+>    Name the nearest artifact **even when it lives outside the unit you were given** and
+>    **even when you believe it does not cover the case**. "Nothing covers this" is the
+>    claim your skeptics will test, and it is unfalsifiable until the nearest candidate is
+>    named — an unnamed gate cannot be re-read, so the verdict turns on your adjective
+>    instead of on the artifact. The only legal empty value is
+>    `nearest_gate: none found — searched: {the commands you ran}`. A missing or
+>    prose-only gate answer makes the manifest **deficient** however many files it lists.
 > 2. **Per criterion, per unit:** the criterion's question answered pass/fail with its
 >    required evidence form. **`file:line`, command output, or a counted assertion — an
 >    adjective is not evidence.** "Looks reasonable", "generally clean", "somewhat
@@ -83,7 +94,12 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 > 4. **Findings**, each in {your finding-row schema}: provisional `id` · `title` (the
 >    defect — not the symptom, not the fix) · `unit` · `dimension` · `severity` · `shape`
 >    (`instance` | `class`) · `evidence` · `reach` · `effort` · `failure_scenario` ·
->    `instances` (class only, **with the deriving grep/AST command**) · `base_sha`.
+>    `nearest_gate` (the same named artifact as the manifest column — never blank, never
+>    prose) · `instances` (class only, **with the deriving grep/AST command**) ·
+>    `base_sha`. **Your `id`s are provisional and will be renumbered.** Under a fleet the
+>    register's denominator moves while you work, so a lane's own proposed ids are always
+>    wrong; number them locally, and expect the calling session to reassign them at
+>    synthesis.
 >
 > **Rules that get your report rejected if broken:**
 >
@@ -92,9 +108,10 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 >   re-severity an existing entry. Only genuinely new material is filed.
 > - **Severity per {your severity taxonomy}**, money-path findings one level higher.
 >   Severity inflation is the single most common thing skeptics correct.
-> - **Answer "why does the nearest existing gate not cover this?"** for every finding.
->   For anything already mechanized, prove *structural insufficiency for a failure class
->   that actually occurred*.
+> - **Answer "why does the nearest existing gate not cover this?"** for every finding —
+>   in the `nearest_gate` **column**, with the artifact named (§1), never as prose. For
+>   anything already mechanized, prove *structural insufficiency for a failure class that
+>   actually occurred*.
 > - **Honour every "When NOT to apply" carve-out** in a cited rule, and check
 >   {your accepted-exceptions list}. A finding that fights a recorded deliberate choice
 >   is a re-tread. **Order of authority when sources disagree: {your order}.**
@@ -166,7 +183,10 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 > 4. **Attack `reach`**: is it really on a production path, or is it latent /
 >    unreachable?
 > 5. **Attack the gate question:** does an existing lint/gate/test already cover this?
->    If yes → REFUTED.
+>    If yes → REFUTED. Start from the finder's **`nearest_gate` column** and re-read the
+>    named artifact yourself — the whole verdict usually turns on it. A finding whose
+>    `nearest_gate` is missing, blank, or prose is a **manifest deficiency**: report it as
+>    such and do not fill the column in on the finder's behalf.
 > 6. **Attack carve-outs and prior rulings:** does the cited rule's "When NOT to apply"
 >    section, or {your accepted-exceptions list}, already license this code? If yes →
 >    REFUTED as a re-tread.
@@ -199,7 +219,9 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 > **Also required:** no time estimates · `UNVERIFIED:` markers on anything you could not
 > settle · a one-line note where the finder's **coverage manifest** looks too thin to
 > support its conclusions (a thin manifest on a money-path unit means another lens-triple
-> is owed, not a better adjective) · for multi-reader criteria, `BLIND: clean` or
+> is owed, not a better adjective) · **`MANIFEST: deficient` whenever the `nearest_gate`
+> column is absent for any claim** — that column, not the file count, is the manifest
+> field verdicts most often turn on · for multi-reader criteria, `BLIND: clean` or
 > `BLIND: VOID — <why>` (skeptic 2 also `DRAW: reproduces (…)` / `DRAW: does NOT
 > reproduce — …`), **no sub-scores in the message**, both lines placed **before** the
 > workflow's mandated final `MONEY_LEGAL_REFUTES:` line, whose contract is unchanged.
@@ -209,9 +231,16 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
 ## C. Post-fleet checklist (the calling session's synthesis gate)
 
 - [ ] Every finder returned a **non-empty coverage manifest**; counts recorded per lane.
+- [ ] Every finder returned a **`nearest_gate` line for every claim** — named artifact,
+      `covers: yes/no`, or the explicit `none found — searched: …`. Any lane a skeptic
+      called `MANIFEST: deficient` on this column is re-dispatched, not patched by the lead.
 - [ ] Every finding carries **2 independent skeptic verdicts**; the skeptics' numbers are
       recorded, not the finder's.
-- [ ] Every `PROMOTER-REQUIRED` flag dispatched, and its outcome recorded.
+- [ ] Every `PROMOTER-REQUIRED` flag dispatched, and its **`PROMOTER-VERDICT:` line
+      pasted verbatim** into the register block — `grep -h '^PROMOTER-VERDICT:'` over the
+      promoter reports and copy, never re-word. A promoter outcome retyped from memory
+      **inverts**, and no gate downstream can see it: a tally reads the disposition field
+      and believes it. Then re-grep the register for the same lines and diff the two sets.
 - [ ] Multi-reader criteria — **three columns in three files**, each carrying the literal
       `scored before reading any report` line; and **grep the finder's main report for a
       score** (its column belongs in its own scores file, nowhere else).
@@ -225,6 +254,9 @@ omit `blindProtocol` and delete §A.3 and §B STEP 0; nothing else changes.
       the next legal pool. Never "close enough".
 - [ ] **Split units graded per half** — no half presented as the whole unit.
 - [ ] Every surviving finding routed into the one register that owns it — **no parallel
-      register is opened**. Refuted findings stay, marked REFUTED with the refutation
-      quoted, so a later session does not re-find them.
+      register is opened** — and **renumbered here**. A lane's proposed ids are always
+      wrong (the denominator moved under the fleet while it worked); the lead assigns the
+      real ids at synthesis and rewrites every cross-reference to them in the same pass.
+      Refuted findings stay, marked REFUTED with the refutation quoted, so a later session
+      does not re-find them.
 - [ ] No time estimates survive into the committed documents.
