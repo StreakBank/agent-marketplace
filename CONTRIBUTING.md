@@ -178,8 +178,10 @@ reads as evidence of absence when it is evidence of nothing.
 **ugrep 7.8.4**, not GNU/BSD grep. With `-oE` and a **leading alternation of ≥7 branches**
 (`-oE '(a|b|c|d|e|f|g)…'`), matches are silently dropped. Related: `git grep` patterns are
 **BRE** by default, so `git grep "a\|b"` is an alternation while `git grep "a|b"` is a
-literal pipe — and `git grep --untracked <pathspec>` skips untracked files, so a sweep that
-must include them needs a different tool.
+literal pipe — `git grep --untracked <pathspec>` skips untracked files, so a sweep that
+must include them needs a different tool — and `git status --short` / `--porcelain`
+collapses a NEW untracked directory to a single `dir/` entry, so a line count built on it
+silently under-counts; pass `--untracked-files=all` for any count that gates an action.
 
 **Rule.** For any **census** — a count you will act on, a "zero hits" claim, a coverage
 manifest — invoke `/usr/bin/grep` or `command grep` explicitly, never the bare name. Then
@@ -188,3 +190,41 @@ before believing a negative: if the control does not match, the regex or the eng
 wrong, not the tree. Split wide alternations into several passes when the tool is not under
 your control. This is a positive-control discipline, not a grep-vendor preference; it
 catches every silent-miss class, not just this one.
+
+
+### 10.4 Session-scoped crons do not fire while background work runs
+
+**Symptom.** A `CronCreate` clock armed in the session sails past its fire time with no
+error and no output; it fires later, or never, even though the session is alive. A
+calendar-bound duty (a resolution, a month-end close) silently misses its window.
+
+**Mechanism (INFERRED, 2026-08-31).** Session-scoped crons appear to fire only when the
+session's REPL is truly idle. A running Workflow or a `run_in_background` Bash task
+suppresses them for its whole duration; the cron fires on the next idle turn, arbitrarily
+late. Observed twice in one consuming-project session (a daily check fired ~40 minutes
+late once background work drained; two one-shots would have missed entirely and were run
+by hand). Not yet confirmed against harness documentation — treat as a working model and
+re-verify before relying on the timing.
+
+**Rule.** Treat a session-scoped cron as best-effort, never as the owner of a
+calendar-bound duty. While any background work runs, check `date -u` each turn and run
+the duty BY HAND the moment its time has passed. For a duty that must not miss, keep a
+foreground eye on the clock (or an external scheduler) instead of trusting the cron.
+
+### 10.5 Fleet agents create self-referential symlinks when given workspace-relative paths
+
+**Symptom.** After a multi-agent fan-out, the tree contains symlinks pointing at their own
+parent — `<repo>/<repo>`, `.claude/.claude`, `docs/docs` — as untracked entries. Later
+tooling that walks the tree (or a `find` from a symlinked root, which silently does not
+descend without `-L` or a trailing slash) misbehaves in ways far removed from the cause.
+
+**Mechanism.** An agent working INSIDE a repo, handed workspace-relative paths like
+`<repo>/internal/...`, "fixes" resolution by symlinking the repo's own name into itself so
+the prefix resolves. Six such links appeared across one session's fan-outs; two were found
+only by a later refute pass.
+
+**Rule.** Every fan-out brief forbids symlink creation outright. The lead asserts
+`find <tree> -maxdepth 3 -type l` is EMPTY at each landing, and removes any hit with
+`rm <link>` — the LINK only, never `rm -r`, since the target is the real directory. Hand
+agents absolute paths (or repo-relative paths with an explicit cwd), never
+workspace-relative paths from inside a repo.
