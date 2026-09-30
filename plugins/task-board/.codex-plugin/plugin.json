@@ -1,0 +1,17 @@
+{
+  "name": "task-board",
+  "version": "0.1.1",
+  "description": "Automatic Backlog.md task maintenance through native harness hooks",
+  "author": {
+    "name": "Local developer"
+  },
+  "interface": {
+    "displayName": "Task Board",
+    "shortDescription": "Keep the task board current from native terminal sessions.",
+    "longDescription": "Local lifecycle observations and checkpoint checks for a shared Backlog.md board.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Show the board and its current task ownership."
+  }
+}

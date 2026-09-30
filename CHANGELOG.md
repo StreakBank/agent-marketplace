@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1 — 2026-09-25
+
+- Task Board 0.1.1: recognize native Codex delegation aliases and require explicit evidence-bearing reconciliation for every follow-up; lifecycle returns remain observations.
+
+## 0.5.0 — 2026-09-24
+
+- Add task-board: native lifecycle observations, shared board routing, and checkpoint checks for Claude Code and Codex.
+
 ## 0.4.2 — 2026-08-30
 
 ### audit-fleet 0.1.2 — the promoter's verdict is machine-shaped, and "no gate covers this" must name a gate
