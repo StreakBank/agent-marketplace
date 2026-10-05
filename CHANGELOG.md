@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2 — 2026-10-05
+
+- Task Board 0.1.2: a worker's tool calls and a hook-authored runtime note no longer stale the lead's checkpoint; a directly delegated return still does.
+
 ## 0.5.1 — 2026-09-25
 
 - Task Board 0.1.1: recognize native Codex delegation aliases and require explicit evidence-bearing reconciliation for every follow-up; lifecycle returns remain observations.

@@ -15,11 +15,13 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 REPAIR = "Task board update required. "
 STATUSES = ["To Do", "In Progress", "Blocked", "Review", "Done"]
 DELEGATE = {"Agent", "Workflow", "spawn_agent", "followup_task"}
 EDIT = {"Edit", "Write", "apply_patch", "NotebookEdit"}
+# Workflow-internal agents return to their workflow, not to the lead's turn.
+WORKFLOW_AGENT_TYPE = "workflow-subagent"
 
 
 def normalize_tool_name(name):
@@ -248,6 +250,32 @@ def note(w, s, message):
         s["pending"].append(message)
 
 
+def checkpoint_hash_is_current(w, s):
+    """True when the Stop check would still read the lead's checkpoint as current."""
+    if not s.get("task") or s.get("released") or not s.get("checkpoint_hash"):
+        return False
+    if s["generation"] != s.get("checkpoint_generation"):
+        return False
+    try:
+        return s["checkpoint_hash"] == task_hash(task(w, s["task"]))
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return False
+
+
+def note_runtime(w, s, message):
+    """Append a hook-authored runtime observation without inventing staleness.
+
+    The note is the hook's own writing, so it must not invalidate a checkpoint
+    that was current immediately before it; a change by anyone else still
+    mismatches the stored hash and keeps the checkpoint stale.
+    """
+    current = checkpoint_hash_is_current(w, s)
+    note(w, s, message)
+    if current:
+        with contextlib.suppress(OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            s["checkpoint_hash"] = task_hash(task(w, s["task"]))
+
+
 def hook(data, harness):
     event = data.get("hook_event_name", "")
     w = workspace(data.get("cwd"))
@@ -304,11 +332,17 @@ def hook(data, harness):
                     journal(w, s, "followup_requested", target=target, known_worker=known)
                 else:
                     s["dispatch_seen"] = True
-                note(w, s, "Runtime observation " + now() + ": dispatch requested via " + tool_name + " — " + label + ". Outcome pending; lead owns verification.")
+                note_runtime(w, s, "Runtime observation " + now() + ": dispatch requested via " + tool_name + " — " + label + ". Outcome pending; lead owns verification.")
                 journal(w, s, "dispatch_requested", tool=tool_name, native_tool=data.get("tool_name"), label=label)
         elif event in {"PostToolUse", "PostToolUseFailure"}:
             if not board_command(data):
-                s["generation"] += 1
+                # A worker's tool call is the worker's work. Keep the attribution
+                # in the journal, but leave the lead's generation alone: a child
+                # event is aliased to the lead's state, so counting it would
+                # strand the lead's checkpoint seconds after it was written, for
+                # every tool call of every background worker.
+                if not child and not agent:
+                    s["generation"] += 1
                 journal(w, s, event, tool=tool_name, worker=agent or None)
         elif event == "SubagentStart":
             if not s.get("task") or not s.get("dispatch_seen") or not agent:
@@ -318,8 +352,8 @@ def hook(data, harness):
             s["workers"][agent] = {"state": "started", "at": now(), "type": data.get("agent_type")}
             aliases[token_for(harness, agent)] = token
             atomic_json(aliases_path, aliases)
-            s["generation"] += 1
-            note(w, s, "Runtime observation " + now() + ": agent " + agent + " (" + str(data.get("agent_type") or "unknown type") + ") started; accomplishment pending.")
+            # A start is not lead work; the lead's dispatch already counted.
+            note_runtime(w, s, "Runtime observation " + now() + ": agent " + agent + " (" + str(data.get("agent_type") or "unknown type") + ") started; accomplishment pending.")
             journal(w, s, event, agent=agent)
             result = context(event, instructions(w, s, True))
         elif event == "SubagentStop":
@@ -328,8 +362,12 @@ def hook(data, harness):
                 save(w, s)
                 return {}
             s["workers"][agent] = {"state": "returned", "at": now(), "type": data.get("agent_type")}
-            s["generation"] += 1
-            note(w, s, "Runtime observation " + now() + ": agent " + agent + " returned. Lead review pending; this is not completion evidence.")
+            # A directly delegated worker returns into the lead's turn and owes a
+            # lead review. A workflow-internal return reaches the lead later, as
+            # its workflow's own completion; the lead checkpoints on that.
+            if str(data.get("agent_type") or "") != WORKFLOW_AGENT_TYPE:
+                s["generation"] += 1
+            note_runtime(w, s, "Runtime observation " + now() + ": agent " + agent + " returned. Lead review pending; this is not completion evidence.")
             journal(w, s, event, agent=agent)
         elif event in {"Interrupt", "StopFailure", "SessionEnd"}:
             # Keep the board honest within the short native end/interrupt budget.

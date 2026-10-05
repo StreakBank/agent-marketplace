@@ -23,3 +23,17 @@ so no canonical-task-name to lifecycle-UUID mapping is inferred. All follow-ups
 require an explicit evidence-bearing reconciliation: even distinct lifecycle
 receipts do not establish a causal link to the latest dispatch.
 This correction does not certify installed hook trust or live callback ordering.
+
+2026-10-05 staleness-scope correction, measured on a real board journal rather
+than inferred: one lead session's event log held 20,411 entries, 15,671 of them
+worker-attributed `PostToolUse` against 1,879 from the lead, and 762 Stop events
+journaled `handoff_missing` against 158 `handoff_current`. Every child tool event
+counted toward the lead's generation, and both lifecycle events additionally
+appended a runtime note that changed the task hash, so the Stop check fired after
+almost every lead turn while a background fan-out ran and then exhausted its
+two-repair budget. The counts come from one workspace's journal, so they size the
+observed failure; they do not enumerate every harness's event shape. The
+workflow-internal `agent_type` value was read from that journal. Regression
+coverage asserts the policy with controls for each case that must still be
+caught; it does not certify installed hook trust or live callback ordering.
+Validated 2026-10-05 against Backlog.md 1.52.0: 42 tests, all passing.

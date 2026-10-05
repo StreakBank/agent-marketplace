@@ -96,6 +96,18 @@ then it surfaces a warning rather than trapping the user in an endless loop.
 Pure conversation without tool activity does not need a new task. Hooks record
 dispatch/start/return observations; they never infer successful implementation.
 
+Staleness is scoped to the lead. The lead's own tool calls, its dispatches, a
+directly delegated worker's return, and any task change made by someone else all
+invalidate the checkpoint. A worker's or child session's tool events are
+journaled with their attribution but do not, because they are aliased to the
+lead's record and would otherwise strand a checkpoint seconds after it was
+written for every tool call of every background worker. An agent start is an
+observation, not lead work. A workflow-internal return is recorded and reviewed
+when its workflow completes, so it does not by itself demand a new checkpoint.
+A runtime note the hook authored does not invalidate a checkpoint that was
+current immediately before that note; the stored task hash still catches a
+change made by anyone else.
+
 ## Persistence and failure handling
 
 The board's `.task-board/` holds private local runtime state, session bindings,

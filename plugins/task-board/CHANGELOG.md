@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.2 — 2026-10-05
+
+- Count only the lead's own tool calls toward checkpoint staleness. Worker and
+  child tool events keep their journal attribution but no longer invalidate the
+  lead's checkpoint, so a background fan-out cannot strand it within seconds.
+- Treat an agent start as an observation rather than lead work, and require a new
+  lead checkpoint only for a directly delegated worker's return; a
+  workflow-internal return is recorded and reviewed at its workflow's completion.
+- Keep a runtime note the hook itself appended from invalidating a checkpoint
+  that was current immediately before the append. A change by anyone else still
+  mismatches the stored task hash and keeps the checkpoint stale.
+- Add regression coverage for the staleness policy with controls for the lead's
+  own tool call, dispatch, a foreign task edit before and after a hook note, and
+  a directly delegated return.
+
 ## 0.1.1 — 2026-09-25
 
 - Recognize native Codex collaboration tool names while preserving plain,
