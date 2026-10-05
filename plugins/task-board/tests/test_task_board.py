@@ -429,6 +429,107 @@ class Lifecycle(unittest.TestCase):
         self.start()
         self.assertEqual(self.command("status")["workers"], {})
 
+    # --- A worker's activity is the worker's, not the lead's (staleness policy) ---
+
+    def dispatch(self, tool_name="Workflow", label="Fan out"):
+        return self.event("PreToolUse", tool_name=tool_name, tool_input={"description": label},
+                          tool_use_id="dispatch-" + label)
+
+    def test_worker_tool_calls_are_journaled_without_staling_the_lead(self):
+        self.start()
+        self.dispatch()
+        self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        self.checkpoint()
+        for i in range(5):
+            self.event("PostToolUse", tool_name="Read", agent_id="wf-a", tool_use_id="worker-read-" + str(i))
+        self.event("PostToolUseFailure", tool_name="Bash", agent_id="wf-a", tool_use_id="worker-fail")
+        self.assertEqual(self.event("Stop"), {})
+        events = [json.loads(line) for line in (self.board / ".task-board/events.jsonl").read_text().splitlines()]
+        attributed = [entry for entry in events
+                      if entry["event"].startswith("PostToolUse") and entry.get("worker") == "wf-a"]
+        self.assertEqual(len(attributed), 6)
+
+    def test_workflow_subagent_lifecycle_does_not_require_a_new_checkpoint(self):
+        self.start()
+        self.dispatch()
+        self.checkpoint()
+        self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        self.assertEqual(self.event("Stop"), {})
+        self.event("SubagentStop", agent_id="wf-a", agent_type="workflow-subagent")
+        self.assertEqual(self.event("Stop"), {})
+        self.assertEqual(self.command("status")["workers"]["wf-a"]["state"], "returned")
+
+    def test_hook_authored_note_refreshes_the_hash_it_wrote_itself(self):
+        task_id = self.start()
+        self.dispatch("Agent", "Review parser")
+        self.checkpoint()
+        before = self.command("status")["checkpoint_hash"]
+        self.event("SubagentStart", agent_id="worker-a", agent_type="Explore")
+        record = tb.task(self.w, task_id)
+        self.assertIn("worker-a", record["implementationNotes"])
+        state = self.command("status")
+        self.assertNotEqual(state["checkpoint_hash"], before)
+        self.assertEqual(state["checkpoint_hash"], tb.task_hash(record))
+        self.assertEqual(self.event("Stop"), {})
+
+    def test_codex_worker_patch_does_not_stale_the_lead_but_its_own_does(self):
+        self.sid = "codex-main"
+        self.token = tb.token_for("codex", self.sid)
+        payload = dict(cwd=str(self.board), session_id=self.sid)
+        tb.hook(dict(payload, hook_event_name="SessionStart"), "codex")
+        self.start()
+        tb.hook(dict(payload, hook_event_name="PreToolUse", tool_name="collaborationspawn_agent",
+                     tool_input={"task_name": "parser"}, tool_use_id="spawn"), "codex")
+        tb.hook(dict(payload, hook_event_name="SubagentStart", agent_id="codex-child", agent_type="worker"), "codex")
+        self.checkpoint()
+        tb.hook(dict(payload, hook_event_name="PostToolUse", tool_name="apply_patch",
+                     agent_id="codex-child", tool_use_id="child-patch"), "codex")
+        self.assertEqual(tb.hook(dict(payload, hook_event_name="Stop"), "codex"), {})
+        tb.hook(dict(payload, hook_event_name="PostToolUse", tool_name="apply_patch",
+                     tool_use_id="lead-patch"), "codex")
+        self.assertEqual(tb.hook(dict(payload, hook_event_name="Stop"), "codex")["decision"], "block")
+
+    # --- Controls: real staleness must still be caught ---
+
+    def test_lead_tool_call_beside_worker_calls_still_stales(self):
+        self.start()
+        self.dispatch()
+        self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        self.checkpoint()
+        self.event("PostToolUse", tool_name="Read", agent_id="wf-a", tool_use_id="worker-read")
+        self.event("PostToolUse", tool_name="Edit", tool_use_id="lead-edit")
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
+    def test_lead_dispatch_still_stales_the_checkpoint(self):
+        self.start()
+        self.checkpoint()
+        self.dispatch()
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
+    def test_foreign_edit_before_a_hook_note_is_not_refreshed_away(self):
+        task_id = self.start()
+        self.dispatch()
+        self.checkpoint()
+        tb.backlog(self.w, ["task", "edit", task_id, "--append-notes", "Another writer's result", "--plain"])
+        self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
+    def test_foreign_edit_after_a_hook_note_still_stales(self):
+        task_id = self.start()
+        self.dispatch()
+        self.checkpoint()
+        self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        tb.backlog(self.w, ["task", "edit", task_id, "--append-notes", "Another writer's result", "--plain"])
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
+    def test_directly_delegated_worker_return_still_requires_a_checkpoint(self):
+        self.start()
+        self.dispatch("Agent", "Review parser")
+        self.event("SubagentStart", agent_id="worker-a", agent_type="Explore")
+        self.checkpoint()
+        self.event("SubagentStop", agent_id="worker-a", agent_type="Explore")
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
 
 if __name__ == "__main__":
     import sys
