@@ -2,7 +2,7 @@
 
 ## 0.5.2 — 2026-10-05
 
-- Task Board 0.1.2: a worker's tool calls and a hook-authored runtime note no longer stale the lead's checkpoint; a directly delegated return still does.
+- Task Board 0.1.2: a worker's tool calls and a hook-authored runtime note no longer stale the lead's checkpoint; a directly delegated return, and a foreign task edit even inside the note window, still do.
 
 ## 0.5.1 — 2026-09-25
 

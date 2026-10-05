@@ -36,4 +36,11 @@ observed failure; they do not enumerate every harness's event shape. The
 workflow-internal `agent_type` value was read from that journal. Regression
 coverage asserts the policy with controls for each case that must still be
 caught; it does not certify installed hook trust or live callback ordering.
-Validated 2026-10-05 against Backlog.md 1.52.0: 42 tests, all passing.
+Independent review then showed the hook-authored-note refresh re-hashed whatever
+the live task held after its own append, so a raw task edit landing inside that
+window was hashed over; this was reproduced with a patched note call on a real
+board before it was scoped to exactly the appended text. The scope ignores the
+edit stamp an append moves on its own, so a content-free stamp bump inside the
+same window remains unreported. A foreign write that lands after the re-read is
+caught by the ordinary Stop comparison, not by this scope.
+Validated 2026-10-05 against Backlog.md 1.52.0: 45 tests, all passing.

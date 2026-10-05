@@ -11,9 +11,14 @@
 - Keep a runtime note the hook itself appended from invalidating a checkpoint
   that was current immediately before the append. A change by anyone else still
   mismatches the stored task hash and keeps the checkpoint stale.
+- Limit that refresh to exactly the appended text. Backlog takes no task-board
+  lock, so the re-read after the note can observe another writer's edit; unless
+  the notes end with the hook's own text and every other field is unchanged, the
+  checkpoint stays stale instead of hashing the foreign edit over.
 - Add regression coverage for the staleness policy with controls for the lead's
-  own tool call, dispatch, a foreign task edit before and after a hook note, and
-  a directly delegated return.
+  own tool call, dispatch, a foreign task edit before, after and inside the hook's
+  note window, a directly delegated return, and the agent-id attribution
+  assumption.
 
 ## 0.1.1 — 2026-09-25
 

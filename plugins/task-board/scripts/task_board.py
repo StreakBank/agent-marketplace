@@ -22,6 +22,8 @@ DELEGATE = {"Agent", "Workflow", "spawn_agent", "followup_task"}
 EDIT = {"Edit", "Write", "apply_patch", "NotebookEdit"}
 # Workflow-internal agents return to their workflow, not to the lead's turn.
 WORKFLOW_AGENT_TYPE = "workflow-subagent"
+# The only fields an appended note is allowed to move.
+NOTE_APPEND_FIELDS = ("implementationNotes", "updatedAt")
 
 
 def normalize_tool_name(name):
@@ -250,30 +252,54 @@ def note(w, s, message):
         s["pending"].append(message)
 
 
-def checkpoint_hash_is_current(w, s):
-    """True when the Stop check would still read the lead's checkpoint as current."""
+def checkpoint_record_if_current(w, s):
+    """The live task record while the Stop check still reads the checkpoint as current, else None."""
     if not s.get("task") or s.get("released") or not s.get("checkpoint_hash"):
-        return False
+        return None
     if s["generation"] != s.get("checkpoint_generation"):
-        return False
+        return None
     try:
-        return s["checkpoint_hash"] == task_hash(task(w, s["task"]))
+        record = task(w, s["task"])
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return None
+    return record if s["checkpoint_hash"] == task_hash(record) else None
+
+
+def only_appended(before, after, message):
+    """True when `after` is `before` plus exactly `message` appended to the notes.
+
+    Backlog takes no task-board lock, so a raw task edit can land between the
+    currency read and the re-read after a hook-authored note. A foreign note
+    (ahead of this one or behind it) or any other changed field must leave the
+    checkpoint stale rather than be hashed over. Only the appended text and the
+    edit stamp the append itself moves may differ.
+    """
+    if not message:
         return False
+    for key in (set(before) | set(after)) - set(NOTE_APPEND_FIELDS):
+        if before.get(key) != after.get(key):
+            return False
+    notes = after.get("implementationNotes") or ""
+    if not notes.endswith(message):
+        return False
+    return notes[:len(notes) - len(message)].rstrip() == (before.get("implementationNotes") or "").rstrip()
 
 
 def note_runtime(w, s, message):
     """Append a hook-authored runtime observation without inventing staleness.
 
     The note is the hook's own writing, so it must not invalidate a checkpoint
-    that was current immediately before it; a change by anyone else still
-    mismatches the stored hash and keeps the checkpoint stale.
+    that was current immediately before it. Every other change keeps the
+    checkpoint stale, including one that lands while the note is being written.
     """
-    current = checkpoint_hash_is_current(w, s)
+    before = checkpoint_record_if_current(w, s)
     note(w, s, message)
-    if current:
-        with contextlib.suppress(OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-            s["checkpoint_hash"] = task_hash(task(w, s["task"]))
+    if before is None:
+        return
+    with contextlib.suppress(OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        after = task(w, s["task"])
+        if only_appended(before, after, message):
+            s["checkpoint_hash"] = task_hash(after)
 
 
 def hook(data, harness):

@@ -105,8 +105,14 @@ written for every tool call of every background worker. An agent start is an
 observation, not lead work. A workflow-internal return is recorded and reviewed
 when its workflow completes, so it does not by itself demand a new checkpoint.
 A runtime note the hook authored does not invalidate a checkpoint that was
-current immediately before that note; the stored task hash still catches a
-change made by anyone else.
+current immediately before that note. That refresh is limited to exactly the text
+the hook appended: if the live notes do not end with that text, or any other
+field moved, the checkpoint stays stale, so a raw task edit landing while the
+note is written is still caught. Only the edit stamp an append moves by itself is
+ignored, which is why a content-free stamp bump inside that window is not
+reported. Worker attribution assumes a lead's own tool-call payload carries no
+agent id; a stamped call is treated as that agent's work and is journaled under
+it.
 
 ## Persistence and failure handling
 
