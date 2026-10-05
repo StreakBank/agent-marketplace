@@ -489,6 +489,23 @@ class Lifecycle(unittest.TestCase):
                      tool_use_id="lead-patch"), "codex")
         self.assertEqual(tb.hook(dict(payload, hook_event_name="Stop"), "codex")["decision"], "block")
 
+    def test_agent_stamped_tool_calls_are_worker_work_by_assumption(self):
+        # The suppression keys on `agent_id` being absent from a lead's own
+        # payload. Pin that assumption: an unknown agent's stamped call is
+        # journaled as that agent's work and leaves the checkpoint current,
+        # while the same call without the stamp stales it. A harness that ever
+        # stamped the lead's own calls would fail here, not silently disable
+        # the whole staleness check.
+        self.start()
+        self.checkpoint()
+        self.event("PostToolUse", tool_name="Read", agent_id="unknown-worker", tool_use_id="stamped-read")
+        self.assertEqual(self.event("Stop"), {})
+        events = [json.loads(line) for line in (self.board / ".task-board/events.jsonl").read_text().splitlines()]
+        stamped = [entry for entry in events if entry["event"] == "PostToolUse"]
+        self.assertEqual(stamped[-1]["worker"], "unknown-worker")
+        self.event("PostToolUse", tool_name="Read", tool_use_id="lead-read")
+        self.assertEqual(self.event("Stop")["decision"], "block")
+
     # --- Controls: real staleness must still be caught ---
 
     def test_lead_tool_call_beside_worker_calls_still_stales(self):
@@ -521,6 +538,42 @@ class Lifecycle(unittest.TestCase):
         self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
         tb.backlog(self.w, ["task", "edit", task_id, "--append-notes", "Another writer's result", "--plain"])
         self.assertEqual(self.event("Stop")["decision"], "block")
+
+    def racing_note(self, task_id, text, before=False):
+        """Run a foreign writer inside the hook's own note window.
+
+        Backlog takes no task-board lock, so a raw `task edit` can land between
+        the currency read and the re-read that follows the hook's note.
+        """
+        real = tb.note
+
+        def patched(w, s, message):
+            if before:
+                tb.backlog(w, ["task", "edit", task_id, "--append-notes", text, "--plain"])
+            real(w, s, message)
+            if not before:
+                tb.backlog(w, ["task", "edit", task_id, "--append-notes", text, "--plain"])
+
+        tb.note = patched
+        try:
+            self.event("SubagentStart", agent_id="wf-a", agent_type="workflow-subagent")
+        finally:
+            tb.note = real
+        self.assertIn(text, tb.task(self.w, task_id)["implementationNotes"])
+
+    def test_foreign_edit_inside_the_note_window_is_not_hashed_over(self):
+        task_id = self.start()
+        self.dispatch()
+        self.checkpoint()
+        self.racing_note(task_id, "FOREIGN EDIT by another writer")
+        self.assertEqual(self.event("Stop").get("decision"), "block")
+
+    def test_foreign_edit_ahead_of_the_hook_note_is_not_hashed_over(self):
+        task_id = self.start()
+        self.dispatch()
+        self.checkpoint()
+        self.racing_note(task_id, "FOREIGN EDIT ahead of the note", before=True)
+        self.assertEqual(self.event("Stop").get("decision"), "block")
 
     def test_directly_delegated_worker_return_still_requires_a_checkpoint(self):
         self.start()
