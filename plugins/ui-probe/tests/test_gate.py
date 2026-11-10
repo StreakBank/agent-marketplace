@@ -344,7 +344,7 @@ class GateCommandTest(unittest.TestCase):
     def test_no_runs_returns_2(self):
         rc, _, err = self.main("gate", self.root)
         self.assertEqual(rc, 2)
-        self.assertIn("no capture.json or run.json found", err)
+        self.assertIn("no run found", err)
 
 
 if __name__ == "__main__":

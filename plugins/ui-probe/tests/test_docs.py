@@ -86,6 +86,29 @@ class ReadmeMatchesCodeTest(unittest.TestCase):
                        "the recorder had stopped before the scenario ended", "A trace that lost data"):
             self.assertIn(phrase, SKILL)
 
+    def test_020_additions_documented(self):
+        self.assertIn("## Screens that are never still", README)
+        self.assertIn("There is no allowance for recorded frames that changed nothing", README)
+        self.assertNotIn("identical_frames_max", " ".join(u.ALLOW_LIMITS))
+        self.assertIn("a blinking caret drew 10 or 11 frames in a 5 s rest window (9 of 9 windows)", README)
+        self.assertIn("produced 1 frame by the platform's count, 9 recorded frames that changed nothing and 9 CPU ticks",
+                      README)
+        self.assertIn("That is also why `find` is not offered on a rest", README)
+        self.assertIn('`"until_quiet": false` with a `settle_ms` that covers the transition', README)
+        self.assertIn("the poll that watches for quiet takes about as long as the gap between two", README)
+        self.assertNotIn('"quiet": {"ms": 400}', README)        # measured: it times out between blinks
+        self.assertIn("Limits come from the step's `allow`, then the command line", README)
+        for name in ("find-<step>.txt", "ui-<step>.xml", "gfx-<step>.base.txt", "lookup-failed.txt", "failed.json"):
+            self.assertIn(name, README)
+        self.assertNotIn("find-failed.txt", README)
+        self.assertIn('{"id": "type-code", "do": "text", "text": "000000"}', README)
+        self.assertEqual(u.default_settle_ms("text"), 2500)
+        self.assertIn("It takes the keys a `key` step takes and the same fixed wait (2500 ms)", README)
+        self.assertEqual(u.FIND_SETTLE_MS, 1000)
+        self.assertIn("`find_settle_ms` (default 1000)", README)
+        self.assertIn("`rest`, `tap`, `swipe`, `key` and `text`", SKILL)
+        self.assertEqual(u.STEP_KINDS, ("rest", "tap", "swipe", "key", "text"))
+
     def test_exit_codes_documented(self):
         self.assertIn("| 1 | the gate found a violation (and only that) |", README)
         self.assertIn("| 3 | an unexpected error", README)

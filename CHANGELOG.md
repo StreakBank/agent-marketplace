@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0 — 2026-11-10
+
+- ui-probe 0.2.0: flows that type into a form, and screens that are never still. A `text` step
+  types into the focused field. A tap can name its target by text or content description
+  (`find`): the device script looks it up before the step starts, counts only an element of the
+  app's own package, and accepts it only when two reads in a row agree, so the lookup's own work
+  is charged to no step. An `allow` on a rest step raises that one step's limits for a screen
+  that draws at rest by design (a blinking caret), with a required reason and no allowance for
+  frames that change nothing. A run that does not complete now fails `gate` instead of being
+  invisible to it. See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.6.0 — 2026-11-10
 
 - Add ui-probe 0.1.0: watch a mobile app from outside while a scripted scenario runs. Counts the

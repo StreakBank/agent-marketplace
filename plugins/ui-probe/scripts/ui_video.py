@@ -298,7 +298,11 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
                 cursor += 1
         frames.append(rec)
 
-    order = [("launch", "launch", marks.get("launch.start"), marks.get(scn["steps"][0]["id"] + ".start"))]
+    # The launch window ends where the first step begins: at its element lookup if it has one, so
+    # that the lookup lies in no step's window.
+    first = scn["steps"][0]
+    launch_end = marks.get(first["id"] + (".find_start" if "find" in first else ".start"))
+    order = [("launch", "launch", marks.get("launch.start"), launch_end)]
     for s in scn["steps"]:
         # A drag is judged as motion unless the scenario says the screen should end where it began
         # ("judge": "state": a pull that springs back, an overscroll, a cancelled dismiss).

@@ -1,5 +1,55 @@
 # Changelog — ui-probe
 
+## 0.2.0 — 2026-11-10
+
+Four additions for flows that type into a form and screens that are never still.
+
+- A `text` step types into the focused field. Only letters, digits, space and `@ . _ + -` are
+  accepted (a space is sent as `input text` spells it); anything else is an error that names the
+  character, so nothing reaches the device shell that it could read another way.
+- An `allow` on a rest step raises that step's limits for frames, CPU and recorded frames that
+  change the app's area, with a required reason. A focused field's caret draws 10 or 11 frames in
+  a 5 s rest window, so without it such a screen could not be gated at all. There is no allowance
+  for recorded frames that changed nothing: a caret does not produce them, and that check is what
+  catches an invisible animation. A violation on such a step says the limit came from the
+  allowance, and a step that passed only because of it gets a note with the value, the allowance
+  and the reason.
+- A per-step `quiet` replaces the scenario's quiet window for that step, for example a longer
+  limit on one slow step. It is not the answer to a caret: a step that ends on a focused field
+  takes a fixed wait (`"until_quiet": false`), because the poll that watches for quiet takes
+  about as long as the gap between two blinks.
+- A tap can name its target (`find`: text or content description, exact, optionally the nth
+  match) instead of coordinates. The device script looks it up before the step starts, retrying
+  until the element is there, so it also waits for the screen. Only an element of the scenario's
+  package counts (`find.package` names another), and only when two reads in a row give it the same
+  bounds, so the tap never goes to another app's element or to where an element was while it
+  moved; a match that never holds still ends the lookup as `unstable`. A lookup value the window
+  tree dump never writes as it is (a tab, a control character, a surrogate, a character outside the
+  Basic Multilingual Plane) is refused when the scenario is checked, and `find.timeout_ms` is at
+  least 100. Reading the window tree makes the
+  app and the compositor work (measured on a still screen: 1 frame, 9 recorded frames that changed
+  nothing, 9 CPU ticks for two reads), so after a lookup the script waits, takes a baseline of
+  every counter, and the step counts from there; the lookup lies in no step's window. The last
+  tree read and the lookup's record are kept in `raw/`, and `run.json` carries the centre, the
+  bounds, the matches and the reads. An element that never appears ends the run with exit 2 and a
+  message naming the step, what was looked for, the matches at the last read (and matching
+  elements in other packages) and the saved tree; the device is restored as on every other error
+  path. The step that stopped is named in `raw/lookup-failed.txt`, a name no step's own record can
+  take.
+- A run that does not complete leaves `failed.json` in its folder (the error, the step if known,
+  the time). `gate` fails a folder that a run started but did not complete (check `run`), even
+  when it is the only one, so a batch that stopped part way never passes on the runs before the
+  failure; `summary` lists such runs and leaves them out of every statistic, and `compare` names
+  the ones it left out on each side. `run` refuses a folder that already holds any part of a run.
+- `gate --scenario` refuses a scenario whose name differs from the one stored with the run, and
+  says on each `allowance:` line when the allowance came from `--scenario`.
+- `doctor --serial` reports whether the device has `uiautomator` (needed by `find` only).
+- The README says what a device run showed about CPU at rest: a caret costs up to 9 ticks in 5 s,
+  so its allowance should raise the CPU limit too, and a clean app's still screens are not
+  always at zero ticks, so a single CPU-only window just over the limit is run again first.
+- The README now says what the code already did: a key ending in `comment` is allowed in the
+  scenario and in a step, not inside the nested blocks.
+
 ## 0.1.0 — 2026-11-10
 
 First release. Android, driven over adb from an unmodified build of the app under test.

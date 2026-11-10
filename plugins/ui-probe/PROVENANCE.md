@@ -77,6 +77,51 @@ Not validated: a physical device; a device that has slept since boot; Android ve
 than 14; a Linux host running against a device (the unit tests run there); the multi-block
 layout of the compositor's statistics (the parser sums blocks; none was seen on this device).
 
+### Validation, 0.2.0
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-10 | Unit tests | macOS (Python 3.12.8) | 379 tests pass: the 281 of 0.1.0 and 98 new |
+| 2026-11-10 | The element lookup's shell code (`find_el`) | The host's `sh` (bash 3.2 in POSIX mode), `dash` and `bash`, with a stand-in for the window-tree dump | Unique, nth, exact, entity-escaped and failed-read cases behave as designed, and so do two reads that must agree, a match that never holds still (`unstable`), a match first seen at the timeout, and the package filter (another package's element is never matched; `find.package` names one). The device's own shell and its `uiautomator` were not exercised by these tests |
+| 2026-11-10 | That the new tests can fail | 17 single mutations of the gate, the analysis, the device script and the host (the allowance ignored or widened, the baseline unused or replaced by the previous step, the lookup inside the step, no retry, the host error switched off) | Each one turns at least one test red |
+| 2026-11-10 | That the tests added for the review's findings can fail | 33 single mutations (failed.json not written; incomplete folders not seen, or seen under another check; summary and compare not leaving them out or not naming them; the first read accepted; no extra read at the timeout; a failed read not breaking the pair; the package filter, its override, its record and its gate check removed; the old marker name; the value and timeout checks relaxed; another scenario accepted by `gate --scenario`; the allowance's source not shown; `run` reusing a used folder; `doctor` requiring or skipping `uiautomator`; the README example without `until_quiet`) | Each one turns at least one test red |
+
+### Live validation, 0.2.0
+
+2026-11-10, on the Android 14 emulator of the 0.1.0 validation (API 34, arm64, a `user` build),
+against the debug build of a real app with a backend seeded for the purpose. Every command went
+through the launcher. The scenarios were the app's own: its tabs, eight pushed screens, pull to
+refresh and three forms, signed out and signed in.
+
+| What | Against | Result |
+|---|---|---|
+| `run` and `gate`, 13 scenarios in three phases | a clean build; 39 taps that find their target by text or description, 3 `text` steps (one of them signs in through the app), 4 rests with an allowance | PASS, exit 0. 44 gated rest windows: 40 at 0 frames, 4 on a focused field at 10 frames each, inside their allowance of 12. No recorded frame at rest that changed nothing. Every lookup: 2 reads, 4.6 to 4.9 s, the app's package recorded |
+| a `quiet` window shorter than the caret's blink | 400 ms on the two steps that end on a focused field | both timed out: the poll takes about as long as the gap between blinks. A fixed wait is what the README prescribes |
+| `gate`, faulty build 1 | an animation left running at zero alpha on the tab screens | FAIL, exit 1. Every rest on a tab: 140 to 190 frames, 133 to 166 recorded frames that changed nothing, 44% to 49% of one core. A rest on a form the fault does not reach passed on its allowance with 10 frames |
+| `gate`, faulty build 2 | an element redrawn on every frame behind zero alpha, above every screen; four scenarios | FAIL, exit 1. 17 of 17 rest windows fail frames (236 to 306, against 0, or against 12 on the three with an allowance) and CPU; 15 of 17 fail on recorded frames that changed nothing, and the other two lie after the recorder's 180 s limit, which the gate reports as such |
+| `gate`, faulty build 3 | an animation clock that runs for ever and draws nothing | FAIL, exit 1, on CPU alone: 65 to 86 ticks (13% to 17% of one core) in 5 of 5 rest windows, and no frame by any count |
+| lookup with `nth` | the second of five elements with the same text | found in 2 reads, the second in document order |
+| a lookup that cannot succeed, `--runs 2` | a text that is on no screen, 3 s timeout | exit 2 naming the step, the text and the package searched. `failed.json`, `raw/lookup-failed.txt` and the last tree are kept; the second run is not started. `gate` on the folder: FAIL (check `run`), exit 1, and exit 0 with `--advisory`. A rerun into the folder is refused. No recorder left on the device, the app in front |
+| a lookup that stops a flow part way | a sign-in of seven lookups whose last one named an element of another screen | exit 2 at that step; the six lookups before it kept their records, and the saved tree showed the screen the flow had reached |
+| `doctor --serial` | the emulator | reports `uiautomator` |
+
+Found on the way, and now in the README: a clean app's CPU at rest is not always zero. Three of 80
+still rest windows read 6 to 9 ticks in 5 s from background threads (the runtime's profile saver,
+a thread pool finishing a request), against a default limit of 10; a focused field read 6 to 9 in
+8 of 8 windows, so its allowance should raise the CPU limit as well as the frame limit.
+
+Not validated on a device: `find.package` naming another package and the refusal of a match in
+another package (the shell code is covered by the unit tests only); a match that never holds
+still; a lookup value containing an XML entity; an Android version other than 14; a physical
+device.
+
+The lookup's format facts (the dump is one line of XML, attributes end with
+`bounds="[x1,y1][x2,y2]"`, values escaped as described in the README) and the measurements that
+shaped the allowance and the baseline (a caret's 10 or 11 frames per 5 s window in 9 of 9
+windows; two tree reads producing 1 frame, 9 recorded frames that changed nothing and 9 CPU
+ticks) were taken on an Android 14 device before this release; they are not repeated by the unit
+tests.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

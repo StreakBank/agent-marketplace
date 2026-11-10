@@ -60,12 +60,22 @@ measures the app behind another one `"background": true`. Coordinates are fracti
 checked strictly: an unknown key, a key that does not apply to the step's kind or a value of the
 wrong type stops the run before anything touches the device.
 
+Step kinds are `rest`, `tap`, `swipe`, `key` and `text` (types into the focused field). Prefer
+`"find": {"text": ...}` or `{"desc": ...}` on a tap to hard-coded coordinates: the target is
+looked up on the device before the step (an element of the app's own package whose bounds held
+still over two reads), and the lookup is charged to no step. A screen that is
+never still by design (a blinking caret) gets an `allow` on its rest step, with a `reason`, and
+every step that ends on it a fixed wait (`"until_quiet": false`), since such a screen never goes
+quiet; never an allowance for recorded frames that changed nothing (there is none). The README's "Screens that are never still" has the
+measured numbers.
+
 ## Reading a run
 
 1. `ui-probe gate <dir>` first. Exit 1 means a violation; exit 2 means the tool could not do its
    job (read the message), never a pass. A `FAIL` line names the check, the step, the number and,
    for frame counts, which of the three counts decided. A `note` line names a witness that was
-   unavailable while another one decided: read the notes too.
+   unavailable while another one decided: read the notes too. A `FAIL [run]` line is a run that
+   did not complete (its folder holds `failed.json` with the error); it is never left out.
 2. For any step in question, **read its contact sheet** (`<run>/sheets/<step>.png`) with the Read
    tool. Each frame is labelled `#index +ms-since-step-start gap`, then the platform's render time,
    then `[identical]` when the frame changed nothing visible or `[bars only]` when only the system
@@ -122,7 +132,9 @@ Report `different` and `same` as such. Report `unknown` as unknown: it is not a 
 
 - Do not approve a signature or a frame budget from a single run.
 - Do not turn a timing into a threshold because it looked stable for an hour.
-- Do not explain away a rest-window failure as noise. A clean app reads zero.
+- Do not explain away a rest-window failure as noise. A clean app draws zero frames at rest. CPU
+  alone is the one exception: a single window a few ticks over the limit, with no frame, is run
+  again first, because background threads do that now and then; a fault repeats in every window.
 - Do not delete or rewrite a run directory; analysis can be redone from it (`analyze`, or
   `sheet` for one run, redoes the whole analysis from the raw files).
 

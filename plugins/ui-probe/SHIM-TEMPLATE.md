@@ -34,6 +34,7 @@ results. This rule adds only what the plugin deliberately does not know.
 - **Where it runs:** <before a landing / in CI / on demand>.
 - **Blocking or advisory:** <which checks block; which only report>.
 - **Limits that differ from the defaults:** <e.g. rest CPU budget, with the reason>.
+- **Rest steps with an `allow`:** <which screens are never still by design, and who approves an allowance>.
 - **Approved baselines:** <where `expect` values are reviewed and who approves a change>.
 - **Timings:** <never gated here / gated only on real devices through `compare`>.
 

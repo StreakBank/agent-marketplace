@@ -9,7 +9,8 @@ screen did, without anything inside the app. It answers two questions a function
   read from a screen recording: a clean transition, a transition through a skeleton or a flash, a
   flicker that leaves a state and returns to it.
 
-It knows a package name and screen coordinates. It names no app, screen, endpoint or UI framework.
+It knows a package name, screen coordinates and, for a tap that names its target, the target's
+text or content description. It names no app, screen, endpoint or UI framework.
 
 ## Three kinds of result, three rules
 
@@ -35,7 +36,9 @@ depending on host load, while its rest-window frame count stays at zero. Keep th
   as not observed, never as a count of zero.
 
 `ui-probe doctor [--serial <serial>]` checks all of this, including the ffmpeg version (a version
-string it cannot read is a warning, not a failure).
+string it cannot read is a warning, not a failure). With a serial it also says whether the device
+has `uiautomator`, which a tap with `find` needs to read the window tree; a scenario without
+`find` does not, so its absence is reported but is not a failure.
 
 ## Install
 
@@ -123,23 +126,123 @@ with different files is not replaced without `--force`. The scripts can also be 
   screen is stable.
 - Fixed waits must add up to less than the recorder's 180 s limit. Split longer scenarios.
 
+Four more keys, one example each:
+
+```json
+{"id": "type-code", "do": "text", "text": "000000"}
+{"id": "open", "do": "tap", "find": {"text": "Sign up"}}
+{"id": "open-slow", "do": "tap", "find": {"desc": "Phone number", "nth": 1, "timeout_ms": 15000}, "until_quiet": true, "quiet": {"max_ms": 30000}}
+{"id": "rest-field", "do": "rest", "ms": 5000, "allow": {"frames_max": 12, "reason": "the caret blinks twice a second"}}
+```
+
+- `text` types into whatever has focus. The text is at most 200 characters of letters, digits,
+  space and `@ . _ + -`; anything else is an error that names the character. It takes the keys a
+  `key` step takes and the same fixed wait (2500 ms), and its recording is judged like a tap's: a
+  state change, not motion.
+- `find` on a tap names its target instead of `x` and `y` (one or the other, never both):
+  exactly one of `text` (the element's text) or `desc` (its content description), matched exactly,
+  on an element of the scenario's `package` (`package` in `find` names another one, for a system
+  dialog say). Without `nth` the match must be unique; `nth` (from 1) picks among several in
+  document order. The lookup retries until the element is there and still, so it doubles as a
+  wait for the screen, up to `timeout_ms` (default: the scenario's `quiet.max_ms`).
+  `find_settle_ms` (default 1000) is the wait after it, before the counts of the step start. See
+  "Tap targets found on the device".
+- `quiet` on a tap, swipe, key or text step replaces the scenario's `quiet` values for that step
+  (a key it leaves out comes from the scenario). It applies only to a step that waits for quiet.
+- `allow` on a rest step raises its limits on purpose, with a reason. See "Screens that are never
+  still".
+
 The file is checked strictly before anything runs, because a key the tool ignored would silently
 change what is gated:
 
 - `package` is an application id (dot-separated names of letters, digits and `_`). `activity` is
   letters, digits, `_`, `.` and `$`, so an inner class such as `.Outer$Inner` works.
-- `quiet.ms` and `quiet.max_ms` are numbers of at least 100, with `max_ms` at least `ms`.
-  `until_quiet`, `meminfo` and `background` are `true` or `false`. `count_sections` is a list
-  of names.
+- `quiet.ms` and `quiet.max_ms` are numbers of at least 100, with `max_ms` at least `ms`, in the
+  scenario's block and in a step's (where the check uses the scenario's value for a key the step
+  leaves out). `until_quiet`, `meminfo` and `background` are `true` or `false`. `count_sections`
+  is a list of names.
 - The `gate` block takes only `rest_frames_max` (an integer) and `rest_cpu_pct_max` (a number).
+- `allow` takes `frames_max` and `changed_frames_max` (integers), `cpu_pct_max` (a number) and
+  `reason` (required), and at least one of the three limits. `find` takes `text` or `desc` (a
+  non-empty string of at most 200 characters on one line, with no tab, no other control
+  character, no surrogate and no character outside the Basic Multilingual Plane: the window-tree
+  dump never writes those as they are, so they could never match; the error names the character),
+  `nth` (an integer of at least 1), `timeout_ms` (a number of at least 100) and `package` (an
+  application id).
 - A key that is unknown, or that does not apply to the step's kind (`meminfo` on a tap,
-  `settle_ms` on a rest), is an error. Keys whose name ends in `comment` are allowed anywhere.
+  `settle_ms` on a rest, `allow` on a tap, `find` on a swipe, `quiet` on a step that does not wait
+  for quiet), is an error. Keys whose name ends in `comment` are allowed in the scenario and in a
+  step; inside `quiet`, `gate`, `expect`, `allow` and `find` every key must be one of the listed.
+
+## Screens that are never still
+
+Some screens draw at rest by design: a focused text field blinks its caret. Measured on a real
+app on Android 14, a blinking caret drew 10 or 11 frames in a 5 s rest window (9 of 9 windows),
+with no recorded frame that changed nothing and no recorded change large enough to count. Drawing
+them cost 3 to 9 CPU ticks (0.6% to 1.8% of one core over 17 windows), which at the top is one
+tick short of the default limit. A rest on such a screen takes an allowance for both:
+
+```json
+{"id": "rest-field", "do": "rest", "ms": 5000, "allow": {"frames_max": 12, "cpu_pct_max": 4.0, "reason": "the caret blinks twice a second"}}
+```
+
+- `frames_max` replaces the frames-at-rest limit and `cpu_pct_max` the CPU-at-rest limit for that
+  step; `changed_frames_max` is how many recorded frames may change the app's area (otherwise
+  none). A step's allowance wins over the command line and the scenario's `gate` block for that
+  step, and applies to no other step.
+- There is no allowance for recorded frames that changed nothing. A caret does not produce them;
+  an animation nobody can see does, and that check is what catches it.
+- A violation on such a step says the limit came from the step's allowance. A step that passed
+  only because of its allowance gets a note with the value observed, the allowance and the reason,
+  and `gate` lists every allowance in force under its run.
+- A screen with a blinking caret never goes quiet, so the step that focuses the field (and any
+  step that ends on it) would time out waiting. Give that step a fixed wait instead:
+  `"until_quiet": false` with a `settle_ms` that covers the transition. A shorter quiet window
+  does not help: the poll that watches for quiet takes about as long as the gap between two
+  blinks. Measured on an emulator, a 400 ms window timed out on 2 of 2 such steps while the
+  caret blinked every 500 ms.
+
+## Tap targets found on the device
+
+Coordinates break when a layout changes. A tap with `find` looks its target up on the device, in
+the device script, before the step starts, so one pass serves a flow that changes state. Each read
+dumps the window tree (`uiautomator dump`, about 2 s a read) and matches the attribute exactly as
+the dump writes it: `&`, `<`, `>` and `"` as entities, an apostrophe and every other character of
+the Basic Multilingual Plane as it is. The characters the dump does not write as they are (a tab,
+control characters, characters outside that plane) are refused when the scenario is checked. Only
+an element whose own `package` attribute is the scenario's package (or the step's `find.package`)
+counts, so an element of the same text in another app's window is never tapped. A match counts
+only when two reads in a row give it the same bounds, so a tap never goes to where an element was
+while it still moved. A wrong number of matches, a read that failed while the screen animated, or
+bounds that changed since the previous read is "not yet": the script waits 0.5 s and reads again,
+up to the timeout; a match first seen at the timeout gets one more read to hold still. The tap
+goes to the centre of the element's bounds, and `find-<step>.txt` and `run.json` record the
+package it was found in.
+
+A lookup is charged to no step. Reading the tree makes the app and the compositor work: two reads
+inside one rest window on a perfectly still screen produced 1 frame by the platform's count, 9
+recorded frames that changed nothing and 9 CPU ticks, where the windows before and after had 0. So
+after a lookup the script waits `find_settle_ms`, takes a baseline reading of every counter a
+snapshot reads (the platform's frames, the compositor's, CPU), and only then marks the step's
+start: the step's counts run from that baseline, not from the previous step's end, and the lookup
+lies outside every step's window by time, so neither the trace nor the recording places it in a
+step. That is also why `find` is not offered on a rest: a lookup never falls inside a rest window.
+A baseline that could not be read leaves the step's counts unknown; they are never taken from the
+previous step.
+
+When the element never appears, or never holds still (its status is then `unstable`), the script
+stops there, restores the device as on every other error path (the recorder stopped, the
+compositor's statistics off), and the run exits 2 with a message that names the step, what was
+looked for, how many elements matched at the last read (and the packages of matching elements in
+other apps, if any) and where the last tree read is saved. No capture is written: the run folder
+keeps `failed.json`, and `gate` fails the run (see "Runs that did not complete").
 
 ## What a run leaves on disk
 
 ```
 <dir>/run-01/
   capture.json          device facts, the scenario as run, host load, the tracer's output
+  failed.json           only when the run did not complete: the error, the step if known, the time (UTC)
   device-script.sh      the exact script that ran on the device
   raw/                  what the device script wrote:
     marks.txt             step marks on the device's boot clock
@@ -151,6 +254,11 @@ change what is gated:
     pid-<step>.txt        the app's process id at the end of each step
     fg-<step>.txt         the resumed activity at the end of each step: which app was in front
     mem-<step>.txt        memory, for rest steps with "meminfo": true
+    find-<step>.txt       a tap with "find": the lookup's result, matches, reads, time, bounds, centre, package
+    ui-<step>.xml         a tap with "find": the last window tree read
+    gfx-<step>.base.txt, sf-<step>.base.txt, cpu-<step>.base.txt, pid-<step>.base.txt
+                          a tap with "find": the baseline the step's counts start from
+    lookup-failed.txt     the step whose element never appeared or never held still, when a run stopped there
     screen.mp4            the recording (unless --no-video)
     sr-exit.txt           the recorder's exit status
     sr-alive.txt          whether the recorder was still running when the scenario ended
@@ -164,7 +272,17 @@ change what is gated:
 ```
 
 `analyze`, `gate`, `summary` and `compare` read only these files. No device is needed to redo
-them. `analyze <dir>...` redoes the whole analysis of every capture it finds; `sheet <run-dir>`
+them. `run` refuses a folder that already holds any of `capture.json`, `run.json`, `failed.json`,
+`device-script.sh` or `raw/`, so the files of one attempt are never mixed with another's.
+
+### Runs that did not complete
+
+A run that fails after its folder exists (a lookup that timed out, a device that went away, an
+interrupt) writes `failed.json` there. A folder that holds `failed.json`, `device-script.sh` or
+`raw/` but neither `capture.json` nor `run.json` is a run that did not complete: `gate` fails it
+(check `run`, with the saved error), `summary` lists it and leaves it out of every statistic, and
+`compare` names the ones it left out on each side. A batch that stopped at its third run therefore
+never passes on the two before it, and a folder holding only such runs fails the gate. `analyze <dir>...` redoes the whole analysis of every capture it finds; `sheet <run-dir>`
 does the same for one run. Both rewrite `run.json`, `video-frames.json`, `frames/` and the sheets
 from the raw files, and remove the old `run.json` first, so a failed analysis never leaves an
 earlier result standing.
@@ -193,9 +311,11 @@ exits 1 on a violation.
 
 | Check | Fails when |
 |---|---|
-| Frames at rest | the app drew more than `rest_frames_max` frames (default 0) in a rest step, or no count of its frames and no aligned recording exist |
-| Recording at rest | frames were composed that changed nothing on screen, or the app's area changed. Only an aligned recording decides, and only while the app is in front; otherwise these are notes |
-| CPU at rest | the app used more than `rest_cpu_pct_max` percent of one core (default 2.0) |
+| Frames at rest | the app drew more than `rest_frames_max` frames (default 0, or the step's `allow.frames_max`) in a rest step, or no count of its frames and no aligned recording exist |
+| Recording at rest | frames were composed that changed nothing on screen, or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes |
+| CPU at rest | the app used more than `rest_cpu_pct_max` percent of one core (default 2.0, or the step's `allow.cpu_pct_max`) |
+| Find | a tap with `find` holds no record of where its element was found, or the element was matched in another package than the one asked for |
+| Run | a run folder holds `failed.json`, `device-script.sh` or `raw/` but no capture: the run did not complete |
 | Quiet | a step with `until_quiet` never went quiet. The message says whether the app's own frame count kept changing, or only the display's (a system animation, the keyboard, another window) |
 | Process | the app's process was not running at the end of a step, more than one process carried its name, or it changed during the scenario |
 | Launch | the launch command printed an error or did not report completion, or no frame of the app was counted while it launched |
@@ -205,6 +325,12 @@ exits 1 on a violation.
 | Expectations | a step's `expect` is not met, or cannot be checked (no aligned recording for a signature, a section the app never emitted, a trace that lost data) |
 | Missing step, scenario | a step of the scenario has no record in the run, or its kind differs |
 | Analysis | a capture has no `run.json`, or one older than the capture: run `ui-probe analyze` |
+
+A clean app's frames at rest are zero; its CPU at rest is not always. On a real app three of 80
+still rest windows read 6 to 9 ticks in 5 s from background threads (the runtime's profile saver,
+a thread pool finishing a request), against the default limit of 10. A fault repeats: an animation
+clock that drew nothing read 65 to 86 ticks in 5 of 5 windows. So one window a few ticks over the
+limit, with no frame, is run again before it is judged; the same step failing twice is a finding.
 
 Frames are counted three ways and the largest available count decides, for the rest checks and
 for `expect` alike; the violation names the source. The three are the platform's own records for
@@ -240,8 +366,11 @@ recorder's start mark), or when the platform's frame rows do not line up with th
 the recording's at-rest findings become notes, frame counts still gate, and an
 `expect.signature` fails with "the recording could not be aligned".
 
-Limits come from the command line, then the scenario's `gate` block, then the defaults.
-`--advisory` reports the same violations and exits 0.
+Limits come from the step's `allow`, then the command line, then the scenario's `gate` block,
+then the defaults. `--advisory` reports the same violations and exits 0. `gate --scenario <file>`
+gates with a revised copy of the run's own scenario (a limit, an allowance): it refuses (exit 2) a
+scenario whose `name` differs from the one stored with the run, and each `allowance:` line then
+says that it came from `--scenario`.
 
 ## Comparing two builds
 
@@ -259,7 +388,9 @@ Five runs a side is the least at which `different` is reachable at the default a
 against five with no overlap gives p = 2/252, about 0.008. Interleave base and head runs on the
 same device so drift affects both.
 
-`summary` and `compare` refuse a capture that has not been analysed (exit 2).
+`summary` and `compare` refuse a capture that has not been analysed (exit 2). A run that did not
+complete is listed by `summary` and left out of every statistic; `compare` prints a note naming the
+ones it left out on each side.
 
 ## A slow network without administrator rights
 
@@ -312,7 +443,7 @@ produce packet loss.
 |---|---|
 | 0 | success, including a gate that passed |
 | 1 | the gate found a violation (and only that) |
-| 2 | an error the tool reports itself: a bad scenario, an unanalysed capture, a device or adb failure, a missing or too old tool found by `doctor`, a `zoom` that could not extract its frames |
+| 2 | an error the tool reports itself: a bad scenario, an unanalysed capture, a device or adb failure, an element a `find` tap never found, a missing or too old tool found by `doctor`, a `zoom` that could not extract its frames |
 | 3 | an unexpected error: the traceback is printed, and it is a defect in the tool |
 
 ## Known limits
@@ -330,6 +461,10 @@ produce packet loss.
 - **The foreground check looks at the end of a step, at launch and at rests only.** An app that
   left the foreground and returned within one step is not noticed, and a dialog the app shows in
   its own window is still the app.
+- **A lookup sees what the window tree exposes.** An element with no text and no content
+  description cannot be found by `find`; a screen that animates for longer than the timeout
+  fails every read. Each read takes about 2 s, and a match needs two reads that agree, so a lookup
+  overshoots its timeout by up to two reads.
 - **The detour threshold was calibrated on two cases in one app.** Treat `TD` against `T` as a
   signal to look at the sheet, and tune `DETOUR_RATIO` if your screens disagree.
 - **`--trace` stops every on-device trace owned by the shell user** when the scenario ends.

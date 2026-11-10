@@ -2,8 +2,9 @@
 """ui-probe: watch a mobile app from outside while a scripted scenario runs.
 
 The probe knows nothing about the app under test. A scenario file supplies the package, the
-launch component and a list of steps in normalized screen coordinates. Everything is read through
-adb from an unmodified build:
+launch component and a list of steps in normalized screen coordinates, or with tap targets named
+by their text or content description and looked up on the device. Everything is read through adb
+from an unmodified build:
 
   * frame counts and per-frame timing  : dumpsys gfxinfo <package> framestats   (HWUI apps)
   * compositor frame counts per layer  : dumpsys SurfaceFlinger --timestats     (any toolkit)
@@ -12,6 +13,7 @@ adb from an unmodified build:
   * CPU time                           : /proc/<pid>/stat (the process, including threads that have
                                          exited) and /proc/<pid>/task/*/stat (the live threads)
   * memory                             : dumpsys meminfo <package>
+  * tap targets (find)                 : uiautomator dump, matched on the device
   * what the screen showed             : screenrecord, one video frame per screen change
 
 Three kinds of result, three rules:
@@ -40,11 +42,12 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
-STEP_KINDS = ("rest", "tap", "swipe", "key")
+STEP_KINDS = ("rest", "tap", "swipe", "key", "text")
+ACTION_KINDS = ("tap", "swipe", "key", "text")     # every kind but rest: an input, then a wait
 RESERVED_IDS = ("launch", "T0", "END")
 FFMPEG_MIN = (5, 1)           # -fps_mode, used to extract recorded frames, arrived in FFmpeg 5.1
 
@@ -55,13 +58,66 @@ ACTIVITY_RE = re.compile(r"[A-Za-z0-9_.$]+")
 TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "steps",
             "count_sections", "gate"}
 STEP_KEYS = {
-    "rest": {"ms", "meminfo", "background"},
-    "tap": {"x", "y", "settle_ms", "until_quiet"},
-    "swipe": {"from", "to", "ms", "judge", "settle_ms", "until_quiet"},
-    "key": {"code", "settle_ms", "until_quiet"},
+    "rest": {"ms", "meminfo", "background", "allow"},
+    "tap": {"x", "y", "find", "find_settle_ms", "settle_ms", "until_quiet", "quiet"},
+    "swipe": {"from", "to", "ms", "judge", "settle_ms", "until_quiet", "quiet"},
+    "key": {"code", "settle_ms", "until_quiet", "quiet"},
+    "text": {"text", "settle_ms", "until_quiet", "quiet"},
 }
 COMMON_STEP_KEYS = {"id", "do", "expect"}
 EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max"}
+QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
+# A rest step's allowance: limits that replace the gate's for that step. There is deliberately no
+# limit for recorded frames that changed nothing: that check is what catches an invisible animation.
+ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max")
+FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package"}
+FIND_ATTRS = {"text": "text", "desc": "content-desc"}   # scenario key -> attribute of the window tree
+FIND_SETTLE_MS = 1000         # after a lookup, before the baseline reading: the lookup's own work settles
+FIND_READ_S = 2.5             # about how long one read of the window tree takes (measured: about 2 s)
+FIND_TIMEOUT_MIN_MS = 100
+LOOKUP_FAILED = "lookup-failed.txt"   # the step whose element never appeared; outside the find-*.txt names
+FAILED_RUN = "failed.json"            # written into a run folder when the run did not complete
+TEXT_MAX = 200
+TEXT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 @._+-")
+
+
+def default_settle_ms(do: str) -> int:
+    """The fixed wait after an action that does not wait for quiet."""
+    return 3000 if do == "tap" else 2500
+
+
+def xml_escape(value: str) -> str:
+    """A value as the window-tree dump writes it inside an attribute: & < > and " become entities;
+    an apostrophe and non-ASCII text are written as they are."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def find_needle(find: dict) -> str:
+    """The text that identifies the element in one node of the window tree: the attribute with a
+    leading space (so that no attribute whose name merely ends the same way matches), exactly."""
+    key = "text" if "text" in find else "desc"
+    return f' {FIND_ATTRS[key]}="{xml_escape(find[key])}"'
+
+
+def find_timeout_ms(scn: dict, step: dict) -> int:
+    return int(step["find"].get("timeout_ms", quiet_settings(scn)[1]))
+
+
+def find_package(scn: dict, step: dict) -> str:
+    """The package whose element a lookup may match: the step's 'find.package', else the app's."""
+    return step["find"].get("package", scn["package"])
+
+
+def unmatchable_char(value: str) -> str | None:
+    """The first character of a lookup value that the window-tree dump never writes as it is, or
+    None. The dump writes a tab, a newline and a carriage return as numeric references, a character
+    outside the Basic Multilingual Plane as a numeric reference, and replaces control characters
+    and the characters XML does not allow; a value holding one can never match."""
+    for ch in value:
+        o = ord(ch)
+        if (o < 0x20 or 0x7F <= o <= 0x9F or 0xD800 <= o <= 0xDFFF or o > 0xFFFF or o in (0xFFFE, 0xFFFF)):
+            return ch
+    return None
 
 TRACE_CONFIG = """\
 buffers { size_kb: 65536 fill_policy: RING_BUFFER }
@@ -136,9 +192,11 @@ def read_json(path: Path) -> dict:
 # scenario
 # --------------------------------------------------------------------------------------------
 
-def quiet_settings(scn: dict) -> tuple[int, int]:
-    q_ = scn.get("quiet") or {}
-    return int(q_.get("ms", 800)), int(q_.get("max_ms", 15000))
+def quiet_settings(scn: dict, step: dict | None = None) -> tuple[int, int]:
+    """(quiet ms, max ms) for the launch (step None) or a step. A step's own 'quiet' replaces the
+    scenario's values for the keys it gives; the scenario's fill in the rest."""
+    merged = {**QUIET_DEFAULTS, **(scn.get("quiet") or {}), **((step or {}).get("quiet") or {})}
+    return int(merged["ms"]), int(merged["max_ms"])
 
 
 def step_until_quiet(scn: dict, step: dict | None) -> bool:
@@ -185,14 +243,22 @@ def validate_scenario(scn: dict) -> None:
     steps = scn.get("steps")
     need(isinstance(steps, list) and steps, "'steps' must be a non-empty list")
     need(number(scn.get("launch_settle_ms", 0)) and scn.get("launch_settle_ms", 0) >= 0, "'launch_settle_ms' must be a number >= 0")
+    def check_quiet(block, prefix, inherited):
+        """The top-level 'quiet' block (prefix '') or a step's (inherited: the scenario's values,
+        which fill in a key the step leaves out)."""
+        need(isinstance(block, dict), f"{prefix}'quiet' must be an object with 'ms' and 'max_ms'")
+        unknown_ = sorted(k for k in block if k not in QUIET_DEFAULTS)
+        need(not unknown_, f"{prefix}unknown 'quiet' keys {unknown_}")
+        for k in QUIET_DEFAULTS:
+            if k in block:
+                need(number(block[k]) and block[k] >= 100, f"{prefix}'quiet.{k}' must be a number of at least 100")
+        eff = {**inherited, **block}
+        need(eff["max_ms"] >= eff["ms"], f"{prefix}'quiet.max_ms' must be at least 'quiet.ms'"
+             + ("" if not prefix else f" ({eff['max_ms']} and {eff['ms']}; a key the step leaves out comes from the scenario)"))
+
     quiet = scn.get("quiet", {})
-    need(isinstance(quiet, dict), "'quiet' must be an object with 'ms' and 'max_ms'")
-    unknown = sorted(k for k in quiet if k not in ("ms", "max_ms"))
-    need(not unknown, f"unknown 'quiet' keys {unknown}")
-    for k in ("ms", "max_ms"):
-        if k in quiet:
-            need(number(quiet[k]) and quiet[k] >= 100, f"'quiet.{k}' must be a number of at least 100")
-    need(quiet.get("max_ms", 15000) >= quiet.get("ms", 800), "'quiet.max_ms' must be at least 'quiet.ms'")
+    check_quiet(quiet, "", QUIET_DEFAULTS)
+    scenario_quiet = {**QUIET_DEFAULTS, **quiet}
     if "count_sections" in scn:
         sec = scn["count_sections"]
         need(isinstance(sec, list) and all(isinstance(n, str) and n for n in sec),
@@ -223,13 +289,74 @@ def validate_scenario(scn: dict) -> None:
         need(number(step.get("settle_ms", 0)) and step.get("settle_ms", 0) >= 0, f"step '{sid}': 'settle_ms' must be a number >= 0")
         if "until_quiet" in step:
             need(isinstance(step["until_quiet"], bool), f"step '{sid}': 'until_quiet' must be true or false")
+        if "quiet" in step:
+            check_quiet(step["quiet"], f"step '{sid}': ", scenario_quiet)
+            # A window the step never waits for would be ignored in silence.
+            need(step_until_quiet(scn, step),
+                 f"step '{sid}': 'quiet' applies only to a step that waits for quiet ('until_quiet' true here or in the scenario)")
         if do == "rest":
             need(number(step.get("ms")) and step["ms"] > 0, f"step '{sid}': rest needs 'ms' > 0")
             for k in ("meminfo", "background"):
                 if k in step:
                     need(isinstance(step[k], bool), f"step '{sid}': '{k}' must be true or false")
+            if "allow" in step:
+                allow = step["allow"]
+                need(isinstance(allow, dict), f"step '{sid}': 'allow' must be an object")
+                unknown = sorted(k for k in allow if k not in ALLOW_LIMITS + ("reason",))
+                need(not unknown, f"step '{sid}': unknown 'allow' keys {unknown}; known: {', '.join(ALLOW_LIMITS)}, reason"
+                     " (there is no allowance for recorded frames that changed nothing)")
+                need(isinstance(allow.get("reason"), str) and allow["reason"].strip(),
+                     f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
+                need(any(k in allow for k in ALLOW_LIMITS),
+                     f"step '{sid}': 'allow' needs at least one of {', '.join(ALLOW_LIMITS)}")
+                for k in ("frames_max", "changed_frames_max"):
+                    if k in allow:
+                        need(count(allow[k]), f"step '{sid}': 'allow.{k}' must be an integer >= 0")
+                if "cpu_pct_max" in allow:
+                    need(number(allow["cpu_pct_max"]) and allow["cpu_pct_max"] >= 0,
+                         f"step '{sid}': 'allow.cpu_pct_max' must be a number >= 0")
         elif do == "tap":
-            need(unit(step.get("x")) and unit(step.get("y")), f"step '{sid}': tap needs 'x' and 'y' between 0 and 1")
+            if "find" in step:
+                need("x" not in step and "y" not in step,
+                     f"step '{sid}': a tap takes either 'find' or 'x' and 'y', not both")
+                find = step["find"]
+                need(isinstance(find, dict), f"step '{sid}': 'find' must be an object")
+                unknown = sorted(k for k in find if k not in FIND_KEYS)
+                need(not unknown, f"step '{sid}': unknown 'find' keys {unknown}; known: {', '.join(sorted(FIND_KEYS))}")
+                named = [k for k in FIND_ATTRS if k in find]
+                need(len(named) == 1, f"step '{sid}': 'find' needs exactly one of 'text' or 'desc'")
+                value = find[named[0]]
+                need(isinstance(value, str) and value and len(value) <= TEXT_MAX and not ("\n" in value or "\r" in value),
+                     f"step '{sid}': 'find.{named[0]}' must be a non-empty string of at most {TEXT_MAX} characters, on one line")
+                bad = unmatchable_char(value)
+                need(bad is None,
+                     f"step '{sid}': 'find.{named[0]}' holds {bad!r} (U+{ord(bad or ' '):04X}), which the window-tree dump "
+                     "never writes as it is (a tab, a control character, a surrogate, a character outside the Basic "
+                     "Multilingual Plane or one XML does not allow), so it could never match")
+                if "nth" in find:
+                    need(isinstance(find["nth"], int) and not isinstance(find["nth"], bool) and find["nth"] >= 1,
+                         f"step '{sid}': 'find.nth' must be an integer >= 1")
+                if "timeout_ms" in find:
+                    need(number(find["timeout_ms"]) and find["timeout_ms"] >= FIND_TIMEOUT_MIN_MS,
+                         f"step '{sid}': 'find.timeout_ms' must be a number of at least {FIND_TIMEOUT_MIN_MS}")
+                if "package" in find:
+                    need(isinstance(find["package"], str) and PACKAGE_RE.fullmatch(find["package"]),
+                         f"step '{sid}': 'find.package' must be an application id: dot-separated names of letters, "
+                         "digits and '_', such as com.example.app")
+                if "find_settle_ms" in step:
+                    need(number(step["find_settle_ms"]) and step["find_settle_ms"] >= 0,
+                         f"step '{sid}': 'find_settle_ms' must be a number >= 0")
+            else:
+                need("find_settle_ms" not in step, f"step '{sid}': 'find_settle_ms' applies only to a tap with 'find'")
+                need(unit(step.get("x")) and unit(step.get("y")),
+                     f"step '{sid}': tap needs 'x' and 'y' between 0 and 1, or 'find'")
+        elif do == "text":
+            value = step.get("text")
+            need(isinstance(value, str) and value, f"step '{sid}': text needs a non-empty string 'text'")
+            need(len(value) <= TEXT_MAX, f"step '{sid}': 'text' is {len(value)} characters; at most {TEXT_MAX}")
+            bad = next((ch for ch in value if ch not in TEXT_CHARS), None)
+            need(bad is None, f"step '{sid}': 'text' may hold only letters, digits, space and @ . _ + -; "
+                              f"{bad!r} is not allowed")
         elif do == "swipe":
             need(number(step.get("ms", 300)) and step.get("ms", 300) > 0, f"step '{sid}': swipe 'ms' must be a number > 0")
             for end in ("from", "to"):
@@ -260,18 +387,25 @@ def validate_scenario(scn: dict) -> None:
 
 def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
     """Seconds the device script needs. worst_case counts every wait-for-quiet at its limit."""
-    q_ms, q_max = quiet_settings(scn)
-    quiet_cost = (q_max + 1500 if worst_case else q_ms + 600) / 1000
+    def quiet_cost(step):
+        q_ms, q_max = quiet_settings(scn, step)
+        return (q_max + 1500 if worst_case else q_ms + 600) / 1000
+
     total = 1 + 1.5 + 4 + scn.get("launch_settle_ms", 6000) / 1000
     if step_until_quiet(scn, None):
-        total += quiet_cost
+        total += quiet_cost(None)
     for step in scn["steps"]:
         if step["do"] == "rest":
             total += step["ms"] / 1000
         elif step_until_quiet(scn, step):
-            total += step.get("ms", 0) / 1000 + step.get("settle_ms", 300) / 1000 + quiet_cost
+            total += step.get("ms", 0) / 1000 + step.get("settle_ms", 300) / 1000 + quiet_cost(step)
         else:
-            total += step.get("ms", 0) / 1000 + step.get("settle_ms", 3000 if step["do"] == "tap" else 2500) / 1000
+            total += step.get("ms", 0) / 1000 + step.get("settle_ms", default_settle_ms(step["do"])) / 1000
+        if "find" in step:
+            # The lookup: two reads when the element is there and still, reads until the timeout
+            # (and up to two more) when it is not; then the settle time and the baseline reading.
+            lookup = find_timeout_ms(scn, step) / 1000 + 2 * FIND_READ_S + 0.5 if worst_case else 2 * FIND_READ_S + 0.5
+            total += lookup + step.get("find_settle_ms", FIND_SETTLE_MS) / 1000 + 0.6
         total += 0.6  # snapshot cost allowance
     return int(total + 6)
 
@@ -355,7 +489,8 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
     px = lambda v, full: str(int(v * full + 0.5))
     L = ["#!/system/bin/sh", f"D={DEV_DIR}", f"PKG={q(pkg)}", "SR=",
          "rm -f $D/marks.txt $D/gfx-*.txt $D/sf-*.txt $D/cpu-*.txt $D/pid-*.txt $D/mem-*.txt $D/fg-*.txt $D/screen.mp4 "
-         "$D/am-start.txt $D/sr-exit.txt $D/sr-alive.txt $D/sr.pid $D/script.pid",
+         "$D/am-start.txt $D/sr-exit.txt $D/sr-alive.txt $D/sr.pid $D/script.pid "
+         f"$D/find-*.txt $D/ui-*.xml $D/ui.tmp $D/hits.tmp $D/cand.tmp $D/{LOOKUP_FAILED}",
          "echo $$ > $D/script.pid",
          "# However the script ends (its last line, an error, a signal, a lost adb session), leave the",
          "# device as it found it: compositor statistics off and the recorder stopped.",
@@ -389,6 +524,68 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
          "  dumpsys SurfaceFlinger --timestats -dump > $D/sf-$1.txt 2>&1",
          "  if [ \"$2\" = mem ]; then dumpsys meminfo \"$PKG\" > $D/mem-$1.txt 2>&1; fi",
          "  cpu $1.after \"$P\"",
+         "}",
+         "# base <id>: every counter a snapshot reads, taken after an element lookup and its settle time.",
+         "# A lookup makes the app and the compositor work; the step's counts start here instead of at",
+         "# the previous step's end, so that work is charged to no step. CPU is read last.",
+         "base() {",
+         "  PID=$(pidof \"$PKG\"); P=${PID%% *}",
+         "  echo \"$PID\" > $D/pid-$1.base.txt",
+         "  dumpsys gfxinfo \"$PKG\" framestats > $D/gfx-$1.base.txt 2>&1",
+         "  dumpsys SurfaceFlinger --timestats -dump > $D/sf-$1.base.txt 2>&1",
+         "  cpu $1.base \"$P\"",
+         "}",
+         "# find_el <id> <needle> <nth, 0 for a unique match> <timeout ms> <package needle>: read the window",
+         "# tree until the element is there and still, then set FX FY to its centre. One node per line after",
+         "# splitting at '>'; the needle and the node's own package attribute are matched as fixed strings.",
+         "# A match counts only when two reads in a row give the same bounds. A read that fails (the screen",
+         "# still animating), a wrong number of matches or bounds that moved is 'not yet': wait 0.5 s and",
+         "# read again, up to the timeout; a match first seen at the timeout gets one more read to hold",
+         "# still. The last tree read is kept as ui-<id>.xml and the lookup's record as find-<id>.txt (on a",
+         "# timeout: not_found, or unstable when a match was there but moved). Returns 1 on a timeout.",
+         "find_el() {",
+         "  fid=$1; needle=$2; nth=$3; tmo=$4; pkn=$5",
+         "  t0=$(now_cs); reads=0; n=unread; b=; pb=; grace=",
+         "  while :; do",
+         "    reads=$((reads + 1)); b=",
+         "    rm -f $D/ui.tmp",
+         "    uiautomator dump $D/ui.tmp >/dev/null 2>&1",
+         "    if [ -s $D/ui.tmp ]; then",
+         "      mv $D/ui.tmp $D/ui-$fid.xml",
+         "      tr '>' '\\n' < $D/ui-$fid.xml | grep -F -- \"$needle\" > $D/cand.tmp",
+         "      grep -F -- \"$pkn\" $D/cand.tmp > $D/hits.tmp",
+         "      n=$(wc -l < $D/hits.tmp | tr -dc '0-9')",
+         "      k=$nth; if [ \"$k\" -eq 0 ]; then k=1; fi",
+         "      if { [ \"$nth\" -eq 0 ] && [ \"$n\" -eq 1 ]; } || { [ \"$nth\" -gt 0 ] && [ \"$n\" -ge \"$nth\" ]; }; then",
+         "        b=$(sed -n \"${k}p\" $D/hits.tmp | sed -nE 's/.*bounds=\"\\[([0-9]+),([0-9]+)\\]\\[([0-9]+),([0-9]+)\\]\".*/\\1 \\2 \\3 \\4/p')",
+         "      fi",
+         "    else",
+         "      n=unread",
+         "    fi",
+         "    t=$(now_cs); ms=$(( (t - t0) * 10 ))",
+         "    if [ -n \"$b\" ] && [ \"$b\" = \"$pb\" ]; then",
+         "      pk=$(sed -n \"${k}p\" $D/hits.tmp | sed -nE 's/.* package=\"([^\"]*)\".*/\\1/p')",
+         "      set -- $b",
+         "      FX=$(( ($1 + $3) / 2 )); FY=$(( ($2 + $4) / 2 ))",
+         "      { echo \"status found\"; echo \"matches $n\"; echo \"reads $reads\"; echo \"elapsed_ms $ms\"",
+         "        echo \"bounds $1 $2 $3 $4\"; echo \"centre $FX $FY\"; echo \"package $pk\"; } > $D/find-$fid.txt",
+         "      rm -f $D/hits.tmp $D/cand.tmp",
+         "      return 0",
+         "    fi",
+         "    if [ $ms -ge $tmo ]; then",
+         "      if [ -n \"$b\" ] && [ -z \"$grace\" ]; then grace=1; pb=$b; continue; fi",
+         "      st=not_found; if [ -n \"$b\" ]; then st=unstable; fi",
+         "      { echo \"status $st\"; echo \"matches $n\"; echo \"reads $reads\"; echo \"elapsed_ms $ms\"",
+         "        if [ -n \"$b\" ]; then echo \"last_bounds $b\"; echo \"previous_bounds $pb\"; fi",
+         "        if [ -s $D/cand.tmp ]; then",
+         "          echo \"other_packages $(grep -v -F -- \"$pkn\" $D/cand.tmp | sed -nE 's/.* package=\"([^\"]*)\".*/\\1/p' | tr '\\n' ' ')\"",
+         "        fi; } > $D/find-$fid.txt",
+         "      rm -f $D/hits.tmp $D/cand.tmp $D/ui.tmp",
+         "      return 1",
+         "    fi",
+         "    pb=$b",
+         "    sleep 0.5",
+         "  done",
          "}",
          "frames() { dumpsys gfxinfo \"$PKG\" 2>/dev/null | grep -m1 'Total frames rendered' | tr -dc '0-9'; }",
          "flips() { dumpsys SurfaceFlinger --timestats -dump -maxlayers 0 2>/dev/null | grep -m1 '^totalFrames' | tr -dc '0-9'; }",
@@ -435,25 +632,42 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
     L += ["snap launch"]
     for step in scn["steps"]:
         sid, do = step["id"], step["do"]
+        if "find" in step:
+            # The lookup comes before the step's start mark, so it lies outside every step's window
+            # by time; the baseline after it keeps it out of the step's counts as well.
+            nth = step["find"].get("nth", 0)
+            pkn = q(' package="' + find_package(scn, step) + '"')
+            L += [f"mark {sid}.find_start",
+                  f"if ! find_el {sid} {q(find_needle(step['find']))} {nth} {find_timeout_ms(scn, step)} {pkn}; then "
+                  f"mark {sid}.find_failed; echo {sid} > $D/{LOOKUP_FAILED}; exit 3; fi",
+                  f"mark {sid}.found",
+                  f"sleep {step.get('find_settle_ms', FIND_SETTLE_MS) / 1000}",
+                  f"base {sid}"]
         L.append(f"mark {sid}.start")
         if do == "rest":
             L.append(f"sleep {step['ms'] / 1000}")
         else:
-            if do == "tap":
+            if do == "tap" and "find" in step:
+                L.append("input tap $FX $FY")
+            elif do == "tap":
                 L.append(f"input tap {px(step['x'], width)} {px(step['y'], height)}")
             elif do == "swipe":
                 (x1, y1), (x2, y2) = step["from"], step["to"]
                 L.append(f"input swipe {px(x1, width)} {px(y1, height)} {px(x2, width)} {px(y2, height)} {step.get('ms', 300)}")
             elif do == "key":
                 L.append(f"input keyevent {step['code']}")
+            elif do == "text":
+                # `input text` spells a space as %s; the validated text holds no '%' of its own.
+                L.append(f"input text {q(step['text'].replace(' ', '%s'))}")
             else:
                 raise ProbeError(f"unknown step kind {do}")
             L.append(f"mark {sid}.injected")
-            fixed = step.get("settle_ms", 3000 if do == "tap" else 2500) / 1000
+            fixed = step.get("settle_ms", default_settle_ms(do)) / 1000
             if step_until_quiet(scn, step):
                 # An explicit settle_ms is a floor before polling; the fallback is the fixed wait.
                 floor = step["settle_ms"] / 1000 if "settle_ms" in step else 0.3
-                L += [f"sleep {floor}", f"wait_quiet {sid} {q_ms} {q_max} {round(max(0.0, fixed - floor), 3)}"]
+                s_ms, s_max = quiet_settings(scn, step)
+                L += [f"sleep {floor}", f"wait_quiet {sid} {s_ms} {s_max} {round(max(0.0, fixed - floor), 3)}"]
             else:
                 L.append(f"sleep {fixed}")
         L.append(f"mark {sid}.end")
@@ -697,11 +911,135 @@ def device_cleanup(serial: str) -> None:
         print(f"ui-probe: clean-up on the device failed ({exc}); compositor statistics may still be on", file=sys.stderr)
 
 
+def pull_raw(serial: str, out: Path, listing: list[str]) -> Path:
+    """Copy what the device script wrote into <out>/raw."""
+    raw = out / "raw"
+    raw.mkdir(exist_ok=True)
+    for name in listing:
+        if name == "run.sh":
+            continue
+        adb(serial, "pull", f"{DEV_DIR}/{name}", str(raw / name))
+    return raw
+
+
+def parse_find(text: str | None) -> dict | None:
+    """The record find_el() writes: status (found, not_found or unstable), matches in the wanted
+    package (a number, or None when the last read of the window tree failed), reads, elapsed_ms;
+    when found, bounds and centre in pixels and the matched node's package; on a timeout, the last
+    two bounds of a match that moved and the packages of matching elements in other packages."""
+    if text is None:
+        return None
+    out = {}
+    for line in text.splitlines():
+        key, _, rest = line.partition(" ")
+        vals = rest.split()
+        if key in ("status", "package"):
+            out[key] = rest.strip() or None
+        elif key in ("matches", "reads", "elapsed_ms"):
+            out[key] = int(vals[0]) if vals and vals[0].isdigit() else None
+        elif key in ("bounds", "centre", "last_bounds", "previous_bounds"):
+            out[key] = [int(v) for v in vals] if vals and all(v.isdigit() for v in vals) else None
+        elif key == "other_packages":
+            out[key] = list(dict.fromkeys(vals))
+    return out
+
+
+class LookupFailed(ProbeError):
+    """The device script stopped because an element never appeared (or never held still)."""
+
+    def __init__(self, message: str, step: str | None):
+        super().__init__(message)
+        self.step = step
+
+
+def describe_find(find: dict) -> str:
+    key = "text" if "text" in find else "desc"
+    what = f"the element with {'text' if key == 'text' else 'content description'} {json.dumps(find[key])}"
+    return what + (f" (match {find['nth']} in document order)" if "nth" in find else "")
+
+
+def lookup_failure(serial: str, scn: dict, out: Path, check: bool = True) -> LookupFailed | None:
+    """If the device script stopped because an element never appeared (or never held still), pull
+    its files and return the error to raise: it names the step, what was looked for, the matches at
+    the last read and where the last tree read is saved. None if it did not stop for that. With
+    check=False (the script already failed), a device that cannot be asked returns None so that the
+    original failure is reported."""
+    try:
+        listing = sh(serial, f"ls {DEV_DIR}").split()
+        if LOOKUP_FAILED not in listing:
+            return None
+        raw = pull_raw(serial, out, listing)
+    except ProbeError:
+        if check:
+            raise
+        return None
+    sid = (_read_raw(raw, LOOKUP_FAILED) or "").strip()
+    step = next((s for s in scn["steps"] if s["id"] == sid and "find" in s), None)
+    if step is None:
+        return LookupFailed(f"the device script stopped at an element lookup of an unknown step {sid!r}; "
+                            f"its files are in {raw}", None)
+    rec = parse_find(_read_raw(raw, f"find-{sid}.txt")) or {}
+    timeout = find_timeout_ms(scn, step)
+    pkg = find_package(scn, step)
+    want = "exactly one" if "nth" not in step["find"] else f"at least {step['find']['nth']}"
+    if rec.get("status") == "unstable":
+        moved = ""
+        if rec.get("previous_bounds") and rec.get("last_bounds"):
+            moved = f" (bounds {rec['previous_bounds']} then {rec['last_bounds']})"
+        seen = f"a match was there but did not hold still: two reads in a row never gave the same bounds{moved}"
+    elif rec.get("matches") is not None:
+        seen = f"{rec['matches']} matched in {pkg} at the last read ({want} needed)"
+    else:
+        seen = "the last read of the window tree failed"
+    others = [p for p in rec.get("other_packages") or [] if p != pkg]
+    if others:
+        seen += f"; matching elements in other packages: {', '.join(others)}"
+    tree = raw / f"ui-{sid}.xml"
+    where = f"the last tree read is saved in {tree}" if tree.exists() else "no read of the window tree succeeded, so no tree was saved"
+    reads = rec.get("reads")
+    verb = "did not hold still" if rec.get("status") == "unstable" else "did not appear"
+    return LookupFailed(f"step '{sid}': {describe_find(step['find'])} {verb} within {timeout} ms"
+                        f" ({reads if reads is not None else 'an unknown number of'} reads): {seen}; {where}."
+                        " The device script stopped there and restored the device; no capture was saved", sid)
+
+
+# What a run folder holds once a run has used it, completely or not: run refuses such a folder.
+RUN_MARKERS = ("capture.json", "run.json", FAILED_RUN, "device-script.sh", "raw")
+
+
+def write_failed(out: Path, exc: BaseException, scenario: str | None = None) -> None:
+    """Leave failed.json in a run folder whose run did not complete, so that gate, summary and
+    compare see the run instead of passing over it. Never raises: the original failure is reported."""
+    if isinstance(exc, ProbeError):
+        error = str(exc)
+    elif isinstance(exc, KeyboardInterrupt):
+        error = "interrupted"
+    else:
+        error = f"{type(exc).__name__}: {exc}"
+    try:
+        (out / FAILED_RUN).write_text(json.dumps({
+            "tool": {"name": "ui-probe", "version": VERSION}, "scenario": scenario, "error": error,
+            "step": getattr(exc, "step", None), "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, indent=1))
+    except OSError as err:
+        print(f"ui-probe: could not write {out / FAILED_RUN}: {err.strerror or err}", file=sys.stderr)
+
+
 def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False) -> dict:
     validate_scenario(scn)
+    held = [name for name in RUN_MARKERS if (out / name).exists()]
+    if held:
+        raise ProbeError(f"{out} already holds a run or what is left of one ({', '.join(held)}); choose a fresh "
+                         "directory (raw evidence is never overwritten)")
     out.mkdir(parents=True, exist_ok=True)
-    if (out / "capture.json").exists():
-        raise ProbeError(f"{out} already holds a run; choose a fresh directory (raw evidence is never overwritten)")
+    try:
+        return _run_once(serial, scn, out, trace, video, sections)
+    except BaseException as exc:
+        write_failed(out, exc, scn.get("name"))
+        raise
+
+
+def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool) -> dict:
     facts = device_facts(serial, scn["package"])
     total_s = scenario_duration_s(scn)
     limit_s = min(RECORD_LIMIT_S, total_s + 60)
@@ -724,7 +1062,20 @@ def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sectio
             time.sleep(1.5)
         started = time.time()
         # A stalled device (an ANR being processed, for instance) slows every shell call; allow for it.
-        sh(serial, f"sh {DEV_DIR}/run.sh", timeout=total_s + 420)
+        looks_up = any("find" in s for s in scn["steps"])
+        try:
+            sh(serial, f"sh {DEV_DIR}/run.sh", timeout=total_s + 420)
+        except ProbeError as exc:
+            # An element that never appeared ends the script on purpose (it restores the device on
+            # its way out): say so, with the evidence, instead of reporting a bare exit status.
+            failure = lookup_failure(serial, scn, out, check=False) if looks_up else None
+            if failure:
+                raise failure from exc
+            raise
+        # An adb that does not pass the script's exit status on reports success: look anyway.
+        failure = lookup_failure(serial, scn, out) if looks_up else None
+        if failure:
+            raise failure
         wall = time.time() - started
         load_after = host_load()
         if tracer is not None:
@@ -734,15 +1085,10 @@ def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sectio
             adb(serial, "pull", trace_dev, str(out / "trace.pftrace"))
             sh(serial, f"rm -f {trace_dev}", check=False)
 
-        raw = out / "raw"
-        raw.mkdir(exist_ok=True)
         listing = sh(serial, f"ls {DEV_DIR}").split()
         if "done.txt" not in listing:
             raise ProbeError("the device script did not finish (no done marker); raw files were left on the device")
-        for name in listing:
-            if name == "run.sh":
-                continue
-            adb(serial, "pull", f"{DEV_DIR}/{name}", str(raw / name))
+        pull_raw(serial, out, listing)
         finished = True
     finally:
         if tracer is not None:
@@ -772,6 +1118,38 @@ def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sectio
 def _read_raw(raw: Path, name: str) -> str | None:
     p = raw / name
     return p.read_text(errors="replace") if p.exists() else None
+
+
+def launch_end_mark(scn: dict) -> str:
+    """The launch window ends where the first step begins: at its element lookup if it has one, so
+    that the lookup lies in no window."""
+    first = scn["steps"][0]
+    return f"{first['id']}.find_start" if "find" in first else f"{first['id']}.start"
+
+
+def find_record(text: str | None, step: dict, facts: dict, baseline: dict | None) -> dict | None:
+    """What run.json says about a step's element lookup: what was looked for, the centre tapped (in
+    pixels and as fractions of the screen), the bounds, the package of the matched element, the
+    matches, the reads and the time it took, and when the baseline was read. None when the lookup
+    left no record."""
+    rec = parse_find(text)
+    if rec is None:
+        return None
+    sid = step["id"]
+    centre, w, h = rec.get("centre"), facts.get("width"), facts.get("height")
+    return {
+        **{k: step["find"][k] for k in ("text", "desc", "nth") if k in step["find"]},
+        "status": rec.get("status"),
+        "centre_px": centre,
+        "centre": [round(centre[0] / w, 4), round(centre[1] / h, 4)] if centre and len(centre) == 2 and w and h else None,
+        "bounds_px": rec.get("bounds"),
+        "package": rec.get("package"),
+        "matches": rec.get("matches"), "reads": rec.get("reads"), "lookup_ms": rec.get("elapsed_ms"),
+        "settle_ms": step.get("find_settle_ms", FIND_SETTLE_MS),
+        # The uptime of the baseline's CPU reading: the step's counts start there.
+        "baseline_s": baseline.get("uptime") if baseline else None,
+        "tree": f"raw/ui-{sid}.xml",
+    }
 
 
 def analyze_run(out: Path, scn: dict | None = None) -> dict:
@@ -808,13 +1186,18 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
     cpu_after = table("cpu", parse_cpu, ".after.txt")
     pids = table("pid", str.strip)
     sf = table("sf", parse_timestats)
+    # The baseline readings taken after an element lookup, for the steps that have one.
+    gfx_base = table("gfx", parse_gfx, ".base.txt")
+    cpu_base = table("cpu", parse_cpu, ".base.txt")
+    pids_base = table("pid", str.strip, ".base.txt")
+    sf_base = table("sf", parse_timestats, ".base.txt")
     sf_ok = any(v["total"] is not None for v in sf.values())
     hwui = any(g.get("present") and g.get("total_frames") is not None for g in gfx.values())
 
     # union of per-frame rows across snapshots (the platform keeps only the most recent 120 per window)
     seen = {}
     for sid in order:
-        for row in gfx.get(sid, {}).get("rows", []):
+        for row in gfx.get(sid, {}).get("rows", []) + gfx_base.get(sid, {}).get("rows", []):
             key = (row.get("IntendedVsync"), row.get("FrameTimelineVsyncId"), row.get("FrameCompleted"))
             seen[key] = row
     frames = sorted(seen.values(), key=lambda r: r.get("IntendedVsync", 0))
@@ -841,11 +1224,18 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
         prev_sid = None if first else order[n - 1]
         step = by_id.get(sid)
         kind = "launch" if sid == "launch" else step["do"]
+        # A step that looked up its target counts from the baseline taken after the lookup, never
+        # from the previous step's end (the lookup's own work lies between the two).
+        found = step is not None and "find" in step
         start = marks.get("launch.start" if sid == "launch" else f"{sid}.start")
-        end = marks.get(f"{sid}.end") if sid != "launch" else marks.get(scn["steps"][0]["id"] + ".start")
+        end = marks.get(f"{sid}.end") if sid != "launch" else marks.get(launch_end_mark(scn))
         missing = [label for label, tbl in (("frame stats", gfx), ("compositor statistics", sf), ("cpu", cpu_end),
                                             ("process id", pids)) if sid not in tbl]
-        g, pg = gfx.get(sid), (None if first else gfx.get(prev_sid))
+        if found:
+            missing += [f"baseline {label}" for label, tbl in (("frame stats", gfx_base), ("compositor statistics", sf_base),
+                                                               ("cpu", cpu_base), ("process id", pids_base)) if sid not in tbl]
+        g = gfx.get(sid)
+        pg = None if first else (gfx_base.get(sid) if found else gfx.get(prev_sid))
         pid_now = pids.get(sid)
         pid_prev = None if first else pids.get(prev_sid)
         single = single_pid(pid_now)
@@ -873,6 +1263,8 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
         if now_c is not None and single is not None and not restarted:
             if first:
                 base = {"uptime": marks.get("launch.start"), "process": 0, "threads": {}}
+            elif found:
+                base = cpu_base.get(sid) if single_pid(pids_base.get(sid)) == single else None
             elif single_pid(pid_prev) == single:
                 base = cpu_after.get(prev_sid)
             else:
@@ -889,7 +1281,7 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
                 cpu_delta = dict(sorted(agg.items(), key=lambda kv: -kv[1]))
 
         first_frame_ms = None
-        if kind in ("tap", "swipe", "key") and in_step:
+        if kind in ACTION_KINDS and in_step:
             inj = marks.get(f"{sid}.start")
             done = [r["FrameCompleted"] for r in in_step if r.get("FrameCompleted", 0) > 0]
             if done:
@@ -897,7 +1289,7 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
 
         frames_display = frames_layers = None
         now_sf = sf.get(sid)
-        prev_sf = None if first else sf.get(prev_sid)
+        prev_sf = None if first else (sf_base.get(sid) if found else sf.get(prev_sid))
         if now_sf is not None and now_sf["total"] is not None:
             prev_ok = first or (prev_sf is not None and prev_sf["total"] is not None)
             if prev_ok:
@@ -946,6 +1338,8 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
         mem_text = _read_raw(raw, f"mem-{sid}.txt")
         if mem_text is not None:
             step_rec["meminfo"] = parse_meminfo(mem_text)
+        if found:
+            step_rec["find"] = find_record(_read_raw(raw, f"find-{sid}.txt"), step, facts, cpu_base.get(sid))
         steps_out.append(step_rec)
 
     rows_total = sum(s["rows_in_window"] for s in steps_out)
@@ -1111,21 +1505,63 @@ def describe(values):
     return out
 
 
-def find_runs(dirs: list[str]) -> list[tuple[Path, str | None]]:
-    """Every run directory under dirs (one that holds capture.json or run.json) with the reason it
-    cannot be used, or None. Captures are enumerated, not analyses: a capture whose analysis is
-    missing or older than the capture is reported, never skipped."""
-    found = set()
+def failed_record(run_dir: Path) -> str | None:
+    """What a run's failed.json says went wrong, or None when there is no such file."""
+    p = run_dir / FAILED_RUN
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+        error = data.get("error") if isinstance(data, dict) else None
+        step = data.get("step") if isinstance(data, dict) else None
+    except (OSError, ValueError) as exc:
+        return f"its {FAILED_RUN} cannot be read ({exc})"
+    if not error:
+        return f"its {FAILED_RUN} holds no error"
+    # A lookup failure already names its step at the start of its own message.
+    named = f"step '{step}': "
+    if step and str(error).startswith(named):
+        return str(error)
+    return (f"at step '{step}': " if step else "") + str(error)
+
+
+def failed_scenario(run_dir: Path) -> str | None:
+    """The scenario name a run's failed.json carries, if any."""
+    try:
+        data = json.loads((run_dir / FAILED_RUN).read_text())
+    except (OSError, ValueError):
+        return None
+    return data.get("scenario") if isinstance(data, dict) and isinstance(data.get("scenario"), str) else None
+
+
+def find_runs(dirs: list[str]) -> list[tuple[Path, str | None, str | None]]:
+    """Every run folder under dirs with the reason it cannot be used and the check that reason
+    belongs to, or (path, None, None). Captures are enumerated, not analyses: a capture whose
+    analysis is missing or older than the capture is reported ('analysis'), never skipped. A folder
+    a run started but did not complete (one with failed.json, device-script.sh or raw/ and neither
+    capture.json nor run.json) is reported too ('run'), so a batch with a failed run never passes
+    on the runs that completed."""
+    found, started = set(), set()
     for d in dirs:
         root = Path(d)
         if not root.exists():
             raise ProbeError(f"{d} does not exist")
         for name in ("capture.json", "run.json"):
             found.update(p.parent for p in root.glob(f"**/{name}"))
-    if not found:
-        raise ProbeError("no capture.json or run.json found under " + ", ".join(dirs))
+        for name in (FAILED_RUN, "device-script.sh"):
+            started.update(p.parent for p in root.glob(f"**/{name}"))
+        started.update(p.parent for p in root.glob("**/raw") if p.is_dir())
+    incomplete = started - found
+    if not found and not incomplete:
+        raise ProbeError("no run found (no capture.json, run.json, failed.json, device-script.sh or raw/) under "
+                         + ", ".join(dirs))
     out = []
-    for run_dir in sorted(found):
+    for run_dir in sorted(found | incomplete):
+        if run_dir in incomplete:
+            saved = failed_record(run_dir)
+            out.append((run_dir, "the run did not complete" + (f": {saved}" if saved else
+                                                               f" (no {FAILED_RUN}, capture.json or run.json)"), "run"))
+            continue
         cap, res = run_dir / "capture.json", run_dir / "run.json"
         problem = None
         if not cap.exists():
@@ -1134,17 +1570,26 @@ def find_runs(dirs: list[str]) -> list[tuple[Path, str | None]]:
             problem = "not analysed: the capture has no run.json (the analysis failed or never ran); run `ui-probe analyze`"
         elif res.stat().st_mtime_ns < cap.stat().st_mtime_ns:
             problem = "not analysed: run.json is older than capture.json; run `ui-probe analyze`"
-        out.append((run_dir, problem))
+        if problem:
+            saved = failed_record(run_dir)
+            if saved:
+                problem += f"; the run reported: {saved}"
+        out.append((run_dir, problem, "analysis" if problem else None))
     return out
 
 
-def load_runs(dirs: list[str]) -> list[tuple[str, dict]]:
-    runs = []
-    for path, problem in find_runs(dirs):
-        if problem:
+def load_runs(dirs: list[str]) -> tuple[list[tuple[str, dict]], list[dict]]:
+    """The analysed runs under dirs, and the runs that did not complete (left out, by name). Any
+    other problem (a capture that was not analysed) is an error."""
+    runs, incomplete = [], []
+    for path, problem, check in find_runs(dirs):
+        if check == "run":
+            incomplete.append({"run": str(path), "problem": problem})
+        elif problem:
             raise ProbeError(f"{path}: {problem}")
-        runs.append((str(path), read_json(path / "run.json")))
-    return runs
+        else:
+            runs.append((str(path), read_json(path / "run.json")))
+    return runs, incomplete
 
 
 def run_row(path: str, r: dict) -> dict:
@@ -1198,7 +1643,11 @@ def run_row(path: str, r: dict) -> dict:
 
 
 def summary(dirs: list[str]) -> dict:
-    raw_rows = [run_row(path, r) for path, r in load_runs(dirs)]
+    runs, incomplete = load_runs(dirs)
+    if not runs:
+        raise ProbeError("no run under " + ", ".join(dirs) + " completed: "
+                         + "; ".join(f"{x['run']}: {x['problem']}" for x in incomplete))
+    raw_rows = [run_row(path, r) for path, r in runs]
     keys = []
     for row in raw_rows:
         keys += [k for k in row if k != "run" and k not in keys]
@@ -1210,7 +1659,7 @@ def summary(dirs: list[str]) -> dict:
         else:
             distinct = sorted({json.dumps(v) for v in vals})
             table[k] = {"n": len(vals), "distinct": len(distinct), "values": distinct[:6]}
-    return {"runs": raw_rows, "stats": table}
+    return {"runs": raw_rows, "incomplete": incomplete, "stats": table}
 
 
 # --------------------------------------------------------------------------------------------
@@ -1304,6 +1753,14 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 fail("process", sid, f"no process id was recorded at the end of '{sid}'")
             else:
                 fail("process", sid, f"the app's process was not running at the end of '{sid}'")
+        if step is not None and "find" in step:
+            rec = s.get("find") or {}
+            if not rec.get("centre_px"):
+                fail("find", sid, f"the run holds no record of where {describe_find(step['find'])} was found, "
+                     "so what the step tapped is unknown")
+            elif rec.get("package") != find_package(scn, step):
+                fail("find", sid, f"{describe_find(step['find'])} was matched in package {rec.get('package')!r}, "
+                     f"not in {find_package(scn, step)!r}: the step may have tapped another app")
         if s.get("process_ambiguous"):
             fail("process", sid, f"more than one process carried the app's name at the end of '{sid}' (a restart in progress)")
         if s.get("process_restarted"):
@@ -1333,6 +1790,27 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 # The compositor's statistics work on this device and hold no layer of the app.
                 fail("launch", sid, "the compositor saw no layer of the app while it launched: nothing of the app was on screen")
         if s["kind"] == "rest":
+            # A step's allowance replaces, for this step only, the limit the command line, the
+            # scenario's gate block or the default would set. Recorded frames that changed nothing
+            # have no allowance: that check is what catches an invisible animation.
+            allow = (step or {}).get("allow") or {}
+            reason = allow.get("reason")
+
+            def step_limit(key, otherwise):
+                """(limit, the limit that would otherwise apply, whether the allowance set it)."""
+                return (allow[key], otherwise, True) if key in allow else (otherwise, otherwise, False)
+
+            def by_allowance(granted):
+                return f" by the step's allowance ({reason})" if granted else ""
+
+            def within_allowance(observed, otherwise, allowed, what):
+                notes.append(f"{sid}: {observed} {what}, above the limit of {otherwise} that would otherwise apply; "
+                             f"passed on the step's allowance of {allowed} ({reason})")
+
+            frames_max, frames_otherwise, frames_allowed = step_limit("frames_max", opts["rest_frames_max"])
+            changed_max, changed_otherwise, changed_allowed = step_limit("changed_frames_max", 0)
+            cpu_max, cpu_otherwise, cpu_allowed = step_limit("cpu_pct_max", opts["rest_cpu_pct_max"])
+            allowance = lambda granted: {"limit_from": "allowance"} if granted else {}
             counted, source = frame_count(s)
             vid = video.get(sid)
             # With another app in front the recording shows that app; it says nothing about this one.
@@ -1343,9 +1821,12 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                        "and a recording that shows another app" if not shows_app else
                        "and a recording that could not be aligned")
                 fail("rest-frames", sid, "cannot count frames: no frame stats from the platform or the compositor, no trace " + why)
-            if counted is not None and counted > opts["rest_frames_max"]:
-                fail("rest-frames", sid, f"{counted} frames drawn at rest ({source} count), allowed {opts['rest_frames_max']}",
-                     observed=counted, allowed=opts["rest_frames_max"], source=source)
+            if counted is not None and counted > frames_max:
+                fail("rest-frames", sid, f"{counted} frames drawn at rest ({source} count), allowed {frames_max}"
+                     + by_allowance(frames_allowed),
+                     observed=counted, allowed=frames_max, source=source, **allowance(frames_allowed))
+            elif counted is not None and frames_allowed and counted > frames_otherwise:
+                within_allowance(counted, frames_otherwise, frames_max, f"frames drawn at rest ({source} count)")
             elif counted is None and usable:
                 notes.append(f"{sid}: no platform frame count for this app; only the recording was checked")
             if vid is not None and not shows_app:
@@ -1353,14 +1834,19 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
             elif vid is not None:
                 findings = []
                 if vid["identical_frames"] > 0:
-                    findings.append((vid["identical_frames"],
+                    findings.append((vid["identical_frames"], 0, False,
                                      f"{vid['identical_frames']} frames were composed at rest that changed nothing on screen"))
                 real = vid.get("app_changed_frames_real", vid["app_region_frames"])
-                if real > 0:
-                    findings.append((real, f"the screen changed at rest: {real} frames in the app's area"))
-                for observed, message in findings:
+                if real > changed_max:
+                    findings.append((real, changed_max, changed_allowed,
+                                     f"the screen changed at rest: {real} frames in the app's area"
+                                     + (f", allowed {changed_max}{by_allowance(True)}" if changed_allowed else "")))
+                elif changed_allowed and real > changed_otherwise:
+                    within_allowance(real, changed_otherwise, changed_max, "recorded frames changed the app's area at rest")
+                for observed, allowed, granted, message in findings:
                     if aligned:
-                        fail("rest-video", sid, message, observed=observed)
+                        fail("rest-video", sid, message, observed=observed, **({"allowed": allowed} if granted else {}),
+                             **allowance(granted))
                     else:
                         notes.append(f"{sid}: {message} (the recording is not aligned with the step marks, so this is not a violation)")
             ticks = s.get("cpu_ticks_total")
@@ -1369,9 +1855,12 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 notes.append(f"{sid}: CPU at rest not available")
             else:
                 cpu_pct = round(100 * ticks * (1000 / tck) / (window_s * 1000), 2)
-                if cpu_pct > opts["rest_cpu_pct_max"]:
-                    fail("rest-cpu", sid, f"{cpu_pct}% of one core used at rest ({ticks} ticks), allowed {opts['rest_cpu_pct_max']}%",
-                         observed=cpu_pct, allowed=opts["rest_cpu_pct_max"])
+                if cpu_pct > cpu_max:
+                    fail("rest-cpu", sid, f"{cpu_pct}% of one core used at rest ({ticks} ticks), allowed {cpu_max}%"
+                         + by_allowance(cpu_allowed),
+                         observed=cpu_pct, allowed=cpu_max, **allowance(cpu_allowed))
+                elif cpu_allowed and cpu_pct > cpu_otherwise:
+                    within_allowance(f"{cpu_pct}%", f"{cpu_otherwise}%", f"{cpu_max}%", "of one core used at rest")
         expect = (step or {}).get("expect") or {}
         if "signature" in expect:
             got = (video.get(sid) or {}).get("signature")
@@ -1421,16 +1910,21 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
     if scenario is not None:
         validate_scenario(scenario)
     out = {"tool": {"name": "ui-probe", "version": VERSION}, "runs": []}
-    for path, problem in find_runs(dirs):
+    for path, problem, check in find_runs(dirs):
         if problem:
-            name = scenario["name"] if scenario else None
-            out["runs"].append({"run": str(path), "scenario": name, "frame_sources": None, "limits": None,
-                                "verdict": "FAIL", "notes": [],
-                                "violations": [{"check": "analysis", "step": None, "message": problem}]})
+            name = scenario["name"] if scenario else failed_scenario(path)
+            out["runs"].append({"run": str(path), "scenario": name, "frame_sources": None, "limits": None, "allowances": None,
+                                "allowances_from": None, "verdict": "FAIL", "notes": [],
+                                "violations": [{"check": check, "step": None, "message": problem}]})
             continue
         cap = read_json(path / "capture.json")
         r = read_json(path / "run.json")
-        scn = scenario or cap.get("scenario")
+        stored = cap.get("scenario")
+        if scenario is not None and isinstance(stored, dict) and stored.get("name") != scenario["name"]:
+            # An override is the same scenario revised (a limit, an allowance), never another one.
+            raise ProbeError(f"{path}: --scenario is '{scenario['name']}' but the run was captured with "
+                             f"'{stored.get('name')}'; gate it with its own scenario")
+        scn = scenario or stored
         if scn is None:
             raise ProbeError(f"{path}: the capture holds no scenario; pass --scenario")
         if scenario is None:
@@ -1442,8 +1936,10 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
         opts.update(scn.get("gate") or {})
         opts.update({k: v for k, v in overrides.items() if v is not None})
         res = gate_run(r, scn, opts)
+        allowances = {s["id"]: s["allow"] for s in scn["steps"] if "allow" in s}
         out["runs"].append({"run": str(path), "scenario": scn["name"], "frame_sources": r.get("frame_sources") or [],
-                            "limits": opts, **res})
+                            "limits": opts, "allowances": allowances,
+                            "allowances_from": "--scenario" if scenario is not None else "capture", **res})
     out["verdict"] = "FAIL" if any(x["verdict"] == "FAIL" for x in out["runs"]) else "PASS"
     return out
 
@@ -1541,8 +2037,10 @@ def compare_metric(base: list, head: list, alpha: float, min_runs: int) -> dict:
 
 
 def compare(base_dirs: list[str], head_dirs: list[str], metrics: list[str], alpha: float, min_runs: int) -> dict:
-    base = [run_row(p, r) for p, r in load_runs(base_dirs)]
-    head = [run_row(p, r) for p, r in load_runs(head_dirs)]
+    base_runs, base_incomplete = load_runs(base_dirs)
+    head_runs, head_incomplete = load_runs(head_dirs)
+    base = [run_row(p, r) for p, r in base_runs]
+    head = [run_row(p, r) for p, r in head_runs]
     keys = metrics or sorted({k for row in base + head for k, v in row.items()
                               if k not in ("run", "host_load1") and isinstance(v, (int, float))})
     table = {}
@@ -1556,6 +2054,7 @@ def compare(base_dirs: list[str], head_dirs: list[str], metrics: list[str], alph
             table[k] = compare_metric(col_a, col_b, alpha, min_runs)
     order = {"different": 0, "unknown": 1, "same": 2}
     return {"tool": {"name": "ui-probe", "version": VERSION}, "alpha": alpha, "min_runs": min_runs,
+            "incomplete": {"base": base_incomplete, "head": head_incomplete},
             "metrics": dict(sorted(table.items(), key=lambda kv: (order[kv[1]["verdict"]], kv[0])))}
 
 
@@ -1614,6 +2113,11 @@ def doctor(serial: str | None) -> dict:
                 for tool in ("screenrecord", "perfetto", "dumpsys", "input", "pidof"):
                     path = sh(serial, f"command -v {tool}", check=False).strip()
                     add(f"device {tool}", bool(path), path or "missing", required=tool != "perfetto")
+                # Needed only by a tap with "find"; a scenario without one runs without it.
+                path = sh(serial, "command -v uiautomator", check=False).strip()
+                add("device uiautomator (for find)", bool(path),
+                    path or "missing: a tap with \"find\" needs it to read the window tree; other steps do not",
+                    required=False)
         except (ProbeError, subprocess.TimeoutExpired) as exc:
             add("device", False, str(exc))
     ok = all(c["ok"] for c in checks if c["required"])
@@ -1727,6 +2231,8 @@ def _dispatch(args) -> int:
             print("analysed", run if args.cmd == "analyze" else run / "sheets")
     elif args.cmd == "summary":
         out = summary(args.dirs)
+        for x in out["incomplete"]:
+            print(f"incomplete, left out of every statistic: {x['run']}: {x['problem']}")
         if args.json:
             Path(args.json).write_text(json.dumps(out, indent=1))
         if args.csv:
@@ -1748,10 +2254,19 @@ def _dispatch(args) -> int:
                 print(f"  FAIL [{v['check']}] {v['step'] or '-'}: {v['message']}")
             for n in run["notes"]:
                 print(f"  note: {n}")
+            source = " (from --scenario, not the scenario stored with the run)" \
+                if run.get("allowances_from") == "--scenario" else ""
+            for sid, allow in (run.get("allowances") or {}).items():
+                granted = ", ".join(f"{k} {allow[k]}" for k in ALLOW_LIMITS if k in allow)
+                print(f"  allowance: {sid}: {granted} ({allow['reason']}){source}")
         print(f"gate: {out['verdict']}" + (" (advisory)" if args.advisory and out["verdict"] == "FAIL" else ""))
         return 1 if out["verdict"] == "FAIL" and not args.advisory else 0
     elif args.cmd == "compare":
         out = compare(args.base, args.head, args.metric, args.alpha, args.min_runs)
+        for side in ("base", "head"):
+            if out["incomplete"][side]:
+                print(f"note: {side}: left out {len(out['incomplete'][side])} incomplete runs: "
+                      + ", ".join(x["run"] for x in out["incomplete"][side]))
         if args.json:
             Path(args.json).write_text(json.dumps(out, indent=1))
         for k, v in out["metrics"].items():
