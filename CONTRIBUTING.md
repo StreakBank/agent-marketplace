@@ -118,6 +118,17 @@ force-loaded "log it locally" instruction silently swallows every generic discov
   `PROVENANCE.md`.
 - Confirm the authoring project still works with the plugin installed globally and its
   local copy (if any) deleted — extraction that breaks the origin is a regression.
+- A validation that starts a long-lived helper (a proxy, a server, a tracer) owns that
+  helper's whole life. Start it as a direct command, not through a shell function or a
+  pipeline: `helper &` inside a function puts the *subshell's* pid in `$!`, so a later
+  `kill $!` leaves the helper running. Wait for its ready line, check that the listener on
+  its port is the pid you started, and check the port is free when you are done. A helper
+  left over from an earlier run answers on the same port, and the run then validates the
+  old code without any error (seen once: a probe through the "new" proxy returned no
+  status, and the new proxy's log stayed empty).
+- Run one live pass through the real entry point before trusting a unit suite that mocks a
+  process boundary. A mock of `adb`, `git` or a child process cannot see a crash in the
+  plumbing around it (a closed pipe flushed twice, a signal delivered to the wrong pid).
 
 ## 10. Known Claude Code harness traps
 

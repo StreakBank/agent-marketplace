@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 — 2026-11-10
+
+- Add ui-probe 0.1.0: watch a mobile app from outside while a scripted scenario runs. Counts the
+  platform's frames and the app's CPU while the screen is at rest, reads the sequence of visual
+  states of each step from a screen recording, and keeps every timing as a distribution. CLI:
+  `run`, `analyze`, `summary`, `gate`, `compare`, `sheet`, `zoom`, `proxy`, `doctor`. Android
+  over adb, nothing added to the app. See `plugins/ui-probe/CHANGELOG.md`.
+- android-device 0.2.1: the skill now records what the emulator's condition levers do inside
+  the guest (memory, cores, low-RAM flag, refresh rate, CPU delay, console network shaping, the
+  two guest network paths, system signals), measured on emulator 37.1.4. Several accepted flags
+  do nothing; the table says which.
+- CI runs the Python unit tests of plugins that ship a `tests/` directory with a
+  `requirements-ci.txt`, on a pinned interpreter.
+- CONTRIBUTING §9 gains two validation rules: a validation owns the whole life of any helper
+  process it starts, and one live pass through the real entry point comes before trusting a
+  suite that mocks a process boundary.
+
 ## 0.5.2 — 2026-10-05
 
 - Task Board 0.1.2: a worker's tool calls and a hook-authored runtime note no longer stale the lead's checkpoint; a directly delegated return, and a foreign task edit even inside the note window, still do.

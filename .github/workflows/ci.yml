@@ -34,3 +34,21 @@ jobs:
           else
             echo "no *.test.mjs found — skipping"
           fi
+
+      # The runner's own Python refuses package installs outside a virtual environment; this one
+      # does not, and it pins the interpreter the tests run on.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python unit tests (plugins that declare CI requirements)
+        run: |
+          found=0
+          for req in plugins/*/tests/requirements-ci.txt; do
+            [ -f "$req" ] || continue
+            found=1
+            plugin_dir=$(dirname "$(dirname "$req")")
+            python -m pip install --quiet -r "$req"
+            python -B -m unittest discover -s "$plugin_dir/tests"
+          done
+          [ "$found" -eq 1 ] || echo "no plugin declares tests/requirements-ci.txt — skipping"

@@ -1,0 +1,82 @@
+{
+  "name": "system-settings",
+  "comment": "A first scenario that needs no app of your own: the stock Android Settings app. Launch, rest, drag the list down while it is at the top (it should spring back: judged by state), scroll down and up, open the item under a fixed point, go back, rest. Coordinates are fractions of the screen. The back step has a six-second floor on purpose: Settings keeps redrawing its home page, with nothing visibly changing, for several seconds after you return to it. Remove the floor and the last rest window fails the gate, which is the tool telling the truth about that app.",
+  "package": "com.android.settings",
+  "activity": ".Settings",
+  "until_quiet": true,
+  "quiet": {
+    "ms": 800,
+    "max_ms": 15000
+  },
+  "steps": [
+    {
+      "id": "rest-start",
+      "do": "rest",
+      "ms": 5000,
+      "meminfo": true
+    },
+    {
+      "id": "overscroll",
+      "do": "swipe",
+      "from": [
+        0.5,
+        0.35
+      ],
+      "to": [
+        0.5,
+        0.75
+      ],
+      "ms": 500,
+      "judge": "state"
+    },
+    {
+      "id": "scroll-down",
+      "do": "swipe",
+      "from": [
+        0.5,
+        0.7
+      ],
+      "to": [
+        0.5,
+        0.3
+      ],
+      "ms": 300
+    },
+    {
+      "id": "scroll-up",
+      "do": "swipe",
+      "from": [
+        0.5,
+        0.3
+      ],
+      "to": [
+        0.5,
+        0.7
+      ],
+      "ms": 300
+    },
+    {
+      "id": "rest-list",
+      "do": "rest",
+      "ms": 5000
+    },
+    {
+      "id": "open-item",
+      "do": "tap",
+      "x": 0.5,
+      "y": 0.42
+    },
+    {
+      "id": "back",
+      "do": "key",
+      "code": 4,
+      "settle_ms": 6000
+    },
+    {
+      "id": "rest-end",
+      "do": "rest",
+      "ms": 5000,
+      "meminfo": true
+    }
+  ]
+}

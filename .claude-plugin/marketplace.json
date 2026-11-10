@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "General-purpose Claude Code plugins built to the core/shim reusability discipline \u2014 generic cores with zero project coupling; project policy lives in thin shims on the consuming side",
-    "version": "0.5.2"
+    "version": "0.6.0"
   },
   "plugins": [
     {
@@ -27,6 +27,11 @@
       "name": "task-board",
       "source": "./plugins/task-board",
       "description": "Automatic shared task-board maintenance through native Claude Code and Codex hooks"
+    },
+    {
+      "name": "ui-probe",
+      "source": "./plugins/ui-probe",
+      "description": "Watch a mobile app from outside while a scripted scenario runs \u2014 frames and CPU while nothing happens, the sequence of visual states per step from a screen recording, timings as distributions; a gate for the counts, base-against-head comparison, contact sheets, and a shaping proxy for slow networks"
     }
   ]
 }
