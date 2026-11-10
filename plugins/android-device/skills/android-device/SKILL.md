@@ -137,6 +137,32 @@ docs (~5k docs). First use downloads ~37 MB; warm queries are sub-second.
 Prefer it over web search for Android/Compose API questions — it's local,
 fast, and versioned.
 
+## Emulator condition levers — verify inside the guest
+
+An emulator flag or console setting can be accepted and still do nothing. Before relying on one,
+read the result from inside the guest (`nproc`, `/proc/meminfo`, `getprop`, `dumpsys display`,
+a timed request). Measured on emulator 37.1.4 with an API 34 Google Play arm64 image
+(2026-11-10); re-measure on other versions:
+
+| Lever | What it did |
+|---|---|
+| `-memory <mb>`, `-cores <n>` | Took effect: the guest reported the memory and core count asked for |
+| `-lowram` | No effect on a Google Play `user` image: `ro.config.low_ram` stayed empty. `-prop ro.config.low_ram=true` is rejected ("only 'qemu.*' properties are supported") |
+| `-vsync-rate 90` | The display mode became 90 Hz, but the compositor rendered apps at 45 Hz |
+| `-cpu-delay <n>` | Rejected at start on Apple Silicon ("invalid option"); the emulator exits |
+| Console `network delay` / `network speed` (and `-netdelay` / `-netspeed`) | Never applied to the guest's default network, the virtual Wi-Fi. With Wi-Fi off (cellular path): the delay is added once when a connection opens, not to later requests on it; any speed limit stalled transfers far below the configured rate. Traffic to the host alias `10.0.2.2` is never shaped |
+| The default (virtual Wi-Fi) network path itself | Adds about 0.6 to 1.0 s to every new TCP connection; requests on an open connection are not slowed. `svc wifi disable` moves traffic to the cellular path, which does not add it |
+| `cmd thermalservice override-status`, `am send-trim-memory`, `cmd power set-mode` (after `dumpsys battery unplug`), `settings put system font_scale`, `cmd connectivity airplane-mode` | All accepted from the shell on a `user` image. They change what the system reports or signals, not the hardware |
+
+Two guest-shell traps met while measuring: toybox `nc` exits as soon as its stdin closes, so
+`printf ... | nc host port` can return before the reply (hold stdin open with a trailing `sleep`);
+and `date +%s%N` can jump when the guest clock is adjusted, so time intervals on `/proc/uptime`.
+
+To impose a slow network on an emulator without administrator rights, shape at a proxy instead
+of at the emulator: point the guest's system proxy (`settings put global http_proxy
+<host>:<port>`, clear with `:0`) at a forward proxy that adds latency and a rate limit. The
+`ui-probe` plugin ships one.
+
 ## Cautions and out of scope
 
 - **Do not run `android describe`** — it injects a `.gradle/init.gradle.kts`

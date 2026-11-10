@@ -54,3 +54,6 @@ is auditable; treat a changed bundle id across installs as a re-validate signal.
   set against a live device, update timings/cautions, then re-pin.
 - **Upstream refresh (`android/skills`):** diff `devtools/android-cli/references/interact.md`
   at HEAD against recorded commit `07302ca…`; re-derive the protocol if it moved.
+- **Emulator lever observations:** 2026-11-10, emulator 37.1.4, API 34 Google Play arm64 image,
+  Apple Silicon host. The "Emulator condition levers" table in the skill records what each flag
+  and console setting did inside the guest; re-measure after an emulator or image update.
