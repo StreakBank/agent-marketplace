@@ -1,7 +1,7 @@
 # ui-probe — watch a mobile app from outside
 
-`ui-probe` runs a scripted scenario against an Android app and records what the platform and the
-screen did, without anything inside the app. It answers two questions a functional test does not:
+`ui-probe` runs a scripted scenario against an Android app (or, for rest steps only, an app on the
+iOS Simulator) and records what the platform and the screen did, without anything inside the app. It answers two questions a functional test does not:
 
 - **Is the app doing work while nothing happens?** Frames drawn, CPU used and frames composed while
   the screen is at rest.
@@ -35,7 +35,10 @@ depending on host load, while its rest-window frame count stays at zero. Keep th
   versions are untested. A section name that never appears in the trace for the app is reported
   as not observed, never as a count of zero.
 
-`ui-probe doctor [--serial <serial>]` checks all of this, including the ffmpeg version (a version
+- For the iOS Simulator instead: Xcode's command-line tools (`xcrun simctl`) and a booted simulator
+  with the app installed; `adb` is then not needed. See "The iOS Simulator".
+
+`ui-probe doctor [--serial <serial> | --simulator <udid>]` checks all of this, including the ffmpeg version (a version
 string it cannot read is a warning, not a failure). With a serial it also says whether the device
 has `uiautomator`, which a tap with `find` needs to read the window tree; a scenario without
 `find` does not, so its absence is reported but is not a failure.
@@ -512,10 +515,92 @@ produce packet loss.
 | 2 | an error the tool reports itself: a bad scenario, an unanalysed capture, a device or adb failure, an element a `find` tap never found, a missing or too old tool found by `doctor`, a `zoom` that could not extract its frames |
 | 3 | an unexpected error: the traceback is printed, and it is a defect in the tool |
 
+## The iOS Simulator
+
+`ui-probe run --simulator <udid> --scenario <file> --out <dir>` runs a scenario on a booted iOS
+Simulator instead of an Android device (exactly one of `--serial` and `--simulator`, neither
+empty). A simulator gives no input from a command line (`simctl` has no tap), no window-tree dump,
+no frame record of the platform and nothing to detect quiet with, so this version runs **rest
+steps only**, driven from the host; there is no device script.
+
+**What it means for a scenario author: any frame recorded at rest fails.** With the status bar
+frozen nothing but the app has a reason to make the display compose, and there is no second
+witness, so every recorded frame after the first counts against the app, whatever it changed. A
+screen that is never still by design (a blinking caret) needs an allowance on its rest
+(`allow.frames_max` and `allow.changed_frames_max`); frames that changed nothing have none.
+
+- **The scenario.** `package` is the bundle identifier (letters, digits and `-` in dot-separated
+  names). `activity`, `quiet` and `count_sections` must be absent, `until_quiet` false or absent,
+  and every step a `rest` of at least 1000 ms (the CPU time is read in steps of 0.01 s) without
+  `meminfo`, `background` or `expect`; anything else is refused before anything runs, a step of
+  another kind with a message that says the iOS Simulator has no input in this version. The
+  launch waits `launch_settle_ms` (default 6000). `allow` and the `gate` block work as described
+  below. `--trace`, `--sections` and `--no-video` cannot be used with `--simulator`.
+- **The run.** The status bar is frozen first (`xcrun simctl status_bar <udid> override --time
+  9:41`; a run whose override fails stops there). An override the user had set is replaced, and
+  cleared (`xcrun simctl status_bar <udid> clear`) when the run ends, however it ends. The app is
+  terminated, launched with `xcrun simctl launch` (which prints its process id) and given
+  `launch_settle_ms`. Then, for each rest step: the recorder starts in a process group of its own
+  (`xcrun simctl io <udid> recordVideo --codec h264 --force raw/rec-<step>.mp4`) and the run waits
+  for it to print `Recording started` (20 s, else the run fails); the app's CPU time is read with
+  `ps -o cputime= -p <pid>` (the app is a process on the host); the step's `ms` passes; the CPU
+  time is read again; whether the recorder is still running is noted, its group gets SIGINT, and
+  the run waits for it to write its file and exit (20 s, then the group is killed). The app is
+  left running after the run.
+- **Clean-up.** The recorder is stopped and the status bar cleared on every way out of a run the
+  tool can see: an error, an interrupt (Ctrl-C), SIGTERM and SIGHUP (which also leave
+  `failed.json`, "terminated by SIGTERM", and exit with 143 or 129). SIGKILL cannot be caught: after
+  one, `pgrep -fl recordVideo` shows a recorder to stop by hand, and
+  `xcrun simctl status_bar <udid> clear` restores the clock.
+- **What is measured.** Per rest step: the window's real length (between the two CPU readings),
+  the CPU seconds and the percentage of one core, and that step's recording, which keeps a frame
+  only when the display changes. Its frames after the first are counted, and the same analysis as
+  on Android names their classes for the reader: those that changed the app's area, those whose
+  change in the app's area is encoder noise, those that changed only the bands where a status bar
+  and a home indicator sit (the top 7% and the bottom 4.5%) and those that changed nothing. The
+  classes decide nothing. A process that is gone at the end of a window (a relaunched app
+  included, since only the launched process is watched) fails the process check.
+- **The gate.** CPU at rest against `rest_cpu_pct_max` (default 2.0) or the step's
+  `allow.cpu_pct_max`; a CPU time that could not be read, or that went down between the two
+  readings (another process holding the pid), is a violation, since CPU is one of only two
+  witnesses here. Every frame recorded at rest after the first, against `rest_frames_max`
+  (default 0) or `allow.frames_max`; frames that changed nothing, with no allowance; frames that
+  changed any pixel, against `allow.changed_frames_max` (default none). The violation names the
+  classes. There is no exact frame count of the app on a simulator, so the rule that excuses
+  recorded frames while the app presented none never applies on a simulator. A recorder that had
+  stopped before its window ended (even with status 0) fails the recording check: its file ends
+  early and would look clean. The checks a simulator cannot feed (waiting for quiet, frames at
+  launch, which app is in front, `find`, trace sections) are not run, and every simulator run
+  says so in a note rather than passing them by silence.
+- **Measured by hand** (a debug build of an app that draws its own surface, iOS 26.1, its launch
+  screen). A clean build used 0.00 to 0.03 s of CPU per 5 s window and its recording held one
+  frame, the first; a build that redraws an element behind zero alpha every frame used 1.45 to
+  1.46 s (29% of one core), and its recordings, about 6.8 s long, held 408 to 412 frames. Run by
+  the tool: a clean build used 0.2% to 0.6% of one core in 20 of 20 rest windows (5 s to 65 s
+  long) and recorded no frame after the first in 19 of them; two faulty builds recorded 299 to 304
+  frames and used 25% to 33% in each of 12 windows of 5 s. The one clean window with frames was a
+  65 s rest before this version froze the status bar: it recorded 2 frames when the clock changed
+  (encoder noise reached the app's area), and none once the status bar was frozen.
+- **On disk.** `raw/launch.txt` (what the launch printed), `raw/pid-<step>.txt`,
+  `raw/rec-<step>.mp4` and `raw/rec-<step>.log` (the recorder's output), `raw/step-<step>.json`
+  (the two CPU readings, the window, the recorder's exit status, whether it was killed and whether
+  it was still running when the window ended), `video/<step>/` (the frames and the analysis of
+  that recording) and `sheets/<step>.png`. `analyze`, `sheet`, `gate`, `summary` and `compare` work
+  on a simulator run as on any other; `zoom` needs `--step <id>`, since each step has its own
+  recording. `summary` and `compare` give a simulator's values keys of their own,
+  `<step>.sim_cpu_s`, `sim_cpu_pct`, `sim_window_s`, `sim_recorded_frames`,
+  `sim_changed_app_frames`, `sim_noise_frames`, `sim_bars_only_frames` and `sim_identical_frames`,
+  since they mean something else than Android's (CPU in seconds, not ticks; every frame of a
+  per-step recording).
+- **Not measured.** Input of any kind; a frame count from the platform; quiet; trace sections;
+  memory; which app is in front; and timings as a phone's (the host's processor and graphics run
+  the simulator). `ui-probe doctor --simulator <udid>` checks `xcrun simctl`, that the simulator
+  exists and is booted, and `ffmpeg` and `ffprobe`.
+
 ## Known limits
 
-- **Android only in this version.** A recording from another platform can be analysed by the
-  same classifier, but nothing here drives one.
+- **Android, and the iOS Simulator for rest steps only.** Nothing here drives a physical iPhone,
+  and on a simulator there is no input, no platform frame count and no quiet detection.
 - **Per-frame timings assume the device has not slept since boot.** Frame rows use the monotonic
   clock and step marks the boot clock; they agree only then. The run is flagged when they do not
   line up. Counts are unaffected; the recording then no longer decides a rest window.

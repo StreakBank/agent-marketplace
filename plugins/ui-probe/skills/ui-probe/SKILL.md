@@ -1,6 +1,6 @@
 ---
 name: ui-probe
-description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb; needs no changes to the app.
+description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rest steps; needs no changes to the app.
 allowed-tools:
   - Bash
   - Read
@@ -72,6 +72,12 @@ never still by design (a blinking caret) gets an `allow` on its rest step, with 
 every step that ends on it a fixed wait (`"until_quiet": false`), since such a screen never goes
 quiet; never an allowance for recorded frames that changed nothing (there is none). The README's "Screens that are never still" has the
 measured numbers.
+
+On the iOS Simulator (`run --simulator <udid>`) only rest steps of at least 1000 ms run: there is
+no input, no frame count from the platform and no quiet detection. The run freezes the status bar,
+and every frame recorded at rest after the first fails, whatever it changed: a screen that is never
+still by design needs `allow.frames_max` and `allow.changed_frames_max` on its rest. CPU comes from
+`ps`; the run's note lists what was not checked. `zoom` needs `--step <id>` there.
 
 ## Reading a run
 

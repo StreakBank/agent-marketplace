@@ -23,6 +23,8 @@ results. This rule adds only what the plugin deliberately does not know.
 ## Device and reference profile
 
 - **Device:** `<avd or device name>` (<api, resolution, memory, cores, refresh rate>).
+- **iOS Simulator (rest steps only), if used:** `<simulator name and runtime>`, identified by name and
+  resolved to its udid at run time; which scenarios run there (rest steps only) and with what limits.
   Identify it by name, never by serial.
 - **Reference profile:** <the settings every baseline assumes: network path, proxy or none,
   font scale, animation scales, compile state>.

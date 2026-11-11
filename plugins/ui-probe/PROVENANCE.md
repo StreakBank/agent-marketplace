@@ -150,6 +150,50 @@ Not validated on a device: `not_visible` (a match in the tree but off the screen
 `scroll`; `find.package` naming another package; an Android version other than 14; a physical
 device.
 
+### Validation, 0.4.0
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-10 | Unit tests | macOS (Python 3.12.8) | 465 tests pass: the 422 of 0.3.0 (two adjusted: the doctor's new argument, and a version check moved to the 0.4.0 tests) and 43 new |
+| 2026-11-10 | A simulator run end to end | stand-ins for `xcrun` (a device list, `launch`, a recorder that answers SIGINT, ignores it, never starts or exits at once, or exits with an error) and for `ps` on PATH | runs, recordings, CPU readings, the status bar frozen and cleared, the recorder's group stopped (or killed) on every path out of a step including an interrupt, SIGTERM and SIGHUP (a real subprocess), a recorder that stops early, `failed.json`, the gate, `analyze`, `sheet`, `summary`, `compare`, `zoom --step` and `doctor --simulator` behave as designed. No simulator was touched |
+| 2026-11-10 | The recording analysis on one step's file | a short lossless video made with ffmpeg: a frame that changed nothing, one that changed only the top bar, one that changed the app's area | counted 1, 1 and 1 |
+| 2026-11-10 | That the new tests can fail | 33 single mutations of the first version, then 16 of the fix round (the status bar not frozen, not cleared on an error, or a failed freeze ignored; the classes exempt again, changed pixels counted only in the app's area; an early recorder passed, or its aliveness not observed; no signal handlers, a termination named as an exception; a falling CPU time accepted; short rests accepted; only the recorder signalled, not its group; an empty `--simulator` accepted by `run` or `doctor`; every step analysed from the first step's recording; Android's keys for a simulator). The first 33: the simulator rules not applied, any step kind, `activity` or `until_quiet` true accepted, a hyphen refused in a bundle identifier; the recorder's start not awaited, the recorder not stopped on an error, a kill not recorded, SIGTERM instead of SIGINT; the app not terminated first, any launch output accepted; CPU percent not over the window, a misread CPU time; bars-only frames held against the app, frames that changed nothing passed or allowed by `frames_max`, unknown CPU passed, no note of what was not checked, the recorder's status ignored, a gone process passed; the Android gate on a simulator run, no simulator row in `summary`, `zoom` without `--step`; `doctor` wanting `adb` or ignoring the state; a used folder not refused, no `failed.json`, `--trace` accepted; narrower system bars, the first frame counted, a simulator that is not booted accepted, the version not bumped, a damaged step record crashing the analysis | Each one turns at least one test red |
+
+The facts the simulator code is built on (the launch prints `<bundle id>: <pid>`; the app is a
+process on the host whose CPU time `ps -o cputime=` reads; the recorder keeps a frame only when the
+display changes and prints `Recording started`; a clean build used 0.00 to 0.03 s of CPU per 5 s
+window and recorded 1 frame, a faulty one 1.45 to 1.46 s and, in recordings about 6.8 s long, 408
+to 412 frames) were measured by hand on an iOS 26.1 simulator before the code was written.
+
+### Live validation, 0.4.0
+
+2026-11-10, on an iOS 26.1 simulator of an iPhone 16e, against a debug build of an app that draws
+its own surface, on its launch screen, and against two faulty builds of it: one redraws an element
+behind zero alpha every frame, the other runs an animation clock whose value nothing draws. An
+independent reviewer read the first version of the code. Its findings (a small animation classed
+as encoder noise and passed; app content inside the fixed system-bar bands passed; a recorder that
+stops early with status 0 passed; a recorder left behind by SIGTERM; a falling CPU time passed)
+and one found on the simulator (a change of the status-bar clock counted against the app) were
+fixed before release. The rows below were run on the released code unless a row says otherwise.
+
+| What | Against | Result |
+|---|---|---|
+| `doctor --simulator` | the booted simulator | `xcrun`, `xcrun simctl`, the simulator and its state reported ok |
+| What is refused | an empty `--simulator` on `run` and on `doctor`; a rest of 500 ms; a `tap` step | exit 2 each, before anything ran |
+| A clean build | the launch and rests of 5 s to 65 s: 20 windows over 9 runs, 16 of the windows under the first version | 0.2% to 0.6% of one core in 20 of 20, and no frame after the first in 19. The other window, 65 s long under the first version, recorded 2 frames when the status-bar clock changed, and the gate failed it; the same rest under the released code, which freezes the status bar, recorded none and passes. A recording of a still screen holds exactly one frame, the one the recorder writes when it starts |
+| The status bar | `simctl status_bar list` during and after a run | 9:41 during the run; no override after it, and none after SIGTERM, SIGHUP or an interrupt |
+| The two faulty builds | three rests of 5 s, each build twice (first version and released code) | FAIL in each of 12 windows, on recorded frames, on frames that changed nothing and on CPU: 299 to 304 frames and 25% to 33% of one core. The animation clock that draws nothing presents every frame on iOS |
+| Signals in the middle of a rest | SIGTERM, SIGHUP and SIGINT sent to the tool | exit 143, 129 and 130; no recorder left; `failed.json` names the cause; the gate fails the run |
+| A recorder stopped from outside during a rest | SIGINT to the recorder's process | it exits with status 0; the gate fails the recording check, because it was not running when the window ended |
+| The app terminated during a rest | `simctl terminate` | the gate fails the process check, the recorded frames and the unreadable CPU |
+| The recorder's process group | `ps -o pid,pgid` during a rest | the recorder leads a group of its own |
+| `summary`, `compare`, `analyze`, `sheet`, `zoom --step` | saved simulator runs of the clean and a faulty build | `summary` and `compare` show the `sim_*` keys (CPU 0.6% against 32.5%, recorded frames 0 against 301); `analyze` on a copy reproduces the run's result exactly; `sheet` and `zoom --step` write their pictures, and `zoom` without `--step` is refused |
+| Android under this version | runs saved by earlier versions (13 scenarios of a clean build, 7 folders of faulty builds, 13 scenarios under another profile), and one full live run on the Android 14 emulator of the 0.3.0 validation | `gate` gives the same verdicts, text and JSON as 0.3.0 on every saved folder, and `analyze` on a saved run gives a result identical to 0.3.0's in every field; the live run of 13 scenarios (lookups, typed text, trace sections, baselines) passes with no violation |
+
+Not validated on a simulator: a screen shape other than one phone's (an iPad, landscape); a
+recorder that ignores SIGINT or writes no file (stand-ins only); an allowance for a caret (no input
+reaches a text field); another Xcode or iOS version.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

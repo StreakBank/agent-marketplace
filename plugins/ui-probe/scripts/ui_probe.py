@@ -35,14 +35,16 @@ import math
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -55,6 +57,10 @@ FFMPEG_MIN = (5, 1)           # -fps_mode, used to extract recorded frames, arri
 # what is gated), except a key whose name ends in "comment".
 PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+")
 ACTIVITY_RE = re.compile(r"[A-Za-z0-9_.$]+")
+# An iOS bundle identifier: dot-separated names of letters, digits and '-'.
+BUNDLE_RE = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
+ANDROID = "android"
+SIM_PLATFORM = "ios-simulator"
 TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "steps",
             "count_sections", "gate"}
 STEP_KEYS = {
@@ -237,8 +243,10 @@ def _is_comment(key) -> bool:
     return isinstance(key, str) and key.endswith("comment")
 
 
-def validate_scenario(scn: dict) -> None:
-    """Reject a malformed scenario with a message that names the problem. No silent defaults."""
+def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
+    """Reject a malformed scenario with a message that names the problem. No silent defaults.
+    platform is ANDROID, SIM_PLATFORM (rest steps only, see validate_sim_rules) or "any" (the
+    package may be either kind of id; used for a gate override before the run's platform is known)."""
     def need(cond, msg):
         if not cond:
             raise ProbeError(f"scenario: {msg}")
@@ -252,8 +260,16 @@ def validate_scenario(scn: dict) -> None:
     need(not unknown, f"unknown keys {unknown}")
     need(isinstance(scn.get("name"), str) and scn["name"], "'name' is required")
     need(isinstance(scn.get("package"), str) and scn["package"], "'package' is required")
-    need(PACKAGE_RE.fullmatch(scn["package"]),
-         "'package' must be an application id: dot-separated names of letters, digits and '_', such as com.example.app")
+    if platform == SIM_PLATFORM:
+        need(BUNDLE_RE.fullmatch(scn["package"]),
+             "'package' must be a bundle identifier: dot-separated names of letters, digits and '-', such as "
+             "com.example.app")
+    elif platform == "any":
+        need(PACKAGE_RE.fullmatch(scn["package"]) or BUNDLE_RE.fullmatch(scn["package"]),
+             "'package' must be an application id or a bundle identifier, such as com.example.app")
+    else:
+        need(PACKAGE_RE.fullmatch(scn["package"]),
+             "'package' must be an application id: dot-separated names of letters, digits and '_', such as com.example.app")
     if "activity" in scn:
         need(isinstance(scn["activity"], str) and ACTIVITY_RE.fullmatch(scn["activity"]),
              "'activity' must be letters, digits, '_', '.' or '$'")
@@ -420,9 +436,45 @@ def validate_scenario(scn: dict) -> None:
                 sm = exp["sections_max"]
                 need(isinstance(sm, dict) and all(isinstance(k, str) and k and count(v) for k, v in sm.items()),
                      f"step '{sid}': 'expect.sections_max' must map section names to integers >= 0")
+    if platform == SIM_PLATFORM:
+        # One recording per rest step on a simulator, by a recorder with no time limit: the Android
+        # recorder's 180 s limit on the whole scenario does not apply.
+        validate_sim_rules(scn, need)
+        return
     fixed = scenario_duration_s(scn, worst_case=False)
     need(fixed <= RECORD_LIMIT_S - 10,
          f"fixed waits add up to about {fixed} s; the screen recorder stops at {RECORD_LIMIT_S} s. Split the scenario")
+
+
+# What a scenario for the iOS Simulator may hold: there is no input from a command line, no
+# window-tree dump, no platform frame record and no quiet detection, so only rest steps run.
+SIM_REST_MIN_MS = 1000
+SIM_REFUSED_TOP = {
+    "activity": "the iOS Simulator launches the app by its bundle identifier ('package'); 'activity' does not apply",
+    "quiet": "there is no quiet detection on the iOS Simulator; 'quiet' would be ignored",
+    "count_sections": "trace sections are not recorded on the iOS Simulator",
+}
+SIM_REFUSED_STEP = {
+    "meminfo": "memory is not read on the iOS Simulator",
+    "background": "which app is in front is not read on the iOS Simulator",
+    "expect": "the iOS Simulator has no exact frame count and no signature check in this version",
+}
+
+
+def validate_sim_rules(scn: dict, need) -> None:
+    for key, why in SIM_REFUSED_TOP.items():
+        need(key not in scn, f"'{key}': {why}")
+    need(not scn.get("until_quiet", False), "'until_quiet' must be false or absent: there is no quiet detection on the "
+                                            "iOS Simulator; the launch waits 'launch_settle_ms'")
+    for step in scn["steps"]:
+        sid, do = step["id"], step["do"]
+        need(do == "rest", f"step '{sid}': the iOS Simulator has no input in this version, so only rest steps run; "
+                           f"a '{do}' step is refused")
+        for key, why in SIM_REFUSED_STEP.items():
+            need(key not in step, f"step '{sid}': '{key}': {why}")
+        need(step["ms"] >= SIM_REST_MIN_MS,
+             f"step '{sid}': a rest on the iOS Simulator lasts at least {SIM_REST_MIN_MS} ms: the CPU time is read in "
+             "steps of 0.01 s, too coarse for a shorter window")
 
 
 def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
@@ -1133,6 +1185,8 @@ def write_failed(out: Path, exc: BaseException, scenario: str | None = None) -> 
     compare see the run instead of passing over it. Never raises: the original failure is reported."""
     if isinstance(exc, ProbeError):
         error = str(exc)
+    elif isinstance(exc, Terminated):
+        error = f"terminated by {exc.signame}"
     elif isinstance(exc, KeyboardInterrupt):
         error = "interrupted"
     else:
@@ -1146,12 +1200,16 @@ def write_failed(out: Path, exc: BaseException, scenario: str | None = None) -> 
         print(f"ui-probe: could not write {out / FAILED_RUN}: {err.strerror or err}", file=sys.stderr)
 
 
-def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False) -> dict:
-    validate_scenario(scn)
+def refuse_used(out: Path) -> None:
     held = [name for name in RUN_MARKERS if (out / name).exists()]
     if held:
         raise ProbeError(f"{out} already holds a run or what is left of one ({', '.join(held)}); choose a fresh "
                          "directory (raw evidence is never overwritten)")
+
+
+def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False) -> dict:
+    validate_scenario(scn)
+    refuse_used(out)
     out.mkdir(parents=True, exist_ok=True)
     try:
         return _run_once(serial, scn, out, trace, video, sections)
@@ -1236,6 +1294,469 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
         raise
 
 
+# --------------------------------------------------------------------------------------------
+# iOS Simulator: rest steps only, driven from the host
+# --------------------------------------------------------------------------------------------
+#
+# The app is a process on the host, so its CPU time is read with `ps`; the display is recorded with
+# `xcrun simctl io <udid> recordVideo`, which keeps a frame only when the display changes. There is
+# no input from a command line, no window-tree dump, no platform frame record and no quiet
+# detection, so a simulator run has rest steps only and is judged by CPU and the recording alone.
+
+SIM_RECORD_START_TIMEOUT_S = 20   # until the recorder prints "Recording started"
+SIM_RECORD_STOP_TIMEOUT_S = 20    # after SIGINT, until the recorder has written its file and exited
+SIM_RECORD_STARTED = "Recording started"
+SIM_TERMINATE_WAIT_S = 1          # after terminating the app, before launching it
+# The status bar and the home indicator, in thousandths of the recorded height, used only to name the
+# class of a recorded frame for the reader ("changed only the system bars"): on a simulator every
+# recorded frame after the first counts against the app, whatever its class. Chosen to cover a status
+# bar of 54 of 852 points and a home indicator of 34 (about 63 and 40).
+SIM_BARS_PERMILLE = (70, 45)
+SIM_NOT_CHECKED = ("waiting for quiet", "frames at launch", "which app is in front", "find", "trace sections",
+                   "an exact frame count of the app (the platform keeps none a host can read)")
+
+
+def xcrun(*args: str, check: bool = True, timeout: int = 60) -> str:
+    try:
+        proc = subprocess.run(["xcrun", *args], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise ProbeError(f"xcrun {' '.join(args)[:200]} did not finish within {timeout} s") from exc
+    except OSError as exc:
+        raise ProbeError(f"cannot run xcrun: {exc.strerror or exc}") from exc
+    if check and proc.returncode != 0:
+        said = proc.stderr.decode(errors="replace").strip()[:400] or proc.stdout.decode(errors="replace").strip()[-400:]
+        raise ProbeError(f"xcrun {' '.join(args)} failed (exit {proc.returncode}): {said or 'no output'}")
+    return proc.stdout.decode(errors="replace")
+
+
+def sim_device(udid: str) -> dict | None:
+    """The simulator with this udid as `simctl list devices -j` describes it (name, state, runtime),
+    or None when there is none."""
+    try:
+        data = json.loads(xcrun("simctl", "list", "devices", "-j"))
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"`xcrun simctl list devices -j` did not print JSON: {exc}") from exc
+    for runtime, devices in (data.get("devices") or {}).items():
+        for dev in devices or []:
+            if dev.get("udid") == udid:
+                return {**dev, "runtime": runtime}
+    return None
+
+
+def sim_facts(udid: str, bundle: str) -> dict:
+    dev = sim_device(udid)
+    if dev is None:
+        raise ProbeError(f"no simulator with udid {udid} (`xcrun simctl list devices`)")
+    if dev.get("state") != "Booted":
+        raise ProbeError(f"simulator {udid} is {dev.get('state')}; boot it first (`xcrun simctl boot {udid}`)")
+    try:
+        container = xcrun("simctl", "get_app_container", udid, bundle).strip()
+    except ProbeError as exc:
+        raise ProbeError(f"{bundle} is not installed on simulator {udid}: {exc}") from exc
+    return {"platform": SIM_PLATFORM, "udid": udid, "name": dev.get("name"), "runtime": dev.get("runtime"),
+            "state": dev.get("state"), "package": bundle, "app_container": container, "host_cpus": os.cpu_count()}
+
+
+def parse_cputime(text: str | None) -> float | None:
+    """Seconds from `ps -o cputime=`: m:ss.cc, h:mm:ss.cc or d-hh:mm:ss. None when empty or malformed."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    days = 0
+    if "-" in t:
+        d, t = t.split("-", 1)
+        if not d.isdigit():
+            return None
+        days = int(d)
+    try:
+        parts = [float(p) for p in t.split(":")]
+    except ValueError:
+        return None
+    if not 1 <= len(parts) <= 3 or any(p < 0 for p in parts):
+        return None
+    secs = 0.0
+    for p in parts:
+        secs = secs * 60 + p
+    return round(days * 86400 + secs, 2)
+
+
+def host_cputime(pid: int) -> str:
+    """The process's CPU time as `ps` prints it, or "" when there is no such process."""
+    try:
+        proc = subprocess.run(["ps", "-o", "cputime=", "-p", str(pid)], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError(f"cannot read the CPU time of process {pid}: {exc}") from exc
+    return proc.stdout.decode(errors="replace").strip()
+
+
+class SimRecorder:
+    """`xcrun simctl io <udid> recordVideo` into a file, in a process group of its own, so that what
+    `xcrun` starts behind it is signalled with it. stop() always ends the group: SIGINT, so that the
+    recorder writes its file, then SIGKILL if it does not exit in time, then SIGKILL to anything
+    left in the group."""
+
+    def __init__(self, udid: str, path: Path):
+        try:
+            self.proc = subprocess.Popen(["xcrun", "simctl", "io", udid, "recordVideo", "--codec", "h264", "--force",
+                                          str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as exc:
+            raise ProbeError(f"cannot start the simulator's recorder: {exc.strerror or exc}") from exc
+        self.lines: list[str] = []
+        self.started = threading.Event()
+        self.killed = False
+        self.alive_at_stop: bool | None = None
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
+
+    def _read(self) -> None:
+        for raw in iter(self.proc.stdout.readline, b""):
+            line = raw.decode(errors="replace").rstrip("\n")
+            self.lines.append(line)
+            if SIM_RECORD_STARTED in line:
+                self.started.set()
+
+    def wait_started(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        while not self.started.wait(0.05):
+            if self.proc.poll() is not None:
+                self.reader.join(2)
+                raise ProbeError(f"the simulator's recorder exited (status {self.proc.returncode}) before it started "
+                                 f"recording: {' | '.join(self.lines)[-400:] or 'no output'}")
+            if time.monotonic() > deadline:
+                raise ProbeError(f"the simulator's recorder did not report '{SIM_RECORD_STARTED}' within {timeout_s} s: "
+                                 f"{' | '.join(self.lines)[-400:] or 'no output'}")
+
+    def _signal_group(self, sig: int) -> None:
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass        # the group is gone already
+
+    def stop(self) -> int | None:
+        # Was it still recording when the window ended? One that stopped early (even with status 0)
+        # leaves a recording that ends before the window did and looks clean.
+        self.alive_at_stop = self.proc.poll() is None
+        if self.alive_at_stop:
+            self._signal_group(signal.SIGINT)
+            try:
+                self.proc.wait(SIM_RECORD_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self.killed = True
+                self._signal_group(signal.SIGKILL)
+                self.proc.wait()
+        self._signal_group(signal.SIGKILL)      # anything the recorder left behind in its group
+        self.reader.join(5)
+        return self.proc.returncode
+
+
+class Terminated(SystemExit):
+    """SIGTERM or SIGHUP during a simulator run: raised in the main thread, so that every finally
+    (the recorder stopped, the status bar cleared) runs and failed.json is written."""
+
+    def __init__(self, signum: int):
+        super().__init__(128 + signum)
+        self.signame = signal.Signals(signum).name
+
+
+def run_once_sim(udid: str, scn: dict, out: Path) -> dict:
+    validate_scenario(scn, SIM_PLATFORM)
+    refuse_used(out)
+    out.mkdir(parents=True, exist_ok=True)
+    previous = {}
+
+    def on_signal(signum, frame):
+        for sig in previous:            # one is enough: let the clean-up finish
+            signal.signal(sig, signal.SIG_IGN)
+        raise Terminated(signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, on_signal)
+    try:
+        return _run_once_sim(udid, scn, out)
+    except BaseException as exc:
+        write_failed(out, exc, scn.get("name"))
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+# The status bar is frozen for a simulator run: its clock would otherwise change during a long rest,
+# and the recorder would keep the frames (with encoder noise that reaches the app's area).
+SIM_STATUS_BAR = ("--time", "9:41")
+
+
+def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
+    bundle = scn["package"]
+    facts = sim_facts(udid, bundle)
+    raw = out / "raw"
+    raw.mkdir()
+    load_before = host_load()
+    started = time.time()
+    try:
+        xcrun("simctl", "status_bar", udid, "override", *SIM_STATUS_BAR)
+    except ProbeError as exc:
+        raise ProbeError(f"the simulator's status bar could not be frozen, so its clock would change the screen at "
+                         f"rest: {exc}") from exc
+    try:
+        _sim_device_part(udid, scn, raw, bundle)
+    finally:
+        try:
+            xcrun("simctl", "status_bar", udid, "clear")
+        except ProbeError as exc:
+            print(f"ui-probe: the simulator's status bar override could not be cleared ({exc}); clear it with "
+                  f"`xcrun simctl status_bar {udid} clear`", file=sys.stderr)
+    wall = time.time() - started
+    (out / "capture.json").write_text(json.dumps({
+        "tool": {"name": "ui-probe", "version": VERSION}, "platform": SIM_PLATFORM,
+        "scenario": scn, "device": facts, "trace": False, "video": True, "sections": False,
+        "status_bar_override": list(SIM_STATUS_BAR),
+        "host": {"load1_before": round(load_before, 2), "load1_after": round(host_load(), 2), "wall_s": round(wall, 1)},
+    }, indent=1))
+    try:
+        return analyze_run(out)
+    except ProbeError as exc:
+        raise ProbeError(f"{out}: the capture was saved but its analysis failed: {exc}") from exc
+
+
+def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str) -> None:
+    """Launch the app and record every rest step. The app is left running afterwards."""
+    xcrun("simctl", "terminate", udid, bundle, check=False)       # not running is not an error
+    time.sleep(SIM_TERMINATE_WAIT_S)
+    launched = xcrun("simctl", "launch", udid, bundle)
+    (raw / "launch.txt").write_text(launched)
+    m = re.search(rf"^{re.escape(bundle)}:\s*(\d+)\s*$", launched.strip(), re.M)
+    if not m:
+        raise ProbeError(f"`xcrun simctl launch` printed no process id for {bundle}: {launched.strip()[:200]!r}")
+    pid = int(m.group(1))
+    time.sleep(scn.get("launch_settle_ms", 6000) / 1000)
+    (raw / "pid-launch.txt").write_text(f"{pid}\n" if host_cputime(pid) else "")
+    for step in scn["steps"]:
+        sid = step["id"]
+        recorder = SimRecorder(udid, raw / f"rec-{sid}.mp4")
+        before = after = ""
+        t0 = t1 = None
+        try:
+            recorder.wait_started(SIM_RECORD_START_TIMEOUT_S)
+            before, t0 = host_cputime(pid), time.monotonic()
+            time.sleep(step["ms"] / 1000)
+            after, t1 = host_cputime(pid), time.monotonic()
+        finally:
+            code = recorder.stop()
+            (raw / f"rec-{sid}.log").write_text("\n".join(recorder.lines) + "\n")
+        (raw / f"pid-{sid}.txt").write_text(f"{pid}\n" if after else "")
+        (raw / f"step-{sid}.json").write_text(json.dumps({
+            "pid": pid, "cputime_before": before, "cputime_after": after, "window_s": round(t1 - t0, 3),
+            "recorder_exit": code, "recorder_killed": recorder.killed,
+            "recorder_alive_at_end": recorder.alive_at_stop}, indent=1))
+
+
+def sim_recording_counts(mp4: Path, workdir: Path, sid: str, name: str) -> dict:
+    """The existing recording analysis on one rest step's recording: the whole file is the step's
+    window, and the first frame (the screen as recording began) is left out. Counts of the frames
+    after it that changed the app's area (with the encoder noise left out), changed it by noise only,
+    changed only the system bars, or changed nothing."""
+    sys.path.insert(0, str(HERE))
+    import ui_video
+    mini = {"name": name, "steps": [{"id": sid, "do": "rest", "ms": 1}]}
+    # The recording has no per-frame device clock: its own frame times are used, placed from 0.
+    marks = {"T0": -0.3, f"{sid}.start": -1e12, f"{sid}.end": 1e12}
+    facts = {"height": 1000, "stable_insets_top_bottom": list(SIM_BARS_PERMILLE)}
+    try:
+        res = ui_video.analyze(mp4, workdir, [], marks, mini, facts)
+    except ui_video.UnusableRecording as exc:
+        return {"error": str(exc)}
+    except ui_video.VideoError as exc:
+        raise ProbeError(f"the recording of '{sid}' cannot be analysed: {exc}") from exc
+    seg = next(s for s in res["steps"] if s["id"] == sid)
+    frames, region, identical = seg["video_frames"], seg["app_region_frames"], seg["identical_frames"]
+    real = seg.get("app_changed_frames_real", region)
+    sheet = workdir / "sheets" / f"{sid}.png"
+    return {"frames": frames, "changed_app": real, "changed_app_noise": region - real, "identical": identical,
+            "bars_only": max(0, frames - region - identical), "signature": seg["signature"],
+            "sheet": str(sheet.relative_to(workdir.parent.parent)) if sheet.exists() else None}
+
+
+def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
+    raw = out / "raw"
+    launched = _read_raw(raw, "launch.txt")
+    if launched is None:
+        raise ProbeError(f"{out}: raw/launch.txt is missing; the capture is incomplete")
+    launch_pid = single_pid(_read_raw(raw, "pid-launch.txt"))
+    m = re.search(rf"^{re.escape(scn['package'])}:\s*(\d+)\s*$", launched.strip(), re.M)
+    steps_out = [{"id": "launch", "kind": "launch", "pid": launch_pid, "process_missing": launch_pid is None,
+                  "process_restarted": False}]
+    prev = launch_pid
+    for step in scn["steps"]:
+        sid = step["id"]
+        text = _read_raw(raw, f"step-{sid}.json")
+        if text is None:
+            continue           # the gate reports a step the run holds no record of
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ProbeError(f"{out}: raw/step-{sid}.json is not valid JSON: {exc}") from exc
+        pid_now = single_pid(_read_raw(raw, f"pid-{sid}.txt"))
+        before, after = parse_cputime(data.get("cputime_before")), parse_cputime(data.get("cputime_after"))
+        window = data.get("window_s")
+        restarted = bool(pid_now is not None and prev is not None and pid_now != prev)
+        cpu_s = round(after - before, 2) if None not in (before, after) and not restarted else None
+        cpu_problem = None
+        if cpu_s is not None and cpu_s < 0:
+            # The CPU time went down: the pid is held by another process now. Unreadable, not negative.
+            cpu_s, cpu_problem = None, f"the CPU time went down between the two readings ({before} s, then {after} s)"
+        cpu_pct = round(100 * cpu_s / window, 2) if cpu_s is not None and window and window > 0 else None
+        mp4 = raw / f"rec-{sid}.mp4"
+        if mp4.exists() and mp4.stat().st_size > 0:
+            recording = sim_recording_counts(mp4, out / "video" / sid, sid, scn["name"])
+            if recording.get("sheet"):
+                (out / "sheets").mkdir(exist_ok=True)
+                shutil.copyfile(out / recording["sheet"], out / "sheets" / f"{sid}.png")
+                recording["sheet"] = f"sheets/{sid}.png"
+        else:
+            recording = None
+        steps_out.append({
+            "id": sid, "kind": step["do"], "pid": pid_now, "process_missing": pid_now is None,
+            "process_restarted": restarted, "window_s": window, "cpu_s": cpu_s, "cpu_pct": cpu_pct,
+            "recorder_exit": data.get("recorder_exit"), "recorder_killed": data.get("recorder_killed"),
+            "recorder_alive_at_end": data.get("recorder_alive_at_end"), "cpu_problem": cpu_problem,
+            "recording": recording})
+        prev = pid_now if pid_now is not None else prev
+    result = {
+        "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": SIM_PLATFORM,
+        "scenario": scn["name"], "package": scn["package"], "device": cap["device"], "host": cap["host"],
+        "launch": {"pid": int(m.group(1)) if m else None, "total_time_ms": None,
+                   "error": None if m else f"the launch printed no process id: {launched.strip()[:200]!r}"},
+        "steps": steps_out, "frame_sources": ["recording"], "video_requested": True, "trace_requested": False,
+        "not_checked": list(SIM_NOT_CHECKED),
+    }
+    tmp = out / "run.json.tmp"
+    tmp.write_text(json.dumps(result, indent=1))
+    tmp.replace(out / "run.json")
+    return result
+
+
+def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
+    """A simulator run: CPU at rest and the recording, nothing else. The status bar is frozen for the
+    run, so nothing but the app has a reason to make the display compose, and there is no exact frame
+    count of the app on a simulator to say otherwise: every recorded frame after the first counts,
+    whatever its class (the 0.3.0 rule that excuses recorded frames while the app presented none never
+    applies here). A recorder that had stopped before the window ended fails the recording check."""
+    violations, notes = [], []
+
+    def fail(check, sid, message, **extra):
+        violations.append({"check": check, "step": sid, "message": message, **extra})
+
+    notes.append("iOS Simulator: not checked, since a simulator does not give them: " + ", ".join(SIM_NOT_CHECKED)
+                 + ". Frames at rest are counted from the recording only")
+    launch = r.get("launch") or {}
+    if launch.get("error"):
+        fail("launch", "launch", f"the app did not start: {launch['error']}")
+    records = {s["id"]: s for s in r.get("steps", [])}
+    by_id = {s["id"]: s for s in scn["steps"]}
+    for sid in ["launch"] + [s["id"] for s in scn["steps"]]:
+        s = records.get(sid)
+        if s is None:
+            fail("missing-step", sid, f"the run holds no record of step '{sid}'")
+            continue
+        step = by_id.get(sid)
+        want = "launch" if step is None else step["do"]
+        if s.get("kind") != want:
+            fail("scenario", sid, f"step '{sid}' is a {s.get('kind')} in the run but a {want} in the scenario")
+            continue
+        if s.get("process_missing"):
+            fail("process", sid, f"the app's process was not running at the end of '{sid}'")
+        if s.get("process_restarted"):
+            fail("process", sid, "the app's process changed during the scenario (a crash or a kill)")
+        if want != "rest":
+            continue
+        allow = step.get("allow") or {}
+        reason = allow.get("reason")
+        frames_max = allow.get("frames_max", opts["rest_frames_max"])
+        changed_max = allow.get("changed_frames_max", 0)
+        cpu_max = allow.get("cpu_pct_max", opts["rest_cpu_pct_max"])
+        by = lambda key: f" by the step's allowance ({reason})" if key in allow else ""
+        extra = lambda key: {"limit_from": "allowance"} if key in allow else {}
+        rec = s.get("recording")
+        code = s.get("recorder_exit")
+        if rec is None or rec.get("error"):
+            why = "no recording was saved" if rec is None else f"the recording could not be used: {rec['error']}"
+            fail("recording", sid, why)
+            fail("rest-frames", sid, f"cannot count frames: {why}, and a simulator gives no other count")
+        else:
+            if s.get("recorder_alive_at_end") is not True:
+                fail("recording", sid, "the recorder had stopped before the window ended (or whether it was still "
+                     "running was not recorded); its recording may end early and look clean")
+            if code != 0:
+                fail("recording", sid, f"the recorder exited with status {code}"
+                     + (" after it was killed" if s.get("recorder_killed") else "") + "; the recording may be incomplete",
+                     observed=code)
+            # With the status bar frozen, nothing but the app has a reason to make the display compose,
+            # and a simulator gives no second witness: every recorded frame after the first counts,
+            # whatever its class. The classes are named for the reader; they decide nothing.
+            total = rec["frames"]
+            changed = total - rec["identical"]
+            classes = (f"{rec['changed_app']} changed the app's area, {rec['changed_app_noise']} changed it by "
+                       f"encoder noise only, {rec['bars_only']} changed only the system bars, {rec['identical']} "
+                       "changed nothing")
+            if total > frames_max:
+                fail("rest-frames", sid, f"{total} frames recorded at rest ({classes}), allowed {frames_max}"
+                     + by("frames_max"), observed=total, allowed=frames_max, source="recording", **extra("frames_max"))
+            elif "frames_max" in allow and total > opts["rest_frames_max"]:
+                notes.append(f"{sid}: {total} frames recorded at rest ({classes}), above the limit of "
+                             f"{opts['rest_frames_max']} that would otherwise apply; passed on the step's allowance of "
+                             f"{frames_max} ({reason})")
+            if rec["identical"] > 0:
+                fail("rest-video", sid, f"{rec['identical']} frames were composed at rest that changed nothing on screen",
+                     observed=rec["identical"])
+            if changed > changed_max:
+                fail("rest-video", sid, f"the screen changed at rest: {changed} recorded frames changed pixels "
+                     f"({rec['changed_app']} in the app's area, {rec['changed_app_noise']} by encoder noise only, "
+                     f"{rec['bars_only']} in the system bars only)"
+                     + (f", allowed {changed_max}{by('changed_frames_max')}" if "changed_frames_max" in allow else ""),
+                     observed=changed, **({"allowed": changed_max} if "changed_frames_max" in allow else {}),
+                     **extra("changed_frames_max"))
+            elif "changed_frames_max" in allow and changed > 0:
+                notes.append(f"{sid}: {changed} recorded frames changed pixels at rest, above the limit of 0 that would "
+                             f"otherwise apply; passed on the step's allowance of {changed_max} ({reason})")
+        pct = s.get("cpu_pct")
+        if pct is None:
+            fail("rest-cpu", sid, "CPU at rest could not be read ("
+                 + (s.get("cpu_problem") or "the process was gone, or `ps` printed nothing")
+                 + "); on a simulator it is one of only two witnesses")
+        elif pct > cpu_max:
+            fail("rest-cpu", sid, f"{pct}% of one core used at rest ({s.get('cpu_s')} s of CPU in {s.get('window_s')} s), "
+                 f"allowed {cpu_max}%" + by("cpu_pct_max"), observed=pct, allowed=cpu_max, **extra("cpu_pct_max"))
+        elif "cpu_pct_max" in allow and pct > opts["rest_cpu_pct_max"]:
+            notes.append(f"{sid}: {pct}% of one core used at rest, above the limit of {opts['rest_cpu_pct_max']}% that "
+                         f"would otherwise apply; passed on the step's allowance of {cpu_max}% ({reason})")
+    for sid in records:
+        if sid != "launch" and sid not in by_id:
+            notes.append(f"{sid}: in the run but not in the scenario; not checked")
+    return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
+
+
+def sim_run_row(path: str, r: dict) -> dict:
+    row = {"run": Path(path).name, "host_load1": r["host"]["load1_before"]}
+    for s in r["steps"]:
+        if s["kind"] != "rest":
+            continue
+        sid, rec = s["id"], s.get("recording") or {}
+        # Keys of their own: a simulator's CPU is in seconds (Android's in ticks), and its recorded
+        # frames are those of a whole per-step recording, every one of which counts.
+        row[f"{sid}.sim_window_s"] = s.get("window_s")
+        row[f"{sid}.sim_cpu_s"] = s.get("cpu_s")
+        row[f"{sid}.sim_cpu_pct"] = s.get("cpu_pct")
+        row[f"{sid}.sim_recorded_frames"] = rec.get("frames")
+        row[f"{sid}.sim_changed_app_frames"] = rec.get("changed_app")
+        row[f"{sid}.sim_noise_frames"] = rec.get("changed_app_noise")
+        row[f"{sid}.sim_bars_only_frames"] = rec.get("bars_only")
+        row[f"{sid}.sim_identical_frames"] = rec.get("identical")
+    return row
+
+
 def _read_raw(raw: Path, name: str) -> str | None:
     p = raw / name
     return p.read_text(errors="replace") if p.exists() else None
@@ -1281,11 +1802,14 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
     scn = scn or cap.get("scenario")
     if scn is None:
         raise ProbeError(f"{out}: the capture holds no scenario; pass --scenario")
-    validate_scenario(scn)
+    platform = cap.get("platform", ANDROID)
+    validate_scenario(scn, platform)
     # A failed analysis must not leave an earlier result standing for gate, summary and compare.
     result_path = out / "run.json"
     if result_path.exists():
         result_path.unlink()
+    if platform == SIM_PLATFORM:
+        return analyze_sim(out, scn, cap)
     facts, trace, video = cap["device"], cap["trace"], cap["video"]
     raw = out / "raw"
     marks_text = _read_raw(raw, "marks.txt")
@@ -1716,6 +2240,8 @@ def load_runs(dirs: list[str]) -> tuple[list[tuple[str, dict]], list[dict]]:
 
 
 def run_row(path: str, r: dict) -> dict:
+    if r.get("platform") == SIM_PLATFORM:
+        return sim_run_row(path, r)
     row = {"run": Path(path).name, "host_load1": r["host"]["load1_before"],
            "launch_total_time_ms": r["launch"]["total_time_ms"]}
     for s in r["steps"]:
@@ -2060,7 +2586,7 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
 
 def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict:
     if scenario is not None:
-        validate_scenario(scenario)
+        validate_scenario(scenario, "any")      # strictly again for each run, once its platform is known
     out = {"tool": {"name": "ui-probe", "version": VERSION}, "runs": []}
     for path, problem, check in find_runs(dirs):
         if problem:
@@ -2079,15 +2605,18 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
         scn = scenario or stored
         if scn is None:
             raise ProbeError(f"{path}: the capture holds no scenario; pass --scenario")
-        if scenario is None:
-            try:
-                validate_scenario(scn)
-            except ProbeError as exc:
-                raise ProbeError(f"{path}: {exc}") from exc
+        platform = cap.get("platform", ANDROID)
+        try:
+            validate_scenario(scn, platform)
+        except ProbeError as exc:
+            raise ProbeError(f"{path}: {exc}") from exc
+        if (r.get("platform") or ANDROID) != platform:
+            raise ProbeError(f"{path}: run.json is for {r.get('platform') or ANDROID} but the capture for {platform}; "
+                             "run `ui-probe analyze`")
         opts = dict(GATE_DEFAULTS)
         opts.update(scn.get("gate") or {})
         opts.update({k: v for k, v in overrides.items() if v is not None})
-        res = gate_run(r, scn, opts)
+        res = gate_sim_run(r, scn, opts) if platform == SIM_PLATFORM else gate_run(r, scn, opts)
         allowances = {s["id"]: s["allow"] for s in scn["steps"] if "allow" in s}
         out["runs"].append({"run": str(path), "scenario": scn["name"], "frame_sources": r.get("frame_sources") or [],
                             "limits": opts, "allowances": allowances,
@@ -2221,7 +2750,7 @@ def ffmpeg_version(text: str) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def doctor(serial: str | None) -> dict:
+def doctor(serial: str | None, simulator: str | None = None) -> dict:
     checks = []
 
     def add(name, ok, detail, required=True, warning=False):
@@ -2235,7 +2764,10 @@ def doctor(serial: str | None) -> dict:
             return ""
 
     add("python", sys.version_info >= (3, 9), sys.version.split()[0])
-    for tool, cmd in (("adb", ["adb", "version"]), ("ffmpeg", ["ffmpeg", "-version"]), ("ffprobe", ["ffprobe", "-version"])):
+    tools = (("adb", ["adb", "version"]), ("ffmpeg", ["ffmpeg", "-version"]), ("ffprobe", ["ffprobe", "-version"]))
+    for tool, cmd in tools:
+        if tool == "adb" and simulator:
+            continue            # a simulator run needs no adb
         found = shutil.which(tool)
         detail = version_of(cmd) if found else "not on PATH"
         add(tool, bool(found), detail)
@@ -2272,6 +2804,20 @@ def doctor(serial: str | None) -> dict:
                     required=False)
         except (ProbeError, subprocess.TimeoutExpired) as exc:
             add("device", False, str(exc))
+    if simulator:
+        found = shutil.which("xcrun")
+        add("xcrun", bool(found), found or "not on PATH (Xcode's command-line tools)")
+        if found:
+            try:
+                xcrun("simctl", "help")
+                add("xcrun simctl", True, "present")
+                dev = sim_device(simulator)
+                add("simulator", dev is not None, f"{simulator}: " + (f"{dev.get('name')}, {dev.get('runtime')}"
+                                                                       if dev else "no such simulator"))
+                if dev is not None:
+                    add("simulator booted", dev.get("state") == "Booted", f"{simulator}: {dev.get('state')}")
+            except ProbeError as exc:
+                add("xcrun simctl", False, str(exc))
     ok = all(c["ok"] for c in checks if c["required"])
     return {"tool": {"name": "ui-probe", "version": VERSION}, "ok": ok, "checks": checks}
 
@@ -2297,7 +2843,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--version", action="version", version=f"ui-probe {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run", help="run a scenario on a device and analyse it")
-    r.add_argument("--serial", required=True)
+    target = r.add_mutually_exclusive_group(required=True)
+    target.add_argument("--serial", help="an Android device or emulator")
+    target.add_argument("--simulator", metavar="UDID", help="a booted iOS Simulator (rest steps only)")
     r.add_argument("--scenario", required=True)
     r.add_argument("--out", required=True, help="a directory that does not yet hold runs")
     r.add_argument("--runs", type=int, default=1)
@@ -2333,9 +2881,12 @@ def main(argv: list[str] | None = None) -> int:
     z.add_argument("a", type=int, help="frame index as printed on a sheet (#N)")
     z.add_argument("b", type=int)
     z.add_argument("--out", default="")
+    z.add_argument("--step", default="", help="a simulator run: the rest step whose recording holds the frames")
     sub.add_parser("proxy", help="a shaping forward proxy: latency and a rate limit per connection", add_help=False)
-    d = sub.add_parser("doctor", help="check the host tools, and a device if --serial is given")
-    d.add_argument("--serial", default="")
+    d = sub.add_parser("doctor", help="check the host tools, and a device if --serial or --simulator is given")
+    dt = d.add_mutually_exclusive_group()
+    dt.add_argument("--serial", default=None)
+    dt.add_argument("--simulator", default=None, metavar="UDID")
 
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -2360,10 +2911,29 @@ def main(argv: list[str] | None = None) -> int:
 def _dispatch(args) -> int:
     if args.cmd == "run":
         scn = load_scenario(args.scenario)
-        validate_scenario(scn)
+        for flag, value in (("--serial", args.serial), ("--simulator", args.simulator)):
+            if value is not None and not value.strip():
+                raise ProbeError(f"{flag} needs a value; an empty one names no device")
+        if args.simulator:
+            unsupported = [flag for flag, on in (("--trace", args.trace), ("--sections", args.sections),
+                                                 ("--no-video", args.no_video)) if on]
+            if unsupported:
+                raise ProbeError(f"{', '.join(unsupported)} cannot be used with --simulator: there is no trace on the iOS "
+                                 "Simulator, and the recording is its only witness of frames")
+            validate_scenario(scn, SIM_PLATFORM)
+        else:
+            validate_scenario(scn)
         base = Path(args.out)
         for i in range(1, args.runs + 1):
             rid = f"run-{i:02d}"
+            if args.simulator:
+                res = run_once_sim(args.simulator, scn, base / rid)
+                line = {"run": rid, "load": res["host"]["load1_before"]}
+                for st in res["steps"]:
+                    if st["kind"] == "rest":
+                        line[st["id"]] = {"cpu_pct": st["cpu_pct"], "frames": (st.get("recording") or {}).get("frames")}
+                print(json.dumps(line), flush=True)
+                continue
             res = run_once(args.serial, scn, base / rid, args.trace or args.sections, not args.no_video, args.sections)
             line = {"run": rid, "load": res["host"]["load1_before"], "launch_ms": res["launch"]["total_time_ms"]}
             for st in res["steps"]:
@@ -2429,14 +2999,25 @@ def _dispatch(args) -> int:
         sys.path.insert(0, str(HERE))
         import ui_video
         run = Path(args.run_dir)
-        out = Path(args.out) if args.out else run / "sheets" / f"zoom-{args.a}-{args.b}.png"
+        sim = (read_json(run / "capture.json").get("platform") == SIM_PLATFORM) if (run / "capture.json").exists() else False
+        if sim and not args.step:
+            raise ProbeError("zoom: a simulator run has one recording per rest step; pass --step <id> (the frame "
+                             "numbers are those on sheets/<id>.png)")
+        if args.step and not sim:
+            raise ProbeError("zoom: --step applies only to a simulator run; this run has one recording")
+        video = run / "raw" / (f"rec-{args.step}.mp4" if sim else "screen.mp4")
+        out = Path(args.out) if args.out else run / "sheets" / (f"zoom-{args.step}-{args.a}-{args.b}.png" if sim
+                                                                else f"zoom-{args.a}-{args.b}.png")
         try:
-            res = ui_video.zoom(run / "raw" / "screen.mp4", args.a, args.b, out)
+            res = ui_video.zoom(video, args.a, args.b, out)
         except ui_video.VideoError as exc:
             raise ProbeError(f"zoom: {exc}") from exc
         print(json.dumps(res))
     elif args.cmd == "doctor":
-        out = doctor(args.serial or None)
+        for flag, value in (("--serial", args.serial), ("--simulator", args.simulator)):
+            if value is not None and not value.strip():
+                raise ProbeError(f"{flag} needs a value; an empty one names no device")
+        out = doctor(args.serial or None, args.simulator or None)
         for chk in out["checks"]:
             state = "ok  " if chk["ok"] else ("WARN" if chk.get("warning") else ("MISS" if chk["required"] else "none"))
             print(f"{state} {chk['check']}: {chk['detail']}")

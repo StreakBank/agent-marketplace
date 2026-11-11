@@ -275,7 +275,7 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual([x["check"] for x in out["checks"] if x["required"] and not x["ok"]], [])
 
     def test_doctor_failure_exits_2(self):
-        with mock.patch.object(u, "doctor", lambda serial: {"ok": False, "checks": [
+        with mock.patch.object(u, "doctor", lambda serial, simulator=None: {"ok": False, "checks": [
                 {"check": "ffmpeg version", "ok": False, "required": True, "warning": False, "detail": "4.4"},
                 {"check": "x", "ok": False, "required": False, "warning": True, "detail": "y"}]}):
             rc, out, _ = main("doctor")

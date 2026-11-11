@@ -568,7 +568,6 @@ class DocsTest(unittest.TestCase):
         self.assertIn("## 0.3.0", (root / "CHANGELOG.md").read_text())
         self.assertIn("find.scroll", (root / "skills" / "ui-probe" / "SKILL.md").read_text())
         self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
-        self.assertEqual(u.VERSION, "0.3.0")
 
 
 if __name__ == "__main__":

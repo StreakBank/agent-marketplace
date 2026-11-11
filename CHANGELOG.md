@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0 — 2026-11-10
+
+- ui-probe 0.4.0: the iOS Simulator, for rest steps. `run --simulator <udid>` launches an app on
+  a booted simulator and, for each rest step, reads the CPU time of the app's process on the host
+  and records the display, which keeps a frame only when something changes. The status bar is
+  frozen for the run, so any frame recorded at rest counts against the app. A simulator takes no
+  input from a command line, so taps, lookups, signatures and count budgets stay Android-only for
+  now, and each simulator run says which checks it could not make. See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.8.0 — 2026-11-10
 
 - ui-probe 0.3.0: the same scenario files under other device profiles, and two false alarms

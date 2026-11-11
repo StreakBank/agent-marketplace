@@ -1,5 +1,36 @@
 # Changelog — ui-probe
 
+## 0.4.0 — 2026-11-10
+
+The iOS Simulator, rest steps only.
+
+- `run --simulator <udid>` (instead of `--serial`; an empty value is refused) runs a scenario of
+  rest steps on a booted iOS Simulator, driven from the host. The status bar is frozen for the run
+  (`simctl status_bar … override --time 9:41`, replacing any override the user had set, and
+  cleared at the end); the app is terminated, launched with `xcrun simctl launch` and given
+  `launch_settle_ms`, and left running afterwards. For each rest the recorder (`xcrun simctl io …
+  recordVideo`, in a process group of its own) is started and awaited ("Recording started"), the
+  app's CPU time is read with `ps` before and after the step's wait, and the recorder's group is
+  stopped with SIGINT (killed if it does not exit). The recorder is stopped and the status bar
+  cleared on an error, an interrupt, SIGTERM and SIGHUP; SIGKILL cannot be caught.
+- A simulator scenario names the app by its bundle identifier and holds rest steps of at least
+  1000 ms only; `activity`, `quiet`, `count_sections`, `until_quiet` true, and `meminfo`,
+  `background` or `expect` on a step are refused before anything runs, a step of another kind with
+  a message that the iOS Simulator has no input in this version.
+- Any frame recorded at rest fails: every frame after the first counts against the app (against
+  `rest_frames_max` or `allow.frames_max`; those that changed any pixel against
+  `allow.changed_frames_max`; those that changed nothing with no allowance), whatever the recording
+  analysis classes it as (app's area, encoder noise, system bars only, nothing); the classes are
+  named for the reader. CPU at rest is held against `rest_cpu_pct_max` or `allow.cpu_pct_max`; an
+  unreadable CPU time, or one that went down, fails. A recorder that had stopped before its window
+  ended fails the recording check. There is no exact frame count on a simulator, so the 0.3.0
+  rule for frames recorded while the app presented none never applies there. Checks a simulator
+  cannot feed are not run, and each run says so in a note.
+- `analyze`, `sheet`, `gate`, `summary` (with keys of its own, `<step>.sim_*`), `compare`, the folder
+  rules and `failed.json` work on a simulator run; `zoom` takes `--step`. `doctor --simulator
+  <udid>` checks `xcrun simctl`, that the simulator exists and is booted, and `ffmpeg`/`ffprobe`,
+  without requiring `adb`.
+
 ## 0.3.0 — 2026-11-10
 
 For running the same scenarios under other device profiles: a small screen, a large font, a slow
