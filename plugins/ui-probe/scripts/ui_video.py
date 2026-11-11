@@ -44,6 +44,9 @@ DETOUR_RATIO = 1.10     # (dist to start + dist to end) / dist(start, end) above
 CHANGED_PIXEL = 12      # grey-level delta for a pixel to count toward a change bounding box
 VISIBLE_PIXEL = 4       # grey-level delta for a pixel to count as visibly different
 VISIBLE_COUNT = 6       # this many such pixels (at thumbnail scale) make a frame "changed"
+CHANGE_LEVEL = 8        # a pixel changed by this much on any colour channel counts in a frame's change measures
+FLAT_RANGE = 8          # a pixel whose 5x5 neighbourhood in the previous frame spans less than this lies in a flat area
+FLAT_CHECK_ABOVE = 32   # the flat-area count is taken only for frames whose largest change is at most this
 ALIGN_TOL_S = 0.020
 MATCH_WINDOW_S = 0.070    # a video frame is matched to an app frame completed at most this long before it
 
@@ -119,6 +122,34 @@ def visibly_changed(a: np.ndarray, b: np.ndarray) -> bool:
     h, w = mask.shape
     dense = sum(padded[dy:dy + h, dx:dx + w] for dy in range(3) for dx in range(3))
     return int(np.sum((dense >= 3) & (mask == 1))) >= VISIBLE_COUNT
+
+
+def change_measures(prev: np.ndarray | None, cur: np.ndarray) -> dict:
+    """How a frame differs from the one before it, at the analysis scale and on the colour channel
+    that changed most: the largest change of any pixel ("max_delta"), how many pixels changed by
+    CHANGE_LEVEL or more ("changed_px"), and how many of those lie where the previous picture was
+    flat ("flat_changed_px": new content on an even area, which an encoder refining a picture along
+    its existing edges does not produce). The flat count is None above FLAT_CHECK_ABOVE, where it is
+    not needed."""
+    if prev is None:
+        return {"max_delta": 0.0, "changed_px": 0, "flat_changed_px": 0}
+    dc = np.abs(cur - prev).max(axis=2)
+    largest = float(dc.max())
+    changed = dc >= CHANGE_LEVEL
+    flat_px = None
+    if largest <= FLAT_CHECK_ABOVE:
+        g = prev.max(axis=2)
+        h, w = g.shape
+        pad = np.pad(g, 2, mode="edge")
+        hi = np.full_like(g, -1)
+        lo = np.full_like(g, 10 ** 4)
+        for dy in range(5):
+            for dx in range(5):
+                win = pad[dy:dy + h, dx:dx + w]
+                hi = np.maximum(hi, win)
+                lo = np.minimum(lo, win)
+        flat_px = int((changed & ((hi - lo) < FLAT_RANGE)).sum())
+    return {"max_delta": round(largest, 1), "changed_px": int(changed.sum()), "flat_changed_px": flat_px}
 
 
 def dist(a: np.ndarray, b: np.ndarray) -> float:
@@ -247,6 +278,7 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
     if n == 0:
         raise UnusableRecording("the recording holds no video frames")
     grey = [np.asarray(Image.open(f).convert("L"), dtype=np.float32) for f in files]
+    rgb = [np.asarray(Image.open(f).convert("RGB"), dtype=np.int16) for f in files]
     h, w = grey[0].shape
     insets = facts.get("stable_insets_top_bottom") or [int(0.035 * facts["height"]), int(0.02 * facts["height"])]
     top = int(round(insets[0] * h / facts["height"]))
@@ -284,7 +316,8 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
         changed = i > 0 and visibly_changed(app[i], app[i - 1])
         whole = i > 0 and visibly_changed(grey[i], grey[i - 1])
         rec = {"i": i, "pts": pts[i], "t": t, "gap_ms": (pts[i] - pts[i - 1]) * 1000 if i else 0.0,
-               "app_changed": bool(changed), "identical": bool(i > 0 and not whole)}
+               "app_changed": bool(changed), "identical": bool(i > 0 and not whole),
+               **change_measures(rgb[i - 1] if i else None, rgb[i])}
         if aligned and len(fc):
             # The platform frame shown by this video frame is the latest one the app completed before
             # the compositor produced it (completion precedes composition by up to a few refreshes).
@@ -348,6 +381,11 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
             "gaps_over_34ms": sum(x["gaps_over_34ms"] for x in infos),
             "detour_frames": sum(x["detour_frames"] for x in infos),
             "detour_ms": round(sum(x["detour_ms"] for x in infos), 1),
+            "largest_change": max((f["max_delta"] for f in inside), default=0.0),
+            "most_changed_px": max((f["changed_px"] for f in inside), default=0),
+            # None when a frame changed too much for the flat-area count to be taken
+            "most_flat_changed_px": (None if any(f["flat_changed_px"] is None for f in inside)
+                                     else max((f["flat_changed_px"] for f in inside), default=0)),
             "burst_detail": infos,
         })
         sheet(out / "sheets" / f"{sid}.png", files, inside,

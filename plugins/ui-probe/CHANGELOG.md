@@ -1,5 +1,73 @@
 # Changelog — ui-probe
 
+## 0.5.0 — 2026-11-11
+
+Input on the iOS Simulator: taps and swipes by fractions of the display, a signature per step.
+
+- A scenario on a simulator may hold `tap` steps (`x`, `y`) and `swipe` steps (`from`, `to`, `ms`,
+  `judge`) besides rests; each waits its `settle_ms` (as on Android) and may carry
+  `expect.signature`, compared by the gate as on Android. `find` and `text` are refused (a lookup
+  or typing reads the app's accessibility tree, which changed the app at rest when measured), and
+  so is `key` (a simulator has no keys to press).
+- The input goes through ui-probe's input agent (`ios-agent/`): one UI test with no host app and no
+  app name, built once per agent source and Xcode version into
+  `${XDG_CACHE_HOME:-$HOME/Library/Caches}/ui-probe/ios-agent/<key>/`, started with
+  `xcodebuild test-without-building` for the run, and spoken to on a loopback port with a random
+  token and a fresh nonce per command, whose keyed hash (HMAC-SHA256 with the token) every reply
+  must carry. It taps and drags through the system app and reads nothing of the app under test but
+  its state; it ends by itself after an idle limit. A command the agent reports it did not perform
+  (an error, or an issue the test framework recorded while handling it) fails its step; a test run
+  that ended with a status other than 0 after `quit` fails the run (check `agent`); the app not in
+  front at the end of any step fails the foreground check (which a run with input now checks). A
+  build counts only once it exited 0 (a marker, a temporary folder renamed into place, a lock per
+  key); the test run's derived data and result bundle go under the run's `raw/` and are removed
+  after a status of 0.
+- On every way out of a run (normal end, error, interrupt, SIGTERM, SIGHUP), in order: each step's
+  recorder stopped at the end of its step; the agent's group ended and its runner app terminated
+  and uninstalled from the simulator; the status bar cleared. Each part runs whatever the one before
+  it raised, every wait has a limit, and a signal during the clean-up is held until it is done.
+  Rest-only scenarios start no agent and are unchanged. `doctor --simulator` reports the agent's
+  source and whether it is built for this Xcode. `install.sh` copies `ios-agent/` beside the
+  scripts.
+- **0.4.0 was wrong** to say that a simulator keeps no exact frame count of the app a host can read.
+  Its log store does: `log show --signpost` gives, for the app's process and with nothing added to
+  the app, one event per frame its Metal layer drew (drawables), per layer-tree commit (commits) and
+  per display update it was woken for (updates). A simulator run now reads its log store once,
+  after the last step (`raw/signposts.ndjson`), and a second time, every process, from the end of
+  the last step (`raw/signposts-tail.json`); each step gets `drawables`, `commits` and `updates`
+  (unknown for every step, with a note, when the store did not answer, holds no drawable or commit
+  of the app between its launch and the first step, or the second read found no event after the
+  end of the last step). The run's gate header names both sources of frame counts when they are
+  known. At rest, drawables plus commits are held
+  against `rest_frames_max` or `allow.frames_max` (source "log store"), and updates against the new
+  `gate.rest_updates_max` (default 0) or `allow.updates_max` (check `rest-updates`).
+- Frames recorded at rest still fail as in 0.4.0, except when the counts are known and all 0 for
+  the window and for the recording's own span, at most 2 frames were recorded, no pixel changed by
+  more than 24 levels on any colour channel, no frame changed more than 2000 pixels by 8 levels or
+  more, and none of those lies where the picture was flat: the encoder refining a still picture
+  along its edges after motion (measured on 17 rest windows: at most 17 levels in 28 to 193 pixels,
+  more on a screen with more text, none on a flat area; a growing 1 pt hairline changed 16 levels
+  with 4 or 5 pixels on a flat area and is held), which is now a note. With the counts unknown,
+  0.4.0's rule stands.
+- `count_signposts` (simulator only) counts an app's own signposts per step; `expect.signposts_max`
+  gates them on rests and input steps (check `signposts`), and fails as unknown, asking whether the
+  app's tracing is switched on, when the run holds none of that subsystem; a name is matched by
+  exact equality with the signpost's name or message, and one that occurs nowhere in the run is
+  unknown and fails its limit. `summary` and `compare`
+  add `sim_drawables`, `sim_commits`, `sim_updates` and `sim_signposts.<name>`.
+- `ui-probe tls-front`: TLS in front of a plain local backend on 127.0.0.1, with a throwaway CA for a
+  simulator (never for a phone's or a Mac's own trust store), so that an app reaches the backend over
+  HTTPS without loosening its transport security; `--ca` prints the CA's path for
+  `xcrun simctl keychain <udid> add-root-cert`. The CA has pathlen:0 and may name only localhost,
+  and its key is deleted once the certificate is signed; a state folder that is not empty and not
+  marked as the tool's is refused, and nothing in a folder the tool did not make is changed.
+- The tests are sealed: stand-ins for `xcrun`, `xcodebuild` and `ps` first on PATH (checked before
+  anything runs), and `XDG_CACHE_HOME` and `HOME` in a temporary folder.
+- `launch_env`: names to strings handed to the app on a simulator, set as `SIMCTL_CHILD_<NAME>` on
+  the `xcrun simctl launch` call only, the only source (`SIMCTL_CHILD_*` in ui-probe's own
+  environment are not passed, and named in a note); saved in `capture.json`, so not a place for
+  secrets; refused on Android. A swipe on a simulator lasts at most 60000 ms.
+
 ## 0.4.0 — 2026-11-10
 
 The iOS Simulator, rest steps only.

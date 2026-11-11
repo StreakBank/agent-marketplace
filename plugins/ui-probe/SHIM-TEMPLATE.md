@@ -24,7 +24,8 @@ results. This rule adds only what the plugin deliberately does not know.
 
 - **Device:** `<avd or device name>` (<api, resolution, memory, cores, refresh rate>).
 - **iOS Simulator (rest steps only), if used:** `<simulator name and runtime>`, identified by name and
-  resolved to its udid at run time; which scenarios run there (rest steps only) and with what limits.
+  resolved to its udid at run time; which scenarios run there (rests, taps and swipes) and with what
+  limits; any `launch_env` the app needs there (no secrets: it is saved with each run).
   Identify it by name, never by serial.
 - **Reference profile:** <the settings every baseline assumes: network path, proxy or none,
   font scale, animation scales, compile state>.

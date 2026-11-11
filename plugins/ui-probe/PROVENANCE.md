@@ -194,6 +194,73 @@ Not validated on a simulator: a screen shape other than one phone's (an iPad, la
 recorder that ignores SIGINT or writes no file (stand-ins only); an allowance for a caret (no input
 reaches a text field); another Xcode or iOS version.
 
+### Validation, 0.5.0
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-11 | Unit tests | macOS (Python 3.12.8) | 554 tests pass; none runs the real `xcodebuild`, `xcrun` or `ps`, or writes outside its temporary folder (stand-ins first on PATH, checked before each test; `XDG_CACHE_HOME` and `HOME` in the test's folder) |
+| 2026-11-11 | Runs with input end to end | stand-ins on PATH for `xcodebuild` (`-version`; a build that writes an `.xctestrun` or fails; a test run that serves the agent's protocol, refuses a tap, refuses the token, reports the app in the background, never answers, exits first, or ignores `quit` and SIGTERM), `xcrun` and `ps` | the build into the cache and its reuse, the agent's start, every command with the token, the order of commands, the signature per step, the foreground check, and the agent and its group gone, the runner terminated and uninstalled and the status bar cleared after a normal end, an error, an interrupt, SIGTERM and SIGHUP behave as designed. No simulator was touched |
+| 2026-11-11 | The agent's Swift compiles | `xcodebuild build-for-testing` of `ios-agent/` for a generic iOS Simulator (Xcode 26.3), the derived data under a scratch folder; again after the review's changes (issues recorded per command, a 5 s deadline per connection, the keyed hash of each command's nonce with CryptoKit) | built, no warning in the agent's source; not run |
+| 2026-11-11 | The excuse for recorded frames at rest | lossless recordings made by the tests at the full display size: a still picture refined along its edges, a 1 pt grey hairline that grows twice (largest change 16), a 20 pt spinner and a caret; and the two real recordings it was made for (largest change 16 and 12 on the largest colour channel, 38 and 8 pixels changed by 8 levels or more) | the refinement and the two real recordings are excused (no changed pixel on a flat area); the hairline is held (4 or 5 changed pixels on a flat area), as are the spinner and the caret. A limit on the number of changed pixels alone could not separate them: the hairline changes fewer pixels (6 or 7) than the real refinement |
+| 2026-11-11 | `tls-front` | the `openssl` on PATH (OpenSSL 3.6.3), Python's `ssl` as the client | the CA carries pathlen:0 and a critical name constraint permitting DNS:localhost, and a client that trusts it reaches the backend; its key is gone after signing; an unmarked folder that is not empty, or that others can open, is refused and left as it was; the server's minimum version is TLS 1.2 (a setting read back, no older client tried) |
+| 2026-11-11 | That the new tests can fail | 120 mutants, one exact replacement each in a fresh copy of the plugin, then the simulator, input, store, review and tls-front test files: 0.5.0's input agent and launch environment, the log store and its rules, `tls-front`, the review's sixteen, and at least one per ruling of the review (the agent's issues and status, the recording's span, the colour channel, the pixel and flat-area limits, unknown signpost names, the second read, the clean-up's shield and phases, the per-connection deadline, the nonce and its proof, the cache's marker and lock, the CA's constraints and key, the derived data and result bundle, the launch environment's single source, the swipe limit, the frame sources) | 118 turned a test red on the first pass; the 2 that survived (the agent's issue record removed, no shield around the status bar's clear) got tests, and they and the 15 mutants of the refinement code changed after the pass were run again: all red. Each one turns at least one test red. The agent's Swift is held by tests of its source only |
+
+Not validated by these tests: the agent itself on a simulator (its socket, its token check, its
+nonce proofs, its 5 s deadline per connection, its idle end, its gestures, an issue recorded while
+a command is handled and the test run's status after it); `SIMCTL_CHILD_` reaching the app; the log
+store's second read on a simulator (that other processes log after the last step); `-derivedDataPath`
+and `-resultBundlePath` on a real test run; the cache's lock under two real concurrent builds;
+`tls-front` reached from a simulator with its CA installed.
+
+### Live validation, 0.5.0
+
+2026-11-11, on an iOS 26.1 simulator of an iPhone 16e with Xcode 26.3, against a debug build of an
+app that draws its own surface through Metal and emits signposts when asked to, reaching a backend
+on the same machine through `tls-front`; and against two faulty builds of it (one redraws an
+element behind zero alpha every frame, the other runs an animation clock whose value nothing
+draws). An independent reviewer read the whole change. Its findings (a gesture XCTest could not
+perform reported as done; the excuse for encoder frames too wide; a signpost name that never
+matches passing as zero; the store proven read only for the launch; a signal during the clean-up;
+a slow client holding the agent; replies not proven to come from the agent; a failed agent build
+reused; `tls-front` taking over a folder that was not its own) were fixed before release.
+
+One limit was then changed on what the simulator showed. The excuse's limit on changed pixels was
+200, and the 17 rest windows with encoder frames in these recordings changed 28 to 193 pixels, most
+on the screen with the most text: the next busier screen would have failed at rest with the app
+idle. The limit is now 2000. The suite and the 15 mutants of that code were run again on the
+change, and all 15 turned a test red.
+
+The rows below were run with the released code. Where a row says "captured earlier", the
+recordings were made by the code as it stood before that change and one other (a reported measure
+that is null where it was a placeholder), neither of which touches a capture, and they were
+analysed and gated again with the released code.
+
+| What | Against | Result |
+|---|---|---|
+| The input agent | built by the tool from the plugin's source into its cache, then 65 taps and 5 swipes in 20 runs (captured earlier) | built once and reused by every run; a tap takes 342 to 453 ms and a swipe of 600 ms 1114 to 1186 ms; all 70 replies carry the keyed hash of their command's nonce; the agent's test run ended with status 0 after `quit` in 20 of 20, and its derived data and result bundle were removed |
+| Scenarios with input | five scenarios (a launch, four tabs each opened twice, a pushed screen and one pushed from it, a modal screen, a pull that springs back), five runs each, through a project's gate script in blocking mode with eleven signatures as baselines (captured earlier) | 25 of 25 runs pass. Each of the 14 input steps had one signature in its five runs (`T` on ten, `E` on the pull, `TD` on three first openings); a batch of the same size captured by a draft of this version gave the same 14 signatures in its five runs when analysed again |
+| The three frame counts of a transition | the 70 input steps of those runs, the app's own signposts switched on | the store's drawables equal the app's own count of its draws in 70 of 70; the recording holds as many frames in 29, one more in 26 and 3 to 14 more in 15, never fewer. The app's layout and scheduling counts move by one or two between runs of one transition, so they suit a rest (zero) better than a transition |
+| Rest steps of a clean build | the 95 rest windows of those runs | the store's counts are known in every run (the second read found 106 to 1017 events after the last step); 0 drawables, 0 commits, 0 updates and 0 of each named signpost in 95 of 95; 0.0% to 0.4% of one core; in 7 windows the recording held one frame of the encoder's, each reported as a note |
+| Encoder frames at rest | the 17 rest windows that recorded any, over all recordings of this validation (five screens) | one or two frames per window; the largest change 14 to 17 levels; 28 to 193 pixels changed by 8 levels or more, most on the screen with the most text; none on a flat area |
+| Two faulty builds | five scenarios each, through the gate script in blocking mode (captured earlier) | the script exits 1 and all five scenarios fail: each of the 19 rests fails on the store's count (300 to 302 drawables in 5 s), on display updates, on recorded frames, on CPU (11% to 23% of one core) and on the app's own signposts, a screen pushed from a pushed screen included |
+| A gesture that leaves the app's display updates running | found in the clean build: a pull on a screen that cannot scroll, then rests of 5 s and 20 s | 300 and 1201 display updates, with no drawable and no commit; the 20 s rest fails on `rest-updates` alone (no recorded frame, 0.9% of one core, which is under the CPU limit); none after the screen is left |
+| Signposts that cannot be counted | the app launched without its tracing; a listed name the app never emits (that run captured earlier) | both fail `signposts` as not counted, each with its own message: no event of the subsystem in the run, and a name that occurs nowhere in the run |
+| The foreground check | another app launched in front during a scenario with input, and during one without | with input, `foreground` fails for each step that ended with the app in the background, and the step's signature fails. Without input there is no agent to ask, and the rest fails on its recording and its counts instead |
+| The agent's protocol | during a run: a tap and a `quit` with a wrong token, a tap with none; in another run, a client that connects and sends nothing | each command is refused with an error that carries no proof and nothing is performed (the rest it arrived in drew no frame, and the agent went on serving); the silent client is answered with an error after 5.0 s; both runs pass |
+| Signals | SIGTERM and SIGHUP in the middle of a run with the agent; SIGKILL | exit 143 and 129 within about a second, `failed.json` names the signal, and no recorder, agent, runner app, status-bar override, derived data or result bundle is left. After SIGKILL the recorder, the agent's `xcodebuild`, the runner app and the override are left, as documented; the agent ended by itself 135 s later, at its idle limit, and the documented commands restored the simulator. A SIGTERM sent while the tool was cleaning up after the last step was tried on the code before the last change: exit 143 and nothing left |
+| `launch_env` | two variables in a scenario; a stray `SIMCTL_CHILD_` variable in the tool's own environment (tried on the code before the last change) | the app reached the backend the first names and emitted the signposts the second switches on, in every run above; the stray one is not passed and is named in a note |
+| What is refused on a simulator | `find`, `text`, `key`, a swipe of 70 s | exit 2 each, before anything ran and before the run's folder was made |
+| `tls-front` | a plain backend on loopback, started through a project's script; the simulator told to trust the CA | every run above reached the backend at `https://localhost:<port>` with no change to the app's transport security; the CA carries the path length and the name constraint, and its key is not kept; a state folder made by an earlier draft, without the marker file, is refused |
+| Xcode's derived data | the number of `Agent-*` folders in Xcode's default derived data before and after the runs above | unchanged; an earlier draft left one folder of about 1.3 MB there per run |
+| Android under this version | eight folders of runs saved by earlier versions, two that pass and six that fail (faulty builds, a small-screen profile), gated by 0.4.0 and by this version; one full live run of 13 scenarios on the Android 14 emulator of the earlier validations (captured earlier) | `gate` exits and prints the same under both versions on all eight; its JSON differs in the version and in one new key, `limits.rest_updates_max`, which only a simulator run uses; the live run passes 13 of 13 |
+
+Not validated on a simulator: an issue recorded by XCTest during a gesture (the path that reports it is held by
+unit tests and by tests of the agent's source; none could be provoked); the proof on a reply against another
+listener on the port; two runs at once, and the build lock under two real builds; an app drawn by UIKit through
+the tool (read by hand once: no drawables, 62 commits against 110 recorded frames on a tap, since the render
+server animates without the app, so its count at rest is its commits); a software keyboard (the simulator had a
+hardware keyboard connected) and any typed text; an iPad; landscape; another Xcode or iOS version.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

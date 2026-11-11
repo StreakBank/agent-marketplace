@@ -30,21 +30,28 @@ Exit codes: 0 success, 1 a gate failed, 2 an error the tool reports itself, 3 an
 from __future__ import annotations
 
 import argparse
+import datetime
+import fcntl
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
+import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -61,7 +68,10 @@ ACTIVITY_RE = re.compile(r"[A-Za-z0-9_.$]+")
 BUNDLE_RE = re.compile(r"[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+")
 ANDROID = "android"
 SIM_PLATFORM = "ios-simulator"
-TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "steps",
+LAUNCH_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+LAUNCH_ENV_MAX = 20
+LAUNCH_ENV_VALUE_MAX = 200
+TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "launch_env", "count_signposts", "steps",
             "count_sections", "gate"}
 STEP_KEYS = {
     "rest": {"ms", "meminfo", "background", "allow"},
@@ -71,11 +81,11 @@ STEP_KEYS = {
     "text": {"text", "settle_ms", "until_quiet", "quiet"},
 }
 COMMON_STEP_KEYS = {"id", "do", "expect"}
-EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max"}
+EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max"}
 QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
 # A rest step's allowance: limits that replace the gate's for that step. There is deliberately no
 # limit for recorded frames that changed nothing: that check is what catches an invisible animation.
-ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max")
+ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max")
 FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package", "scroll"}
 # find.scroll: swipes made while a read shows no acceptable match. max is required; from and to are
 # screen fractions like a swipe step's; the swipe must move at least SCROLL_MIN_TRAVEL of the screen
@@ -164,7 +174,8 @@ SECTIONS_CONFIG = """data_sources { config { name: "linux.ftrace" ftrace_config 
 # framework-specific names under "count_sections"; the probe counts whatever names it is given.
 DEFAULT_SECTIONS = ["Choreographer#doFrame", "traversal", "draw", "Record View#draw()", "deliverInputEvent"]
 
-GATE_DEFAULTS = {"rest_frames_max": 0, "rest_cpu_pct_max": 2.0}
+GATE_DEFAULTS = {"rest_frames_max": 0, "rest_cpu_pct_max": 2.0, "rest_updates_max": 0}
+SIM_ONLY = "the iOS Simulator only: its log store is what counts it"
 
 # The line of `dumpsys activity activities` that names the resumed activity (the first match is
 # taken; the name of the line differs between platform versions).
@@ -270,6 +281,18 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
     else:
         need(PACKAGE_RE.fullmatch(scn["package"]),
              "'package' must be an application id: dot-separated names of letters, digits and '_', such as com.example.app")
+    if "launch_env" in scn:
+        need(platform != ANDROID, "'launch_env' is refused on Android: an Android launch takes no environment")
+        env = scn["launch_env"]
+        need(isinstance(env, dict), "'launch_env' must be an object of names to string values")
+        need(len(env) <= LAUNCH_ENV_MAX, f"'launch_env' holds {len(env)} pairs; at most {LAUNCH_ENV_MAX}")
+        for name, value in env.items():
+            need(LAUNCH_ENV_NAME_RE.fullmatch(name), f"'launch_env' name {name!r} must be capital letters, digits "
+                                                     "and '_', starting with a letter")
+            need(isinstance(value, str) and len(value) <= LAUNCH_ENV_VALUE_MAX,
+                 f"'launch_env.{name}' must be a string of at most {LAUNCH_ENV_VALUE_MAX} characters")
+            bad = next((ch for ch in value if ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F), None)
+            need(bad is None, f"'launch_env.{name}' holds a control character {bad!r}")
     if "activity" in scn:
         need(isinstance(scn["activity"], str) and ACTIVITY_RE.fullmatch(scn["activity"]),
              "'activity' must be letters, digits, '_', '.' or '$'")
@@ -307,6 +330,22 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
             need(count(g["rest_frames_max"]), "'gate.rest_frames_max' must be an integer >= 0")
         if "rest_cpu_pct_max" in g:
             need(number(g["rest_cpu_pct_max"]) and g["rest_cpu_pct_max"] >= 0, "'gate.rest_cpu_pct_max' must be a number >= 0")
+        if "rest_updates_max" in g:
+            need(platform != ANDROID, f"'gate.rest_updates_max' applies to {SIM_ONLY}")
+            need(count(g["rest_updates_max"]), "'gate.rest_updates_max' must be an integer >= 0")
+    if "count_signposts" in scn:
+        need(platform != ANDROID, "'count_signposts' is refused on Android: it reads the iOS Simulator's log store "
+                                  "('count_sections' counts trace sections there)")
+        cs = scn["count_signposts"]
+        need(isinstance(cs, dict) and set(cs) == {"subsystem", "names"},
+             "'count_signposts' must be an object with 'subsystem' and 'names'")
+        need(isinstance(cs["subsystem"], str) and SUBSYSTEM_RE.fullmatch(cs["subsystem"]),
+             "'count_signposts.subsystem' must be letters, digits, '.', '_' or '-'")
+        need(isinstance(cs["names"], list) and cs["names"] and len(cs["names"]) <= 50
+             and all(isinstance(n, str) and n and len(n) <= 200 and unmatchable_char(n) is None for n in cs["names"])
+             and len(set(cs["names"])) == len(cs["names"]),
+             "'count_signposts.names' must be a list of 1 to 50 different names, each a string of 1 to 200 characters "
+             "with no control character")
     seen = set()
     for n, step in enumerate(steps):
         where = f"step {n + 1}"
@@ -344,9 +383,11 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
                      f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
                 need(any(k in allow for k in ALLOW_LIMITS),
                      f"step '{sid}': 'allow' needs at least one of {', '.join(ALLOW_LIMITS)}")
-                for k in ("frames_max", "changed_frames_max"):
+                for k in ("frames_max", "changed_frames_max", "updates_max"):
                     if k in allow:
                         need(count(allow[k]), f"step '{sid}': 'allow.{k}' must be an integer >= 0")
+                if "updates_max" in allow:
+                    need(platform != ANDROID, f"step '{sid}': 'allow.updates_max' applies to {SIM_ONLY}")
                 if "cpu_pct_max" in allow:
                     need(number(allow["cpu_pct_max"]) and allow["cpu_pct_max"] >= 0,
                          f"step '{sid}': 'allow.cpu_pct_max' must be a number >= 0")
@@ -436,6 +477,15 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
                 sm = exp["sections_max"]
                 need(isinstance(sm, dict) and all(isinstance(k, str) and k and count(v) for k, v in sm.items()),
                      f"step '{sid}': 'expect.sections_max' must map section names to integers >= 0")
+            if "signposts_max" in exp:
+                need(platform != ANDROID, f"step '{sid}': 'expect.signposts_max' applies to {SIM_ONLY}")
+                sp = exp["signposts_max"]
+                names = (scn.get("count_signposts") or {}).get("names") or []
+                need(isinstance(sp, dict) and sp and all(isinstance(k, str) and count(v) for k, v in sp.items()),
+                     f"step '{sid}': 'expect.signposts_max' must map signpost names to integers >= 0")
+                unlisted = sorted(k for k in sp if k not in names)
+                need(not unlisted, f"step '{sid}': 'expect.signposts_max' names {unlisted}, which 'count_signposts.names' "
+                                   "does not list")
     if platform == SIM_PLATFORM:
         # One recording per rest step on a simulator, by a recorder with no time limit: the Android
         # recorder's 180 s limit on the whole scenario does not apply.
@@ -457,24 +507,53 @@ SIM_REFUSED_TOP = {
 SIM_REFUSED_STEP = {
     "meminfo": "memory is not read on the iOS Simulator",
     "background": "which app is in front is not read on the iOS Simulator",
-    "expect": "the iOS Simulator has no exact frame count and no signature check in this version",
 }
+
+
+# Input on a simulator goes through the input agent (ios-agent/), by position only.
+SIM_INPUT_KINDS = ("tap", "swipe")
+SIM_SWIPE_MS_MAX = 60000
+SIM_NO_LOOKUP = ("a lookup or typing reads the app's accessibility tree, which changed the app at rest when "
+                 "measured, so this version takes positions as fractions (a tap's 'x' and 'y', a swipe's 'from' and 'to')")
 
 
 def validate_sim_rules(scn: dict, need) -> None:
     for key, why in SIM_REFUSED_TOP.items():
         need(key not in scn, f"'{key}': {why}")
     need(not scn.get("until_quiet", False), "'until_quiet' must be false or absent: there is no quiet detection on the "
-                                            "iOS Simulator; the launch waits 'launch_settle_ms'")
+                                            "iOS Simulator; the launch waits 'launch_settle_ms', an input step its "
+                                            "'settle_ms'")
     for step in scn["steps"]:
         sid, do = step["id"], step["do"]
-        need(do == "rest", f"step '{sid}': the iOS Simulator has no input in this version, so only rest steps run; "
-                           f"a '{do}' step is refused")
-        for key, why in SIM_REFUSED_STEP.items():
-            need(key not in step, f"step '{sid}': '{key}': {why}")
-        need(step["ms"] >= SIM_REST_MIN_MS,
-             f"step '{sid}': a rest on the iOS Simulator lasts at least {SIM_REST_MIN_MS} ms: the CPU time is read in "
-             "steps of 0.01 s, too coarse for a shorter window")
+        need(not (do == "tap" and "find" in step), f"step '{sid}': 'find' is refused on the iOS Simulator: {SIM_NO_LOOKUP}")
+        need(do != "text", f"step '{sid}': a 'text' step is refused on the iOS Simulator: {SIM_NO_LOOKUP}")
+        need(do != "key", f"step '{sid}': a 'key' step is refused on the iOS Simulator: a simulator has no keys to "
+                          "press; tap the screen's own control or swipe from the edge")
+        need(do == "rest" or do in SIM_INPUT_KINDS, f"step '{sid}': a '{do}' step is refused on the iOS Simulator")
+        if do == "rest":
+            for key, why in SIM_REFUSED_STEP.items():
+                need(key not in step, f"step '{sid}': '{key}': {why}")
+            unknown = sorted(set(step.get("expect") or {}) - {"signposts_max"})
+            need(not unknown, f"step '{sid}': 'expect' on a rest on the iOS Simulator takes only 'signposts_max' "
+                              f"(frames at rest are gated by the limits and 'allow'); refused: {unknown}")
+            need(step["ms"] >= SIM_REST_MIN_MS,
+                 f"step '{sid}': a rest on the iOS Simulator lasts at least {SIM_REST_MIN_MS} ms: the CPU time is read "
+                 "in steps of 0.01 s, too coarse for a shorter window")
+        else:
+            need(not step.get("until_quiet", False),
+                 f"step '{sid}': 'until_quiet' must be false or absent: there is no quiet detection on the iOS "
+                 "Simulator; the step waits its 'settle_ms'")
+            if do == "swipe":
+                need(step.get("ms", 300) <= SIM_SWIPE_MS_MAX,
+                     f"step '{sid}': a swipe on the iOS Simulator lasts at most {SIM_SWIPE_MS_MAX} ms (what the input "
+                     "agent accepts)")
+            unknown = sorted(set(step.get("expect") or {}) - {"signature", "signposts_max"})
+            need(not unknown, f"step '{sid}': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature' "
+                              f"and 'signposts_max'; refused: {unknown}")
+
+
+def sim_needs_agent(scn: dict) -> bool:
+    return any(s["do"] in SIM_INPUT_KINDS for s in scn["steps"])
 
 
 def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
@@ -1312,13 +1391,12 @@ SIM_TERMINATE_WAIT_S = 1          # after terminating the app, before launching 
 # recorded frame after the first counts against the app, whatever its class. Chosen to cover a status
 # bar of 54 of 852 points and a home indicator of 34 (about 63 and 40).
 SIM_BARS_PERMILLE = (70, 45)
-SIM_NOT_CHECKED = ("waiting for quiet", "frames at launch", "which app is in front", "find", "trace sections",
-                   "an exact frame count of the app (the platform keeps none a host can read)")
+SIM_NOT_CHECKED = ("waiting for quiet", "frames at launch", "which app is in front", "find", "trace sections")
 
 
-def xcrun(*args: str, check: bool = True, timeout: int = 60) -> str:
+def xcrun(*args: str, check: bool = True, timeout: int = 60, env: dict | None = None) -> str:
     try:
-        proc = subprocess.run(["xcrun", *args], capture_output=True, timeout=timeout)
+        proc = subprocess.run(["xcrun", *args], capture_output=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as exc:
         raise ProbeError(f"xcrun {' '.join(args)[:200]} did not finish within {timeout} s") from exc
     except OSError as exc:
@@ -1444,7 +1522,10 @@ class SimRecorder:
             except subprocess.TimeoutExpired:
                 self.killed = True
                 self._signal_group(signal.SIGKILL)
-                self.proc.wait()
+                try:
+                    self.proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    pass
         self._signal_group(signal.SIGKILL)      # anything the recorder left behind in its group
         self.reader.join(5)
         return self.proc.returncode
@@ -1457,6 +1538,311 @@ class Terminated(SystemExit):
     def __init__(self, signum: int):
         super().__init__(128 + signum)
         self.signame = signal.Signals(signum).name
+
+
+# --------------------------------------------------------------------------------------------
+# the input agent for the iOS Simulator (ios-agent/): taps and swipes by fractions of the display
+# --------------------------------------------------------------------------------------------
+#
+# A UI-testing bundle with no host app, built once per agent source and Xcode version into a cache,
+# started with `xcodebuild test-without-building`, and spoken to over a loopback socket with a
+# token. It queries the app under test for nothing but its state (see the agent's source).
+
+AGENT_DIR = HERE / "ios-agent" if (HERE / "ios-agent").is_dir() else HERE.parent / "ios-agent"
+AGENT_RUNNER = "dev.uiprobe.agent.uitests.xctrunner"   # what xcodebuild installs on the simulator
+AGENT_TEST = "AgentUITests/AgentUITests/testServe"
+AGENT_BUILD_TIMEOUT_S = 600
+AGENT_START_TIMEOUT_S = 120       # from xcodebuild's start to the agent's first answer
+AGENT_QUIT_WAIT_S = 15            # after "quit", for xcodebuild to exit before its group is signalled
+AGENT_TERM_WAIT_S = 5             # after SIGTERM to its group, before SIGKILL
+AGENT_IDLE_MARGIN_S = 120         # the agent's idle limit: the scenario's longest wait plus this
+AGENT_COMMAND_TIMEOUT_S = 90
+
+
+def agent_source_files() -> list[Path]:
+    """The agent's source: every file under ios-agent/ but what Xcode writes beside it for one user."""
+    if not AGENT_DIR.is_dir():
+        return []
+    return sorted(p for p in AGENT_DIR.rglob("*") if p.is_file() and "xcuserdata" not in p.parts
+                  and not p.name.startswith("."))
+
+
+def agent_cache_key(xcode_version: str) -> str:
+    """A hash of the agent's source files and of what `xcodebuild -version` printed: a changed agent or
+    another Xcode builds anew."""
+    h = hashlib.sha256()
+    h.update(xcode_version.strip().encode())
+    for p in agent_source_files():
+        h.update(b"\0" + str(p.relative_to(AGENT_DIR)).encode() + b"\0" + p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def agent_cache_root() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / "Library" / "Caches")
+    return Path(base) / "ui-probe" / "ios-agent"
+
+
+def xcode_version() -> str:
+    try:
+        proc = subprocess.run(["xcodebuild", "-version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError(f"cannot run `xcodebuild -version`: {exc}") from exc
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise ProbeError(f"`xcodebuild -version` failed (exit {proc.returncode}): {(proc.stderr or proc.stdout).strip()[:300]}")
+    return proc.stdout
+
+
+AGENT_BUILT_MARKER = "built.ok"       # written only after a build that exited 0: what "built" means
+AGENT_LOCK_TIMEOUT_S = 900
+
+
+def agent_built(folder: Path) -> Path | None:
+    """The .xctestrun of a finished build in this folder, or None: the marker is written only after a
+    build that exited 0, and a build is renamed into place only then."""
+    if not (folder / AGENT_BUILT_MARKER).is_file():
+        return None
+    found = sorted((folder / "Build" / "Products").glob("*.xctestrun"))
+    return found[0] if found else None
+
+
+def ensure_agent_built() -> Path:
+    """The agent's .xctestrun for this Xcode, built into the cache on first use. A build goes into a
+    temporary folder under the cache root and is renamed into place once it exited 0 and the marker is
+    written; a lock file serialises concurrent builds of one key. A failed build fails the run and
+    names its saved log."""
+    if not agent_source_files():
+        raise ProbeError(f"the input agent's source is missing ({AGENT_DIR}); reinstall the plugin")
+    key = agent_cache_key(xcode_version())
+    root = agent_cache_root()
+    folder = root / key
+    built = agent_built(folder)
+    if built is not None:
+        return built
+    root.mkdir(parents=True, exist_ok=True)
+    with open(root / f"{key}.lock", "w") as lock:
+        deadline = time.monotonic() + AGENT_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise ProbeError(f"another build of the input agent held {root / (key + '.lock')} for "
+                                     f"{AGENT_LOCK_TIMEOUT_S} s") from None
+                time.sleep(0.5)
+        built = agent_built(folder)             # built by the one that held the lock
+        if built is not None:
+            return built
+        work = Path(tempfile.mkdtemp(prefix=f"{key}.building-", dir=root))
+        log = root / f"{key}.build.log"
+        cmd = ["xcodebuild", "build-for-testing", "-project", str(AGENT_DIR / "Agent.xcodeproj"), "-scheme", "Agent",
+               "-destination", "generic/platform=iOS Simulator", "-derivedDataPath", str(work)]
+        try:
+            with open(log, "wb") as f:
+                rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    timeout=AGENT_BUILD_TIMEOUT_S).returncode
+        except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            raise ProbeError(f"the input agent did not build within {AGENT_BUILD_TIMEOUT_S} s; its log is {log}") from exc
+        except OSError as exc:
+            shutil.rmtree(work, ignore_errors=True)
+            raise ProbeError(f"cannot run xcodebuild to build the input agent: {exc.strerror or exc}") from exc
+        found = sorted((work / "Build" / "Products").glob("*.xctestrun"))
+        if rc != 0 or not found:
+            shutil.rmtree(work, ignore_errors=True)
+            raise ProbeError(f"the input agent could not be built (xcodebuild exit {rc}"
+                             + ("" if rc else ", and no .xctestrun was written") + f"); its log is {log}")
+        (work / AGENT_BUILT_MARKER).write_text(f"{time.time()}\n")
+        if folder.exists():
+            shutil.rmtree(folder)               # an unfinished build from before markers, or a stale one
+        os.rename(work, folder)
+        return agent_built(folder)
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def tail(path: Path, lines: int = 12) -> str:
+    try:
+        return " | ".join(path.read_text(errors="replace").strip().splitlines()[-lines:]) or "no output"
+    except OSError:
+        return "no log"
+
+
+class SimAgent:
+    """The input agent under `xcodebuild test-without-building`, in a process group of its own."""
+
+    def __init__(self, udid: str, bundle: str, idle_s: int, raw: Path):
+        self.udid, self.raw = udid, raw
+        xctestrun = ensure_agent_built()
+        self.port, self.token = free_port(), secrets.token_hex(16)
+        env = dict(os.environ, TEST_RUNNER_UI_PROBE_AGENT_PORT=str(self.port), TEST_RUNNER_UI_PROBE_AGENT_TOKEN=self.token,
+                   TEST_RUNNER_UI_PROBE_AGENT_BUNDLE=bundle, TEST_RUNNER_UI_PROBE_AGENT_IDLE_S=str(idle_s))
+        self.log_path = raw / "agent.log"
+        self.log = open(self.log_path, "wb")
+        # Without these, every agent run leaves a folder and a result bundle in Xcode's default derived
+        # data. Removed after a test run that ended with status 0; kept otherwise.
+        self.derived, self.result_bundle = raw / "agent-derived-data", raw / "agent.xcresult"
+        try:
+            self.proc = subprocess.Popen(["xcodebuild", "test-without-building", "-xctestrun", str(xctestrun),
+                                          "-destination", f"platform=iOS Simulator,id={udid}", f"-only-testing:{AGENT_TEST}",
+                                          "-derivedDataPath", str(self.derived), "-resultBundlePath", str(self.result_bundle)],
+                                         stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT, env=env,
+                                         start_new_session=True)
+        except OSError as exc:
+            self.log.close()
+            raise ProbeError(f"cannot start the input agent with xcodebuild: {exc.strerror or exc}") from exc
+        self.record = {"port": self.port, "xctestrun": str(xctestrun), "idle_s": idle_s}
+
+    def proof(self, nonce: str) -> str:
+        return hmac.new(self.token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
+
+    def _exchange(self, command: dict, timeout: float) -> dict:
+        """Send one command with the run's token and a fresh nonce and read the one reply, which must carry
+        the keyed hash of the nonce (HMAC-SHA256 with the token): a reply without it did not come from
+        the agent and is a failed command. OSError when nothing answered."""
+        nonce = secrets.token_hex(16)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=timeout) as sock:
+            sock.sendall(json.dumps({**command, "token": self.token, "nonce": nonce}).encode() + b"\n")
+            data = b""
+            while not data.endswith(b"\n") and len(data) < 1_000_000:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        try:
+            reply = json.loads(data) if data.strip() else None
+        except ValueError:
+            reply = None
+        if not isinstance(reply, dict):
+            return {"ok": False, "error": f"the agent's reply is not a JSON object: {data[:200]!r}"}
+        if not hmac.compare_digest(str(reply.get("proof", "")), self.proof(nonce)):
+            return {"ok": False, "error": "the reply was not proven to come from the agent (no keyed hash of the "
+                                          f"command's nonce); it said: {reply.get('error') or reply}",
+                    "unproven": True}
+        return reply
+
+    def send(self, command: dict, timeout: float = AGENT_COMMAND_TIMEOUT_S) -> tuple[dict, int]:
+        """(the agent's reply, the round trip in ms). A reply that never came is {"ok": false, ...}."""
+        started = time.monotonic()
+        try:
+            reply = self._exchange(command, timeout)
+        except OSError as exc:
+            reply = {"ok": False, "error": f"no reply from the agent: {exc}"}
+        return reply, round((time.monotonic() - started) * 1000)
+
+    def wait_ready(self, timeout_s: float) -> dict:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if self.proc.poll() is not None:
+                raise ProbeError(f"xcodebuild exited (status {self.proc.returncode}) before the input agent answered; "
+                                 f"its log ({self.log_path}) ends: {tail(self.log_path)}")
+            try:
+                reply = self._exchange({"cmd": "ping"}, timeout=5)
+            except OSError:
+                reply = None
+            if reply is not None:
+                if not reply.get("ok"):
+                    raise ProbeError(f"the input agent answered but refused the run's first command: {reply.get('error')}")
+                self.record["ready"] = reply
+                return reply
+            if time.monotonic() > deadline:
+                raise ProbeError(f"the input agent did not answer within {timeout_s} s; its log ({self.log_path}) "
+                                 f"ends: {tail(self.log_path)}")
+            time.sleep(0.25)
+
+    def _signal_group(self, sig: int) -> None:
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def stop(self) -> None:
+        """quit, then xcodebuild's group ended (SIGTERM, then SIGKILL), then the runner app terminated and
+        uninstalled from the simulator, then the agent's derived data and result bundle removed if its
+        test run ended with status 0. Every phase runs whatever the one before it raised, and every wait
+        has a limit. Never raises."""
+        info = {"quit": None, "exit": None, "terminated": False, "killed": False}
+
+        def end_xcodebuild():
+            if self.proc.poll() is None:
+                info["quit"], _ = self.send({"cmd": "quit"}, timeout=5)
+                try:
+                    self.proc.wait(AGENT_QUIT_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    info["terminated"] = True
+                    self._signal_group(signal.SIGTERM)
+                    try:
+                        self.proc.wait(AGENT_TERM_WAIT_S)
+                    except subprocess.TimeoutExpired:
+                        info["killed"] = True
+                        self._signal_group(signal.SIGKILL)
+                        self.proc.wait(10)
+
+        def remove_runner():
+            for action in ("terminate", "uninstall"):
+                try:
+                    xcrun("simctl", action, self.udid, AGENT_RUNNER, check=False, timeout=60)
+                except ProbeError:
+                    pass        # failures ignored: the runner may not be there
+
+        def tidy():
+            if info["exit"] == 0:
+                for path in (self.derived, self.result_bundle):
+                    shutil.rmtree(path, ignore_errors=True)
+
+        def record():
+            self.record["stop"] = info
+            (self.raw / "agent.json").write_text(json.dumps(self.record, indent=1))
+
+        run_phases(end_xcodebuild,
+                   lambda: self._signal_group(signal.SIGKILL),          # anything xcodebuild left in its group
+                   lambda: info.__setitem__("exit", self.proc.poll()),
+                   self.log.close, remove_runner, tidy, record)
+
+
+def run_phases(*phases) -> None:
+    """Run every phase of a clean-up, whatever the one before it raised; report what failed."""
+    for phase in phases:
+        try:
+            phase()
+        except Exception as exc:        # noqa: BLE001 - a clean-up phase must not stop the next one
+            print(f"ui-probe: a clean-up step failed ({type(exc).__name__}: {exc}); the next ones still ran",
+                  file=sys.stderr)
+
+
+class CleanupShield:
+    """Hold SIGINT, SIGTERM and SIGHUP while a clean-up runs, and deliver the first one afterwards, so
+    that a signal cannot cut a clean-up short and the run still ends as interrupted or terminated."""
+
+    def __enter__(self):
+        self.pending: list[int] = []
+        self.saved = {}
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                self.saved[sig] = signal.signal(sig, lambda s, f: self.pending.append(s))
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for sig, handler in self.saved.items():
+            signal.signal(sig, handler)
+        if self.pending:
+            first = self.pending[0]
+            if first == signal.SIGINT:
+                raise KeyboardInterrupt
+            raise Terminated(first)
+        return False
+
+
+def agent_idle_s(scn: dict) -> int:
+    """The agent's idle limit: the scenario's longest wait plus a margin."""
+    waits = [scn.get("launch_settle_ms", 6000)]
+    for s in scn["steps"]:
+        waits += [s.get("ms", 0), s.get("settle_ms", default_settle_ms(s["do"]) if s["do"] != "rest" else 0)]
+    return int(max(waits) / 1000 + AGENT_IDLE_MARGIN_S)
 
 
 def run_once_sim(udid: str, scn: dict, out: Path) -> dict:
@@ -1486,6 +1872,10 @@ def run_once_sim(udid: str, scn: dict, out: Path) -> dict:
 # The status bar is frozen for a simulator run: its clock would otherwise change during a long rest,
 # and the recorder would keep the frames (with encoder noise that reaches the app's area).
 SIM_STATUS_BAR = ("--time", "9:41")
+# XCUIApplication.State, as the agent's ping reports it.
+SIM_APP_IN_FRONT = 4
+SIM_APP_STATES = {0: "unknown", 1: "not running", 2: "running in the background, suspended",
+                  3: "running in the background", 4: "running in front"}
 
 
 def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
@@ -1501,18 +1891,29 @@ def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
         raise ProbeError(f"the simulator's status bar could not be frozen, so its clock would change the screen at "
                          f"rest: {exc}") from exc
     try:
-        _sim_device_part(udid, scn, raw, bundle)
-    finally:
+        agent = None
         try:
-            xcrun("simctl", "status_bar", udid, "clear")
-        except ProbeError as exc:
-            print(f"ui-probe: the simulator's status bar override could not be cleared ({exc}); clear it with "
-                  f"`xcrun simctl status_bar {udid} clear`", file=sys.stderr)
+            if sim_needs_agent(scn):
+                agent = SimAgent(udid, bundle, agent_idle_s(scn), raw)
+                agent.wait_ready(AGENT_START_TIMEOUT_S)
+            _sim_device_part(udid, scn, raw, bundle, agent)
+        finally:
+            if agent is not None:
+                with CleanupShield():
+                    agent.stop()
+    finally:
+        with CleanupShield():
+            try:
+                xcrun("simctl", "status_bar", udid, "clear")
+            except ProbeError as exc:
+                print(f"ui-probe: the simulator's status bar override could not be cleared ({exc}); clear it with "
+                      f"`xcrun simctl status_bar {udid} clear`", file=sys.stderr)
     wall = time.time() - started
     (out / "capture.json").write_text(json.dumps({
         "tool": {"name": "ui-probe", "version": VERSION}, "platform": SIM_PLATFORM,
         "scenario": scn, "device": facts, "trace": False, "video": True, "sections": False,
-        "status_bar_override": list(SIM_STATUS_BAR),
+        "status_bar_override": list(SIM_STATUS_BAR), "launch_env": scn.get("launch_env") or {},
+        "launch_env_dropped": json.loads(_read_raw(raw, "launch-env.json") or "{}").get("dropped", []),
         "host": {"load1_before": round(load_before, 2), "load1_after": round(host_load(), 2), "wall_s": round(wall, 1)},
     }, indent=1))
     try:
@@ -1521,46 +1922,283 @@ def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
         raise ProbeError(f"{out}: the capture was saved but its analysis failed: {exc}") from exc
 
 
-def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str) -> None:
-    """Launch the app and record every rest step. The app is left running afterwards."""
+def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAgent | None = None) -> None:
+    """Launch the app and record every step: a rest waits its 'ms'; a tap or swipe is sent to the agent
+    and the step waits its 'settle_ms'. With the agent, every step ends with a ping for the app's state.
+    The app is left running afterwards."""
     xcrun("simctl", "terminate", udid, bundle, check=False)       # not running is not an error
     time.sleep(SIM_TERMINATE_WAIT_S)
-    launched = xcrun("simctl", "launch", udid, bundle)
+    # launch_env reaches the app's process through simctl's SIMCTL_CHILD_ prefix, on this call only.
+    launch_env = scn.get("launch_env") or {}
+    dropped = sorted(k for k in os.environ if k.startswith("SIMCTL_CHILD_"))
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SIMCTL_CHILD_")}
+    env.update({f"SIMCTL_CHILD_{k}": v for k, v in launch_env.items()})
+    (raw / "launch-env.json").write_text(json.dumps({"dropped": dropped}))
+    launch_wall = time.time()
+    launched = xcrun("simctl", "launch", udid, bundle, env=env)
     (raw / "launch.txt").write_text(launched)
+    (raw / "launch-time.json").write_text(json.dumps({"wall": launch_wall}))
     m = re.search(rf"^{re.escape(bundle)}:\s*(\d+)\s*$", launched.strip(), re.M)
     if not m:
         raise ProbeError(f"`xcrun simctl launch` printed no process id for {bundle}: {launched.strip()[:200]!r}")
     pid = int(m.group(1))
     time.sleep(scn.get("launch_settle_ms", 6000) / 1000)
     (raw / "pid-launch.txt").write_text(f"{pid}\n" if host_cputime(pid) else "")
+    last_wall = None
     for step in scn["steps"]:
         sid = step["id"]
         recorder = SimRecorder(udid, raw / f"rec-{sid}.mp4")
         before = after = ""
-        t0 = t1 = None
+        t0 = t1 = w0 = w1 = rec_start = rec_end = None
+        command = reply = ping = None
+        round_trip = None
         try:
             recorder.wait_started(SIM_RECORD_START_TIMEOUT_S)
-            before, t0 = host_cputime(pid), time.monotonic()
-            time.sleep(step["ms"] / 1000)
-            after, t1 = host_cputime(pid), time.monotonic()
+            rec_start = time.time()
+            before, t0, w0 = host_cputime(pid), time.monotonic(), time.time()
+            if step["do"] == "rest":
+                time.sleep(step["ms"] / 1000)
+            else:
+                command = sim_command(step)
+                reply, round_trip = agent.send(command)
+                time.sleep(step.get("settle_ms", default_settle_ms(step["do"])) / 1000)
+            after, t1, w1 = host_cputime(pid), time.monotonic(), time.time()
+            if agent is not None:
+                ping, _ = agent.send({"cmd": "ping"}, timeout=30)
         finally:
-            code = recorder.stop()
-            (raw / f"rec-{sid}.log").write_text("\n".join(recorder.lines) + "\n")
+            with CleanupShield():
+                code = recorder.stop()
+                rec_end = time.time()
+                (raw / f"rec-{sid}.log").write_text("\n".join(recorder.lines) + "\n")
         (raw / f"pid-{sid}.txt").write_text(f"{pid}\n" if after else "")
         (raw / f"step-{sid}.json").write_text(json.dumps({
             "pid": pid, "cputime_before": before, "cputime_after": after, "window_s": round(t1 - t0, 3),
+            "wall_before": w0, "wall_after": w1, "rec_wall_start": rec_start, "rec_wall_end": rec_end,
             "recorder_exit": code, "recorder_killed": recorder.killed,
-            "recorder_alive_at_end": recorder.alive_at_stop}, indent=1))
+            "recorder_alive_at_end": recorder.alive_at_stop,
+            **({} if agent is None else {"command": command, "reply": reply, "round_trip_ms": round_trip,
+                                         "end_ping": ping,
+                                         "app_state": ping.get("app_state") if ping and ping.get("ok") else None})},
+            indent=1))
+        last_wall = w1
+    read_log_store(udid, scn, raw, pid, launch_wall, last_wall)
 
 
-def sim_recording_counts(mp4: Path, workdir: Path, sid: str, name: str) -> dict:
-    """The existing recording analysis on one rest step's recording: the whole file is the step's
-    window, and the first frame (the screen as recording began) is left out. Counts of the frames
-    after it that changed the app's area (with the encoder noise left out), changed it by noise only,
-    changed only the system bars, or changed nothing."""
+# --------------------------------------------------------------------------------------------
+# the simulator's log store: exact counts of the app's frames, commits and display updates
+# --------------------------------------------------------------------------------------------
+#
+# `log show --signpost` inside the simulator returns, for the app's process and with nothing added
+# to the app, one event per frame its Metal layer drew (a drawable), per layer-tree commit, and per
+# display update it was woken for. Read once per run, after the last step.
+
+SIM_COUNTS = {   # name: (subsystem, category prefix, signpost name)
+    "drawables": ("com.apple.coreanimation", "CAMetalLayer", "ClientDrawable"),
+    "commits": ("com.apple.coreanimation", "Transaction", "Commit"),
+    "updates": ("com.apple.UIKit", "UpdateCycle", "UpdateSequence"),
+}
+SIM_LOG_MARGIN_S = 2          # around the run, for the store read
+SIM_LOG_FLUSH_WAIT_S = 1      # before the read, for the store to hold the last events
+SIM_LOG_TIMEOUT_S = 180
+# A rest's recorded frames are excused (a note, not a violation) when the app presented nothing by
+# any count, there are at most this many, and none changed any pixel by more than this many grey
+# levels at the analysis scale: the encoder refining a still picture after motion. Measured: such
+# frames changed at most 17 levels (17 rest windows); a 20 pt spinner and a caret changed 165 or more.
+SIM_REFINE_FRAMES_MAX = 2
+SIM_REFINE_DELTA_MAX = 24
+# ... and changed at most this many pixels by ui_video.CHANGE_LEVEL (8) or more, none of them where the
+# previous picture was flat. Measured: 17 rest windows on five screens of one app changed 28 to 193
+# pixels, more on a screen with more text, none in a flat area; a 1 pt grey hairline that grew
+# (largest change 16) changed 6 or 7, of which 4 or 5 in a flat area. So the flat-area count is what
+# tells the two apart, and the pixel limit only bounds a wide subtle change: it sits a factor of ten
+# above the largest refinement measured, because a limit near it fails the next busier screen.
+SIM_REFINE_CHANGED_PX_MAX = 2000
+SIM_REFINE_FLAT_PX_MAX = 0
+SUBSYSTEM_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def xcrun_result(*args: str, timeout: int = 60) -> tuple[int | None, str, str]:
+    """(exit status, stdout, stderr) of an xcrun call; (None, "", why) when it could not run."""
+    try:
+        proc = subprocess.run(["xcrun", *args], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "", f"did not finish within {timeout} s"
+    except OSError as exc:
+        return None, "", f"cannot run xcrun: {exc.strerror or exc}"
+    return proc.returncode, proc.stdout.decode(errors="replace"), proc.stderr.decode(errors="replace")
+
+
+def log_store_predicate(scn: dict, pid: int) -> str:
+    subsystems = sorted({s for s, _, _ in SIM_COUNTS.values()} | ({scn["count_signposts"]["subsystem"]}
+                                                                  if "count_signposts" in scn else set()))
+    return f"processID == {pid} AND (" + " OR ".join(f'subsystem == "{s}"' for s in subsystems) + ")"
+
+
+def read_log_store(udid: str, scn: dict, raw: Path, pid: int, launch_wall: float, last_wall: float | None) -> None:
+    """One `log show` for the app's process and the whole run, saved as raw/signposts.ndjson with
+    what was asked and how it answered in raw/signposts.json. Never fails the run: a store that did
+    not answer leaves the counts unknown."""
+    time.sleep(SIM_LOG_FLUSH_WAIT_S)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    start = datetime.datetime.fromtimestamp(launch_wall - SIM_LOG_MARGIN_S).strftime(fmt)
+    end = datetime.datetime.fromtimestamp((last_wall or time.time()) + SIM_LOG_MARGIN_S).strftime(fmt)
+    predicate = log_store_predicate(scn, pid)
+    code, out, err = xcrun_result("simctl", "spawn", udid, "log", "show", "--signpost", "--start", start, "--end", end,
+                                  "--style", "ndjson", "--predicate", predicate, timeout=SIM_LOG_TIMEOUT_S)
+    (raw / "signposts.ndjson").write_text(out)
+    (raw / "signposts.json").write_text(json.dumps({"exit": code, "stderr": err[-2000:], "start": start, "end": end,
+                                                    "predicate": predicate, "pid": pid}, indent=1))
+    # A simulator has no `logger`, so no marker can be written from outside. Instead a second, small
+    # read of every process, from the end of the last step to now: other processes log all the time,
+    # so an event stamped after the end of the last step shows the store was read to the end.
+    after = last_wall or launch_wall
+    asked = ["simctl", "spawn", udid, "log", "show", "--start", datetime.datetime.fromtimestamp(after).strftime(fmt),
+             "--end", datetime.datetime.fromtimestamp(time.time() + 1).strftime(fmt), "--style", "ndjson"]
+    code2, out2, err2 = xcrun_result(*asked, timeout=SIM_LOG_TIMEOUT_S)
+    total = later = 0
+    for line in out2.splitlines():
+        try:
+            e = json.loads(line)
+            ts = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp()
+        except (ValueError, KeyError, TypeError):
+            continue
+        total += 1
+        later += ts > after
+    (raw / "signposts-tail.json").write_text(json.dumps({"asked": asked, "exit": code2, "stderr": err2[-500:],
+                                                         "events": total, "events_after_end": later, "after": after},
+                                                        indent=1))
+
+
+def parse_log_store(raw: Path, pid: int | None) -> tuple[list[tuple[float, dict]] | None, str | None]:
+    """The app's signpost events with their times, or (None, why they cannot be used)."""
+    meta_text, text = _read_raw(raw, "signposts.json"), _read_raw(raw, "signposts.ndjson")
+    if meta_text is None or text is None:
+        return None, "the run holds no read of the simulator's log store"
+    meta = json.loads(meta_text)
+    if meta.get("exit") != 0:
+        return None, (f"the simulator's log store did not answer (`log show` exit {meta.get('exit')}: "
+                      f"{(meta.get('stderr') or '').strip()[-200:] or 'no message'})")
+    events = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            return None, f"the simulator's log store answered something that is not JSON (line {n})"
+        if not isinstance(e, dict):
+            return None, f"the simulator's log store answered something that is not a JSON object (line {n})"
+        if e.get("eventType") != "signpostEvent" or (pid is not None and e.get("processID") != pid):
+            continue
+        try:
+            ts = datetime.datetime.strptime(e["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp()
+        except (KeyError, TypeError, ValueError):
+            return None, f"the simulator's log store gave an event without a readable time (line {n})"
+        events.append((ts, e))
+    return events, None
+
+
+def count_kind(events: list[tuple[float, dict]], kind: str, lo: float, hi: float) -> int:
+    subsystem, prefix, name = SIM_COUNTS[kind]
+    return sum(1 for ts, e in events if lo <= ts <= hi and e.get("subsystem") == subsystem
+               and str(e.get("category") or "").startswith(prefix) and e.get("signpostName") == name)
+
+
+def count_signposts(events: list[tuple[float, dict]], spec: dict, lo: float, hi: float) -> dict:
+    """Per listed name, the app's events of the subsystem whose type is begin or event and whose
+    signpost name or message is that name."""
+    out = {}
+    for name in spec["names"]:
+        out[name] = sum(1 for ts, e in events if lo <= ts <= hi and e.get("subsystem") == spec["subsystem"]
+                        and e.get("signpostType") in ("begin", "event")
+                        and (e.get("signpostName") == name or e.get("eventMessage") == name))
+    return out
+
+
+def store_counts(raw: Path, scn: dict, steps_out: list[dict], result: dict) -> None:
+    """Each step's drawables, commits and updates (and the scenario's own signposts) from the log store,
+    by the wall-clock window of its two CPU readings, and the same three counts over its recording's
+    span. Known for the run only if the store answered, holds a drawable or a commit of the app between
+    its launch and the first step (an app that started has drawn or committed something), and a second
+    read of every process holds an event stamped after the end of the last step (so the store was read
+    to the end)."""
+    launch_pid = next((s.get("pid") for s in steps_out if s["id"] == "launch"), None)
+    meta = json.loads(_read_raw(raw, "signposts.json") or "{}")
+    events, why = parse_log_store(raw, meta.get("pid", launch_pid))
+    launch_time = json.loads(_read_raw(raw, "launch-time.json") or "{}").get("wall")
+    windows, spans = {}, {}
+    for st in steps_out:
+        if st["id"] == "launch":
+            continue
+        data = json.loads(_read_raw(raw, f"step-{st['id']}.json") or "{}")
+        windows[st["id"]] = (data.get("wall_before"), data.get("wall_after"))
+        spans[st["id"]] = (data.get("rec_wall_start"), data.get("rec_wall_end"))
+    first = next(iter(windows.values()), (None, None))[0]
+    tail = json.loads(_read_raw(raw, "signposts-tail.json") or "null")
+    if why is None:
+        if launch_time is None or first is None:
+            why = "the run holds no time of its launch or of its first step, so the log store's events cannot be placed"
+        elif not (count_kind(events, "drawables", launch_time, first) or count_kind(events, "commits", launch_time, first)):
+            why = ("the log store holds no drawable or commit of the app between its launch and the first step; an app "
+                   "that started has drawn or committed something, so the store was not read")
+        elif tail is None or tail.get("exit") != 0 or not tail.get("events_after_end"):
+            why = ("a second read of the log store, of every process, found no event after the end of the last step "
+                   + ("(it did not answer)" if tail is None or tail.get("exit") != 0 else "") +
+                   ", so the store may not have been read to the end").replace(" ,", ",")
+    spec = scn.get("count_signposts")
+    sign_why = why
+    unmatched = []
+    if spec is not None and why is None:
+        if not any(e.get("subsystem") == spec["subsystem"] for _, e in events):
+            sign_why = (f"the run holds no event of subsystem '{spec['subsystem']}' from the app, launch included: is the "
+                        "app's tracing switched on?")
+        else:
+            whole = count_signposts(events, spec, float("-inf"), float("inf"))
+            unmatched = [name for name, n in whole.items() if n == 0]
+    result["log_store"] = {"known": why is None, "reason": why, "events": None if events is None else len(events),
+                           "tail": tail}
+    if spec is not None:
+        result["log_store"]["signposts_known"] = sign_why is None
+        result["log_store"]["signposts_reason"] = sign_why
+        result["log_store"]["signposts_unmatched"] = unmatched
+    for st in steps_out:
+        if st["id"] == "launch":
+            continue
+        lo, hi = windows.get(st["id"], (None, None))
+        placed = why is None and lo is not None and hi is not None
+        for kind in SIM_COUNTS:
+            st[kind] = count_kind(events, kind, lo, hi) if placed else None
+        s0, s1 = spans.get(st["id"], (None, None))
+        st["recording_span"] = ({kind: count_kind(events, kind, s0, s1) for kind in SIM_COUNTS}
+                                if why is None and s0 is not None and s1 is not None else None)
+        if spec is not None:
+            counted = (count_signposts(events, spec, lo, hi) if placed and sign_why is None
+                       else {name: None for name in spec["names"]})
+            st["signposts"] = {name: (None if name in unmatched else n) for name, n in counted.items()}
+
+
+def sim_command(step: dict) -> dict:
+    """The agent command for an input step (the token is added when it is sent)."""
+    if step["do"] == "tap":
+        return {"cmd": "tap", "x": step["x"], "y": step["y"]}
+    return {"cmd": "swipe", "from": step["from"], "to": step["to"], "ms": step.get("ms", 300)}
+
+
+def sim_recording_counts(mp4: Path, workdir: Path, step: dict | str, name: str) -> dict:
+    """The existing recording analysis on one step's recording: the whole file is the step's window,
+    and the first frame (the screen as recording began) is left out. Counts of the frames after it
+    that changed the app's area (with the encoder noise left out), changed it by noise only, changed
+    only the system bars, or changed nothing, and the step's signature: a tap is judged as a state
+    change, a swipe as motion unless its 'judge' is 'state', as on Android."""
     sys.path.insert(0, str(HERE))
     import ui_video
-    mini = {"name": name, "steps": [{"id": sid, "do": "rest", "ms": 1}]}
+    if isinstance(step, str):
+        step = {"id": step, "do": "rest"}
+    sid = step["id"]
+    mini_step = {"id": sid, "do": step["do"], "ms": 1}
+    if "judge" in step:
+        mini_step["judge"] = step["judge"]
+    mini = {"name": name, "steps": [mini_step]}
     # The recording has no per-frame device clock: its own frame times are used, placed from 0.
     marks = {"T0": -0.3, f"{sid}.start": -1e12, f"{sid}.end": 1e12}
     facts = {"height": 1000, "stable_insets_top_bottom": list(SIM_BARS_PERMILLE)}
@@ -1576,6 +2214,8 @@ def sim_recording_counts(mp4: Path, workdir: Path, sid: str, name: str) -> dict:
     sheet = workdir / "sheets" / f"{sid}.png"
     return {"frames": frames, "changed_app": real, "changed_app_noise": region - real, "identical": identical,
             "bars_only": max(0, frames - region - identical), "signature": seg["signature"],
+            "largest_change": seg.get("largest_change"), "most_changed_px": seg.get("most_changed_px"),
+            "most_flat_changed_px": seg.get("most_flat_changed_px"),
             "sheet": str(sheet.relative_to(workdir.parent.parent)) if sheet.exists() else None}
 
 
@@ -1610,7 +2250,7 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
         cpu_pct = round(100 * cpu_s / window, 2) if cpu_s is not None and window and window > 0 else None
         mp4 = raw / f"rec-{sid}.mp4"
         if mp4.exists() and mp4.stat().st_size > 0:
-            recording = sim_recording_counts(mp4, out / "video" / sid, sid, scn["name"])
+            recording = sim_recording_counts(mp4, out / "video" / sid, step, scn["name"])
             if recording.get("sheet"):
                 (out / "sheets").mkdir(exist_ok=True)
                 shutil.copyfile(out / recording["sheet"], out / "sheets" / f"{sid}.png")
@@ -1622,7 +2262,12 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
             "process_restarted": restarted, "window_s": window, "cpu_s": cpu_s, "cpu_pct": cpu_pct,
             "recorder_exit": data.get("recorder_exit"), "recorder_killed": data.get("recorder_killed"),
             "recorder_alive_at_end": data.get("recorder_alive_at_end"), "cpu_problem": cpu_problem,
-            "recording": recording})
+            "recording": recording,
+            **({"signature": (recording or {}).get("signature")} if step["do"] != "rest" else {}),
+            **({} if "app_state" not in data else {
+                "app_state": data.get("app_state"),
+                "agent": {"command": data.get("command"), "reply": data.get("reply"),
+                          "round_trip_ms": data.get("round_trip_ms"), "end_ping": data.get("end_ping")}})})
         prev = pid_now if pid_now is not None else prev
     result = {
         "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": SIM_PLATFORM,
@@ -1632,6 +2277,13 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
         "steps": steps_out, "frame_sources": ["recording"], "video_requested": True, "trace_requested": False,
         "not_checked": list(SIM_NOT_CHECKED),
     }
+    store_counts(raw, scn, steps_out, result)
+    result["frame_sources"] = ["recording"] + (["log store"] if result["log_store"]["known"] else [])
+    result["launch_env_dropped"] = cap.get("launch_env_dropped") or []
+    if sim_needs_agent(scn):
+        agent_text = _read_raw(raw, "agent.json")
+        result["agent"] = json.loads(agent_text) if agent_text else None
+        result["not_checked"] = [c for c in SIM_NOT_CHECKED if c != "which app is in front"]
     tmp = out / "run.json.tmp"
     tmp.write_text(json.dumps(result, indent=1))
     tmp.replace(out / "run.json")
@@ -1639,18 +2291,40 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
 
 
 def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
-    """A simulator run: CPU at rest and the recording, nothing else. The status bar is frozen for the
-    run, so nothing but the app has a reason to make the display compose, and there is no exact frame
-    count of the app on a simulator to say otherwise: every recorded frame after the first counts,
-    whatever its class (the 0.3.0 rule that excuses recorded frames while the app presented none never
-    applies here). A recorder that had stopped before the window ended fails the recording check."""
+    """A simulator run: CPU at rest, the log store's exact counts (drawables, commits, display
+    updates) and the recording. The status bar is frozen for the run, so nothing but the app has a
+    reason to make the display compose: every recorded frame after the first counts against the app,
+    whatever its class, unless the counts are known, all 0 for the window, and the frames are at most
+    SIM_REFINE_FRAMES_MAX that changed no pixel by more than SIM_REFINE_DELTA_MAX grey levels (the
+    encoder refining a still picture). A recorder that had stopped before the window ended fails the
+    recording check."""
     violations, notes = [], []
 
     def fail(check, sid, message, **extra):
         violations.append({"check": check, "step": sid, "message": message, **extra})
 
-    notes.append("iOS Simulator: not checked, since a simulator does not give them: " + ", ".join(SIM_NOT_CHECKED)
-                 + ". Frames at rest are counted from the recording only")
+    uses_agent = "agent" in r
+    not_checked = [c for c in SIM_NOT_CHECKED if not (uses_agent and c == "which app is in front")]
+    store = r.get("log_store") or {"known": False, "reason": "the run holds no read of the simulator's log store"}
+    notes.append("iOS Simulator: not checked, since a simulator does not give them: " + ", ".join(not_checked)
+                 + ("; a tap's or a swipe's frames, counts and CPU are information, never gated" if uses_agent else ""))
+    if not store.get("known"):
+        notes.append(f"the drawables, commits and display updates are unknown for every step: {store.get('reason')}; "
+                     "frames at rest are counted from the recording only")
+    spec = scn.get("count_signposts")
+    if r.get("launch_env_dropped"):
+        notes.append(f"{', '.join(r['launch_env_dropped'])} in ui-probe's own environment were not passed to the app: "
+                     "the scenario's launch_env is the only source")
+    if uses_agent:
+        stop = (r.get("agent") or {}).get("stop")
+        if stop is None:
+            fail("agent", None, "the run holds no record of how the agent's test run ended")
+        elif stop.get("terminated") or stop.get("killed"):
+            notes.append("the agent's test run did not end after 'quit' and was ended by the tool ("
+                         + ("SIGKILL" if stop.get("killed") else "SIGTERM") + "); its exit status says nothing")
+        elif stop.get("exit") != 0:
+            fail("agent", None, f"the agent's test run ended with status {stop.get('exit')}: XCTest recorded an issue "
+                 "(raw/agent.log, raw/agent.xcresult)", observed=stop.get("exit"))
     launch = r.get("launch") or {}
     if launch.get("error"):
         fail("launch", "launch", f"the app did not start: {launch['error']}")
@@ -1670,6 +2344,39 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
             fail("process", sid, f"the app's process was not running at the end of '{sid}'")
         if s.get("process_restarted"):
             fail("process", sid, "the app's process changed during the scenario (a crash or a kill)")
+        if uses_agent and want != "launch":
+            # The agent's ping at the end of every step reports the app's state (4: in front).
+            state = s.get("app_state")
+            if state is None:
+                fail("foreground", sid, f"the agent did not report which app was in front at the end of '{sid}'")
+            elif state != SIM_APP_IN_FRONT:
+                fail("foreground", sid, f"the app was not in front at the end of '{sid}' (its state: "
+                     f"{SIM_APP_STATES.get(state, state)})", observed=state)
+        if want in SIM_INPUT_KINDS:
+            reply = (s.get("agent") or {}).get("reply") or {}
+            if not reply.get("ok"):
+                fail("input", sid, f"the agent did not perform the {want}: {reply.get('error') or 'no reply'}")
+            rec = s.get("recording")
+            if rec is None or rec.get("error"):
+                fail("recording", sid, "no recording was saved" if rec is None else
+                     f"the recording could not be used: {rec['error']}")
+            else:
+                if s.get("recorder_alive_at_end") is not True:
+                    fail("recording", sid, "the recorder had stopped before the window ended (or whether it was still "
+                         "running was not recorded); its recording may end early")
+                if s.get("recorder_exit") != 0:
+                    fail("recording", sid, f"the recorder exited with status {s.get('recorder_exit')}; the recording may "
+                         "be incomplete", observed=s.get("recorder_exit"))
+            expect = step.get("expect") or {}
+            gate_signposts(fail, sid, s, expect, spec, store)
+            if "signature" in expect:
+                got = None if rec is None or rec.get("error") else rec.get("signature")
+                if got is None:
+                    fail("signature", sid, "no recording, so the signature could not be read")
+                elif got != expect["signature"]:
+                    fail("signature", sid, f"signature '{got}', approved '{expect['signature']}'",
+                         observed=got, allowed=expect["signature"])
+            continue
         if want != "rest":
             continue
         allow = step.get("allow") or {}
@@ -1679,12 +2386,34 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
         cpu_max = allow.get("cpu_pct_max", opts["rest_cpu_pct_max"])
         by = lambda key: f" by the step's allowance ({reason})" if key in allow else ""
         extra = lambda key: {"limit_from": "allowance"} if key in allow else {}
+        gate_signposts(fail, sid, s, step.get("expect") or {}, spec, store)
+        known = s.get("drawables") is not None and s.get("commits") is not None and s.get("updates") is not None
+        if known:
+            presented = s["drawables"] + s["commits"]
+            if presented > frames_max:
+                fail("rest-frames", sid, f"{presented} frames presented at rest ({s['drawables']} drawables, "
+                     f"{s['commits']} commits; log store count), allowed {frames_max}" + by("frames_max"),
+                     observed=presented, allowed=frames_max, source="log store", **extra("frames_max"))
+            elif "frames_max" in allow and presented > opts["rest_frames_max"]:
+                notes.append(f"{sid}: {presented} frames presented at rest (log store count), above the limit of "
+                             f"{opts['rest_frames_max']} that would otherwise apply; passed on the step's allowance of "
+                             f"{frames_max} ({reason})")
+            updates_max = allow.get("updates_max", opts["rest_updates_max"])
+            if s["updates"] > updates_max:
+                fail("rest-updates", sid, f"the app was woken for {s['updates']} display updates at rest, allowed "
+                     f"{updates_max}" + by("updates_max"), observed=s["updates"], allowed=updates_max,
+                     **extra("updates_max"))
+            elif "updates_max" in allow and s["updates"] > opts["rest_updates_max"]:
+                notes.append(f"{sid}: the app was woken for {s['updates']} display updates at rest, above the limit of "
+                             f"{opts['rest_updates_max']} that would otherwise apply; passed on the step's allowance of "
+                             f"{updates_max} ({reason})")
         rec = s.get("recording")
         code = s.get("recorder_exit")
         if rec is None or rec.get("error"):
             why = "no recording was saved" if rec is None else f"the recording could not be used: {rec['error']}"
             fail("recording", sid, why)
-            fail("rest-frames", sid, f"cannot count frames: {why}, and a simulator gives no other count")
+            if not known:
+                fail("rest-frames", sid, f"cannot count frames: {why}, and the log store's counts are unknown")
         else:
             if s.get("recorder_alive_at_end") is not True:
                 fail("recording", sid, "the recorder had stopped before the window ended (or whether it was still "
@@ -1701,6 +2430,25 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
             classes = (f"{rec['changed_app']} changed the app's area, {rec['changed_app_noise']} changed it by "
                        f"encoder noise only, {rec['bars_only']} changed only the system bars, {rec['identical']} "
                        "changed nothing")
+            largest = rec.get("largest_change")
+            span = s.get("recording_span") or {}
+            span_zero = known and all(span.get(kind) == 0 for kind in SIM_COUNTS)
+            refined = (span_zero and s["drawables"] == 0 and s["commits"] == 0 and s["updates"] == 0
+                       and total <= SIM_REFINE_FRAMES_MAX and largest is not None and largest <= SIM_REFINE_DELTA_MAX
+                       and (rec.get("most_changed_px") is not None and rec["most_changed_px"] <= SIM_REFINE_CHANGED_PX_MAX)
+                       and (rec.get("most_flat_changed_px") is not None
+                            and rec["most_flat_changed_px"] <= SIM_REFINE_FLAT_PX_MAX))
+            if refined:
+                if total:
+                    notes.append(f"{sid}: {total} frames recorded at rest ({classes}) are not held against the app: it "
+                                 "presented nothing by any count over the whole recording (0 drawables, 0 commits, 0 "
+                                 f"display updates), no pixel changed by more than {largest:g} levels on any colour "
+                                 f"channel (the limit is {SIM_REFINE_DELTA_MAX}), {rec['most_changed_px']} pixels "
+                                 f"changed at most (the limit is {SIM_REFINE_CHANGED_PX_MAX}) and none where the picture "
+                                 "was flat: the encoder refining a still picture. Look at them on "
+                                 f"sheets/{sid}.png and with `ui-probe zoom <run-dir> <a> <b> --step {sid}`")
+                total = changed = 0
+                rec = {**rec, "identical": 0}
             if total > frames_max:
                 fail("rest-frames", sid, f"{total} frames recorded at rest ({classes}), allowed {frames_max}"
                      + by("frames_max"), observed=total, allowed=frames_max, source="recording", **extra("frames_max"))
@@ -1738,14 +2486,37 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
     return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
 
 
+def gate_signposts(fail, sid: str, s: dict, expect: dict, spec: dict | None, store: dict) -> None:
+    """expect.signposts_max against the step's counts of the app's own signposts (check 'signposts')."""
+    for name, limit in (expect.get("signposts_max") or {}).items():
+        got = (s.get("signposts") or {}).get(name)
+        if got is None and name in (store.get("signposts_unmatched") or []):
+            fail("signposts", sid, f"'{name}' was not counted: it occurs nowhere in the run, launch included. A name is "
+                 "matched by exact equality with the signpost's name or its message")
+        elif got is None:
+            why = store.get("signposts_reason") or store.get("reason") or "the run holds no count of it"
+            fail("signposts", sid, f"'{name}' was not counted: {why}")
+        elif got > limit:
+            fail("signposts", sid, f"{got} '{name}' signposts, approved at most {limit}", observed=got, allowed=limit)
+
+
 def sim_run_row(path: str, r: dict) -> dict:
     row = {"run": Path(path).name, "host_load1": r["host"]["load1_before"]}
     for s in r["steps"]:
-        if s["kind"] != "rest":
+        if s["kind"] == "launch":
             continue
         sid, rec = s["id"], s.get("recording") or {}
+        if s["kind"] in SIM_INPUT_KINDS:
+            agent = s.get("agent") or {}
+            row[f"{sid}.sim_signature"] = s.get("signature")
+            row[f"{sid}.sim_round_trip_ms"] = agent.get("round_trip_ms")
+            row[f"{sid}.sim_agent_ms"] = (agent.get("reply") or {}).get("elapsed_ms")
         # Keys of their own: a simulator's CPU is in seconds (Android's in ticks), and its recorded
         # frames are those of a whole per-step recording, every one of which counts.
+        for kind in SIM_COUNTS:
+            row[f"{sid}.sim_{kind}"] = s.get(kind)
+        for name, value in (s.get("signposts") or {}).items():
+            row[f"{sid}.sim_signposts.{name}"] = value
         row[f"{sid}.sim_window_s"] = s.get("window_s")
         row[f"{sid}.sim_cpu_s"] = s.get("cpu_s")
         row[f"{sid}.sim_cpu_pct"] = s.get("cpu_pct")
@@ -2818,6 +3589,21 @@ def doctor(serial: str | None, simulator: str | None = None) -> dict:
                     add("simulator booted", dev.get("state") == "Booted", f"{simulator}: {dev.get('state')}")
             except ProbeError as exc:
                 add("xcrun simctl", False, str(exc))
+        # The input agent: needed only by a scenario with a tap or a swipe on a simulator.
+        add("input agent source (for tap and swipe)", bool(agent_source_files()),
+            str(AGENT_DIR) if agent_source_files() else f"missing ({AGENT_DIR}): reinstall the plugin", required=False)
+        if shutil.which("xcodebuild") and agent_source_files():
+            try:
+                folder = agent_cache_root() / agent_cache_key(xcode_version())
+                built = agent_built(folder)
+                add("input agent built for this Xcode", built is not None,
+                    str(built) if built else "not yet: it is built on the first run with a tap or a swipe "
+                                              f"(into {folder})", required=False, warning=built is None)
+            except ProbeError as exc:
+                add("input agent built for this Xcode", False, str(exc), required=False, warning=True)
+        else:
+            add("input agent built for this Xcode", False, "xcodebuild is not on PATH (Xcode); a tap or a swipe on a "
+                "simulator needs it", required=False, warning=True)
     ok = all(c["ok"] for c in checks if c["required"])
     return {"tool": {"name": "ui-probe", "version": VERSION}, "ok": ok, "checks": checks}
 
@@ -2883,6 +3669,8 @@ def main(argv: list[str] | None = None) -> int:
     z.add_argument("--out", default="")
     z.add_argument("--step", default="", help="a simulator run: the rest step whose recording holds the frames")
     sub.add_parser("proxy", help="a shaping forward proxy: latency and a rate limit per connection", add_help=False)
+    sub.add_parser("tls-front", help="TLS in front of a plain local backend, for an app on the iOS Simulator",
+                   add_help=False)
     d = sub.add_parser("doctor", help="check the host tools, and a device if --serial or --simulator is given")
     dt = d.add_mutually_exclusive_group()
     dt.add_argument("--serial", default=None)
@@ -2890,6 +3678,10 @@ def main(argv: list[str] | None = None) -> int:
 
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        if argv[:1] == ["tls-front"]:
+            sys.path.insert(0, str(HERE))
+            import tlsfront
+            return tlsfront.main(argv[1:])
         if argv[:1] == ["proxy"]:
             sys.path.insert(0, str(HERE))
             import shapeproxy
@@ -2932,6 +3724,9 @@ def _dispatch(args) -> int:
                 for st in res["steps"]:
                     if st["kind"] == "rest":
                         line[st["id"]] = {"cpu_pct": st["cpu_pct"], "frames": (st.get("recording") or {}).get("frames")}
+                    elif st["kind"] in SIM_INPUT_KINDS:
+                        reply = (st.get("agent") or {}).get("reply") or {}
+                        line[st["id"]] = {"signature": st.get("signature"), "ok": reply.get("ok")}
                 print(json.dumps(line), flush=True)
                 continue
             res = run_once(args.serial, scn, base / rid, args.trace or args.sections, not args.no_video, args.sections)

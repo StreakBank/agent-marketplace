@@ -259,7 +259,7 @@ class GateEndToEndTest(unittest.TestCase):
         write_run(self.root, "run-01", make_run(base_steps(cpu=5)), scn)
         out = u.gate([self.root], {})
         self.assertEqual(out["verdict"], "PASS")
-        self.assertEqual(out["runs"][0]["limits"], {"rest_frames_max": 0, "rest_cpu_pct_max": 3.0})
+        self.assertEqual(out["runs"][0]["limits"], {"rest_frames_max": 0, "rest_cpu_pct_max": 3.0, "rest_updates_max": 0})
         self.assertEqual(out["runs"][0]["scenario"], "Example")
         self.assertEqual(out["runs"][0]["frame_sources"], ["platform"])
         # a None override is ignored

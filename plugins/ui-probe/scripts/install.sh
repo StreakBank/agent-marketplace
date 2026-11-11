@@ -32,7 +32,13 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ui-probe/$VERSION"
 BIN="${PREFIX:-$HOME/.local/bin}"
 LAUNCHER="$BIN/ui-probe"
 MARK="# ui-probe launcher (written by the plugin's install.sh)"
-FILES="ui_probe.py ui_video.py pftrace.py shapeproxy.py"
+FILES="ui_probe.py ui_video.py pftrace.py shapeproxy.py tlsfront.py"
+# The input agent for the iOS Simulator, copied beside the scripts (built on first use, into a cache).
+AGENT_FILES="ios-agent/Agent.xcodeproj/project.pbxproj ios-agent/Agent.xcodeproj/xcshareddata/xcschemes/Agent.xcscheme ios-agent/AgentUITests/AgentUITests.swift"
+AGENT_SRC="$HERE/.."
+for f in $AGENT_FILES; do
+  [ -f "$AGENT_SRC/$f" ] || { echo "install: $AGENT_SRC/$f is missing" >&2; exit 1; }
+done
 
 if [ -e "$LAUNCHER" ] && ! grep -qF "$MARK" "$LAUNCHER" 2>/dev/null; then
   echo "install: $LAUNCHER exists and was not written by this installer; not replacing it" >&2
@@ -43,6 +49,9 @@ DIFFERS=""
 if [ -d "$DATA" ]; then
   for f in $FILES; do
     if ! cmp -s "$HERE/$f" "$DATA/$f"; then DIFFERS="$DIFFERS $f"; fi
+  done
+  for f in $AGENT_FILES; do
+    if ! cmp -s "$AGENT_SRC/$f" "$DATA/$f"; then DIFFERS="$DIFFERS $f"; fi
   done
 fi
 
@@ -64,6 +73,10 @@ fi
 mkdir -p "$DATA" "$BIN"
 for f in $FILES; do
   cp "$HERE/$f" "$DATA/$f"
+done
+for f in $AGENT_FILES; do
+  mkdir -p "$(dirname -- "$DATA/$f")"
+  cp "$AGENT_SRC/$f" "$DATA/$f"
 done
 
 # Quote the path for the launcher so that any character in it is taken literally: wrap it in

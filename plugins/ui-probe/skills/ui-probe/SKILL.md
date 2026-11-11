@@ -1,6 +1,6 @@
 ---
 name: ui-probe
-description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rest steps; needs no changes to the app.
+description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rests, taps and swipes; needs no changes to the app.
 allowed-tools:
   - Bash
   - Read
@@ -73,11 +73,22 @@ every step that ends on it a fixed wait (`"until_quiet": false`), since such a s
 quiet; never an allowance for recorded frames that changed nothing (there is none). The README's "Screens that are never still" has the
 measured numbers.
 
-On the iOS Simulator (`run --simulator <udid>`) only rest steps of at least 1000 ms run: there is
-no input, no frame count from the platform and no quiet detection. The run freezes the status bar,
-and every frame recorded at rest after the first fails, whatever it changed: a screen that is never
-still by design needs `allow.frames_max` and `allow.changed_frames_max` on its rest. CPU comes from
-`ps`; the run's note lists what was not checked. `zoom` needs `--step <id>` there.
+On the iOS Simulator (`run --simulator <udid>`) a scenario holds rests of at least 1000 ms, taps
+(`x`, `y`) and swipes, the input sent through ui-probe's input agent (built once with `xcodebuild`,
+installed on the simulator for the run and removed after). There are no lookups and no typing
+there: an accessibility read can change the app it reads, so give positions as fractions. The run
+freezes the status bar, and every frame recorded at rest after the first fails, whatever it
+changed: a screen that is never still by design needs `allow.frames_max` and
+`allow.changed_frames_max` on its rest. A tap or swipe may carry `expect.signature`. `launch_env`
+passes variables to the app (not secrets: they are saved with the run). `zoom` needs `--step <id>`.
+A simulator run reads its log store: each step gets the app's `drawables`, `commits` and display
+`updates`, gated at rest (`rest_updates_max`, `allow.updates_max`); they are known only when a
+second read shows the store was read to the end. With them known and 0 over the whole recording, up
+to 2 recorded frames that changed no pixel by more than 24 levels, at most 2000 pixels, and none on
+a flat area, are the encoder, not the app. `count_signposts` counts the app's own signposts (names
+matched exactly; a name that occurs nowhere in the run is unknown and fails its limit). An agent
+whose test run ended with an issue fails the run (check `agent`). `ui-probe tls-front` puts TLS with a throwaway CA
+(for a simulator only) in front of a plain local backend.
 
 ## Reading a run
 

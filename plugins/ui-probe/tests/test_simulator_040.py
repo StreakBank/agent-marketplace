@@ -37,6 +37,9 @@ def read(name, default=""):
     return open(p).read() if os.path.exists(p) else default
 with open(os.path.join(S, "xcrun.log"), "a") as log:
     log.write(" ".join(sys.argv[1:]) + "\\n")
+with open(os.path.join(S, "xcrun-env.log"), "a") as log:
+    child = sorted(k + "=" + v for k, v in os.environ.items() if k.startswith("SIMCTL_CHILD_"))
+    log.write(" ".join(sys.argv[1:3]) + " | " + " ".join(child) + "\\n")
 a = sys.argv[1:]
 if a[:1] != ["simctl"]:
     sys.exit(64)
@@ -51,11 +54,79 @@ if cmd == "get_app_container":
     sys.stderr.write("No such app\\n"); sys.exit(2)
 if cmd == "terminate":
     sys.exit(3)
+if cmd == "spawn" and a[3:5] == ["log", "show"] and "--predicate" not in a:
+    # the second read, of every process: events of other processes stamped now (after the last step)
+    import datetime
+    with open(os.path.join(S, "tail-reads"), "a") as f:
+        f.write(" ".join(a) + "\\n")
+    if read("tail.mode").strip() == "fail":
+        sys.stderr.write("log: Could not open the store\\n"); sys.exit(1)
+    n = 0 if read("tail.mode").strip() == "none" else 3
+    # "old": events stamped an hour ago, before the end of the last step
+    when = time.time() - (3600 if read("tail.mode").strip() == "old" else 0)
+    for _ in range(n):
+        print(json.dumps({{"eventType": "logEvent", "processID": 1, "subsystem": "com.example.other",
+                          "timestamp": datetime.datetime.fromtimestamp(when).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f%z")}}))
+    sys.exit(0)
+if cmd == "spawn" and a[3:5] == ["log", "show"]:
+    # the log store: events made from store.spec.json, placed in the windows the run recorded
+    import datetime, glob, re
+    rc = int(read("log.rc", "0"))
+    if rc:
+        sys.stderr.write("log: Could not open the store\\n"); sys.exit(rc)
+    if read("log.mode").strip() == "garbage":
+        print("Filtering the log data using a predicate"); sys.exit(0)
+    spec = json.loads(read("store.spec.json", "{{}}"))
+    raw = os.path.join(read("run.dir").strip(), "raw")
+    pid = int(re.search(r"processID == (\\d+)", a[a.index("--predicate") + 1]).group(1))
+    if spec.get("pid") is not None:
+        pid = spec["pid"]
+    kinds = {{"drawables": ("com.apple.coreanimation", "CAMetalLayer", "ClientDrawable"),
+             "commits": ("com.apple.coreanimation", "Transaction", "Commit"),
+             "updates": ("com.apple.UIKit", "UpdateCycle", "UpdateSequence")}}
+    def stamp(ts):
+        return datetime.datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f%z")
+    def emit(ts, subsystem, category, name, kind="event", message=""):
+        print(json.dumps({{"eventType": "signpostEvent", "timestamp": stamp(ts), "subsystem": subsystem,
+                          "category": category, "signpostName": name, "signpostType": kind, "eventMessage": message,
+                          "processID": pid}}))
+    windows = {{}}
+    launch = json.load(open(os.path.join(raw, "launch-time.json")))["wall"]
+    for f in sorted(glob.glob(os.path.join(raw, "step-*.json"))):
+        d = json.load(open(f))
+        windows[os.path.basename(f)[5:-5]] = (d["wall_before"], d["wall_after"])
+    first = min(w[0] for w in windows.values())
+    windows["launch"] = (launch, first)
+    for where, counts in spec.get("counts", {{}}).items():
+        lo, hi = windows[where]
+        for kind, n in counts.items():
+            for _ in range(n):
+                emit((lo + hi) / 2, *kinds[kind])
+    for where, counts in spec.get("span_counts", {{}}).items():
+        # inside the step's recording but after its CPU window: while the recorder was being stopped
+        d = json.load(open(os.path.join(raw, "step-" + where + ".json")))
+        for kind, n in counts.items():
+            for _ in range(n):
+                emit((d["wall_after"] + d["rec_wall_end"]) / 2, *kinds[kind])
+    sub = spec.get("signposts", {{}})
+    for where, counts in sub.get("counts", {{}}).items():
+        lo, hi = windows[where]
+        for name, n in counts.items():
+            for _ in range(n):
+                emit((lo + hi) / 2, sub["subsystem"], "app", "AppInterval", "begin", name)
+                emit((lo + hi) / 2, sub["subsystem"], "app", "AppInterval", "end", "")
+    print(json.dumps({{"count": 0, "finished": 1}}))
+    sys.exit(0)
 if cmd == "status_bar":
     if a[3] == "override":
         sys.exit(int(read("statusbar.rc", "0")))
+    # a slow clear: what a signal during the clean-up must not cut short
+    time.sleep(float(read("statusbar.clear.sleep", "0") or 0))
+    open(os.path.join(S, "statusbar-cleared"), "w").write("done")
     sys.exit(0)
 if cmd == "launch":
+    with open(os.path.join(S, "launch-order"), "a") as f:
+        f.write("agent started before the launch\\n" if os.path.exists(os.path.join(S, "agent-pids")) else "no agent yet\\n")
     out = read("launch.out", f"{{a[3]}}: {PID}\\n")
     sys.stdout.write(out); sys.exit(int(read("launch.rc", "0")))
 if cmd == "io" and a[3] == "recordVideo":
@@ -87,6 +158,100 @@ if cmd == "io" and a[3] == "recordVideo":
 sys.exit(65)
 """
 
+XCODEBUILD = f"""#!{sys.executable} -B
+# xcodebuild: -version, build-for-testing (writes an .xctestrun) and test-without-building (a small
+# agent that speaks the input agent's protocol on the port the host passed)
+import hashlib, hmac, json, os, select, signal, socket, subprocess, sys, time
+S = os.environ["SIMSTATE"]
+def read(name, default=""):
+    p = os.path.join(S, name)
+    return open(p).read() if os.path.exists(p) else default
+def log(name, text):
+    with open(os.path.join(S, name), "a") as f:
+        f.write(text + "\\n")
+a = sys.argv[1:]
+log("xcodebuild.log", " ".join(a))
+if a == ["-version"]:
+    print(read("xcode.version", "Xcode 26.3\\nBuild version 17C1")); sys.exit(0)
+if a[:1] == ["build-for-testing"]:
+    d = a[a.index("-derivedDataPath") + 1]
+    if read("build.mode", "ok").strip() == "fail":
+        print("error: the agent did not compile"); sys.exit(65)
+    os.makedirs(os.path.join(d, "Build", "Products"), exist_ok=True)
+    open(os.path.join(d, "Build", "Products", "Agent_iphonesimulator26.1-arm64.xctestrun"), "w").write("<plist/>")
+    if read("build.mode", "ok").strip() == "fail-after-writing":
+        print("error: a later build phase failed"); sys.exit(65)
+    print("** TEST BUILD SUCCEEDED **"); sys.exit(0)
+if a[:1] != ["test-without-building"]:
+    sys.exit(64)
+log("agent-pids", str(os.getpid()))
+for flag in ("-derivedDataPath", "-resultBundlePath"):
+    if flag in a:
+        os.makedirs(os.path.join(a[a.index(flag) + 1], "Logs"), exist_ok=True)
+        open(os.path.join(a[a.index(flag) + 1], "Logs", "x.log"), "w").write("x")
+env = {{k: v for k, v in os.environ.items() if k.startswith("TEST_RUNNER_UI_PROBE_AGENT_")}}
+open(os.path.join(S, "agent-env.json"), "w").write(json.dumps({{"env": env, "argv": a}}))
+port, token = int(env["TEST_RUNNER_UI_PROBE_AGENT_PORT"]), env["TEST_RUNNER_UI_PROBE_AGENT_TOKEN"]
+idle = float(env["TEST_RUNNER_UI_PROBE_AGENT_IDLE_S"])
+mode = read("agent.mode", "ok").strip()
+print("Testing started", flush=True)
+if mode == "exit":
+    print("Testing failed: Unable to boot the test runner", flush=True); sys.exit(70)
+if mode == "deaf":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    child = subprocess.Popen([sys.executable, "-c", "import signal, time; signal.signal(signal.SIGTERM, "
+                              "signal.SIG_IGN); time.sleep(300)"])
+    log("agent-grandchild-pids", str(child.pid))
+if mode == "silent":
+    while True:
+        time.sleep(0.05)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", port)); srv.listen(4)
+last = time.monotonic()
+while True:
+    if time.monotonic() - last > idle:
+        log("agent-events", "idle"); sys.exit(0)
+    r, _, _ = select.select([srv], [], [], 0.1)
+    if not r:
+        continue
+    conn, _ = srv.accept()
+    data = b""
+    while not data.endswith(b"\\n"):
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    obj = json.loads(data)
+    if mode == "badtoken" or obj.get("token") != token:
+        reply = {{"ok": False, "error": "wrong or missing token; nothing was done"}}
+        log("agent-cmds", json.dumps({{"bad_token": True}}))
+    else:
+        last = time.monotonic()
+        cmd = {{k: v for k, v in obj.items() if k != "token"}}
+        log("agent-cmds", json.dumps(cmd))
+        c = obj.get("cmd")
+        if c == "ping":
+            reply = {{"ok": True, "app_state": int(read("appstate", "4")), "screen": [393.0, 852.0]}}
+        elif c == "tap" and mode == "refuse-tap":
+            reply = {{"ok": False, "error": "tap failed: the touch was not delivered"}}
+        elif c in ("tap", "swipe"):
+            reply = {{"ok": True}}
+            if mode == "issue" and c == "tap":
+                reply = {{"ok": False, "error": "XCTest recorded: Failed to synthesize event"}}
+        elif c == "quit":
+            reply = {{"ok": True}}
+        else:
+            reply = {{"ok": False, "error": "unknown command"}}
+    reply["elapsed_ms"] = 400
+    if obj.get("token") == token and mode not in ("badtoken", "noproof") and obj.get("nonce"):
+        reply["proof"] = hmac.new(token.encode(), obj["nonce"].encode(), hashlib.sha256).hexdigest()
+    if obj.get("token") == token and obj.get("nonce"):
+        log("agent-nonces", obj["nonce"])
+    conn.sendall(json.dumps(reply).encode() + b"\\n"); conn.close()
+    if obj.get("cmd") == "quit" and mode != "badtoken" and obj.get("token") == token and mode != "deaf":
+        log("agent-events", "quit"); sys.exit(65 if mode == "issue" else 0)
+"""
+
 PS = f"""#!{sys.executable} -B
 import os, sys
 S = os.environ["SIMSTATE"]
@@ -108,10 +273,13 @@ def devices(state="Booted", udid=UDID):
         {"udid": udid, "name": "Test Phone", "state": state, "isAvailable": True}]}})
 
 
-def block(sid, frames=0, identical=0, region=0, real=None):
+def block(sid, frames=0, identical=0, region=0, real=None, largest=None, changed_px=None, flat_px=None):
     return {"frames": frames + 1, "clock": "start-mark-fallback", "steps": [
         {"id": sid, "video_frames": frames, "identical_frames": identical, "app_region_frames": region,
-         "app_changed_frames_real": region if real is None else real, "signature": "-"}]}
+         "app_changed_frames_real": region if real is None else real, "signature": "-",
+         "largest_change": (200.0 if frames else 0.0) if largest is None else largest,
+         **({} if changed_px is None else {"most_changed_px": changed_px}),
+         **({} if flat_px is None else {"most_flat_changed_px": flat_px})}]}
 
 
 def main(*argv):
@@ -129,14 +297,22 @@ class SimBase(unittest.TestCase):
         self.state.mkdir()
         b = self.root / "bin"
         b.mkdir()
-        for name, text in (("xcrun", XCRUN), ("ps", PS)):
+        for name, text in (("xcrun", XCRUN), ("ps", PS), ("xcodebuild", XCODEBUILD)):
             (b / name).write_text(text)
             (b / name).chmod(0o755)
         (self.state / "devices.json").write_text(devices())
         (self.state / "installed").write_text("")
-        self.env = mock.patch.dict(os.environ, {"SIMSTATE": str(self.state), "PATH": f"{b}:{os.environ['PATH']}"})
+        self.cache = self.root / "cache"
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.env = mock.patch.dict(os.environ, {"SIMSTATE": str(self.state), "PATH": f"{b}:{os.environ['PATH']}",
+                                                "XDG_CACHE_HOME": str(self.cache), "HOME": str(self.home)})
         self.env.start()
+        # Sealed: every tool the code calls by name resolves to a stand-in here, before anything runs.
+        for tool in ("xcrun", "xcodebuild", "ps"):
+            assert shutil.which(tool) == str(b / tool), f"{tool} resolves to {shutil.which(tool)}, not the stand-in"
         self.patches = [mock.patch.object(u, "SIM_TERMINATE_WAIT_S", 0), mock.patch.object(u, "SIM_REST_MIN_MS", 100),
+                        mock.patch.object(u, "SIM_LOG_FLUSH_WAIT_S", 0),
                         mock.patch.object(u, "SIM_RECORD_START_TIMEOUT_S", 3),
                         mock.patch.object(u, "SIM_RECORD_STOP_TIMEOUT_S", 3)]
         for p in self.patches:
@@ -184,6 +360,7 @@ class SimBase(unittest.TestCase):
         return str(path)
 
     def run_cli(self, *extra, scn=None, out="out"):
+        (self.state / "run.dir").write_text(str(self.root / out / "run-01"))
         return main("run", "--simulator", UDID, "--scenario", self.scenario(scn), "--out", str(self.root / out), *extra)
 
     def gate(self, *extra, out="out"):
@@ -211,12 +388,12 @@ class SimScenarioTest(unittest.TestCase):
                              "steps": [{"id": "r", "do": "rest", "ms": 5000,
                                         "allow": {"cpu_pct_max": 4, "frames_max": 12, "reason": "caret"}}]}, u.SIM_PLATFORM)
 
-    def test_only_rest_steps(self):
-        for st in ({"id": "t", "do": "tap", "x": 0.5, "y": 0.5}, {"id": "k", "do": "key", "code": 4},
-                   {"id": "s", "do": "swipe", "from": [0, 0], "to": [1, 1]}, {"id": "x", "do": "text", "text": "a"},
-                   {"id": "f", "do": "tap", "find": {"text": "Go"}}):
-            self.reject({**SCN, "steps": [st]}, f"step '{st['id']}': the iOS Simulator has no input in this version, "
-                                                f"so only rest steps run; a '{st['do']}' step is refused")
+    def test_keys_text_and_lookups_are_refused(self):
+        self.reject({**SCN, "steps": [{"id": "k", "do": "key", "code": 4}]},
+                    "step 'k': a 'key' step is refused on the iOS Simulator: a simulator has no keys to press")
+        for st in ({"id": "x", "do": "text", "text": "a"}, {"id": "f", "do": "tap", "find": {"text": "Go"}}):
+            self.reject({**SCN, "steps": [st]}, "a lookup or typing reads the app's accessibility tree, which changed "
+                                                "the app at rest when measured")
 
     def test_refused_keys(self):
         self.reject({**SCN, "activity": ".Main"}, "'activity': the iOS Simulator launches the app by its bundle identifier")
@@ -224,7 +401,9 @@ class SimScenarioTest(unittest.TestCase):
         self.reject({**SCN, "quiet": {"ms": 500}}, "'quiet': there is no quiet detection on the iOS Simulator")
         self.reject({**SCN, "count_sections": ["x"]}, "'count_sections': trace sections are not recorded")
         for key, value in (("meminfo", True), ("background", True), ("expect", {"frames": 0})):
-            self.reject({**SCN, "steps": [{"id": "r", "do": "rest", "ms": 100, key: value}]}, f"step 'r': '{key}':")
+            self.reject({**SCN, "steps": [{"id": "r", "do": "rest", "ms": 100, key: value}]},
+                        "step 'r': 'expect' on a rest on the iOS Simulator takes only 'signposts_max'" if key == "expect"
+                        else f"step 'r': '{key}':")
 
     def test_a_bundle_identifier(self):
         u.validate_scenario({**SCN, "package": "com.my-company.app2"}, u.SIM_PLATFORM)
@@ -309,7 +488,9 @@ class SimRunTest(SimBase):
         self.assertEqual(st["rest-a"]["cpu_pct"], round(100 * 0.05 / st["rest-a"]["window_s"], 2))
         self.assertGreater(st["rest-a"]["cpu_pct"], 10)
         self.assertEqual(st["rest-a"]["recording"], {"frames": 9, "changed_app": 2, "changed_app_noise": 1, "identical": 5,
-                                                     "bars_only": 1, "signature": "-", "sheet": None})
+                                                     "bars_only": 1, "signature": "-", "largest_change": 200.0,
+                                                     "most_changed_px": None, "most_flat_changed_px": None,
+                                                     "sheet": None})
         self.assertEqual(self.gate()[0], 1)
 
     def test_a_recorder_that_never_starts(self):
@@ -407,9 +588,9 @@ class SimRunTest(SimBase):
         self.assertFalse([l for l in self.log() if "recordVideo" in l or "launch" in l])
 
     def test_refused_before_anything_runs(self):
-        rc, _, err = self.run_cli(scn={**SCN, "steps": [{"id": "t", "do": "tap", "x": 0.5, "y": 0.5}]})
+        rc, _, err = self.run_cli(scn={**SCN, "steps": [{"id": "k", "do": "key", "code": 4}]})
         self.assertEqual(rc, 2)
-        self.assertIn("the iOS Simulator has no input in this version", err)
+        self.assertIn("a 'key' step is refused on the iOS Simulator", err)
         for flag in ("--trace", "--sections", "--no-video"):
             rc, _, err = self.run_cli(flag)
             self.assertEqual(rc, 2, flag)
@@ -559,10 +740,10 @@ class SavedSimRunTest(SimBase):
         self.assertEqual(rc, 2)
         self.assertIn("--scenario is 'Another' but the run was captured with 'Sim rest'", err)
         revised = self.root / "r.json"
-        revised.write_text(json.dumps({**SCN, "steps": [{"id": "rest-a", "do": "tap", "x": 0.5, "y": 0.5}, SCN["steps"][1]]}))
+        revised.write_text(json.dumps({**SCN, "steps": [{"id": "rest-a", "do": "key", "code": 4}, SCN["steps"][1]]}))
         rc, _, err = main("gate", str(base), "--scenario", str(revised))
         self.assertEqual(rc, 2)
-        self.assertIn("the iOS Simulator has no input in this version", err)
+        self.assertIn("a 'key' step is refused on the iOS Simulator", err)
         revised.write_text(json.dumps({**SCN, "gate": {"rest_cpu_pct_max": 5}}))
         self.assertEqual(main("gate", str(base), "--scenario", str(revised))[0], 0)
 
@@ -756,7 +937,7 @@ class DocsTest(unittest.TestCase):
         root = Path(u.HERE).parent
         readme = " ".join((root / "README.md").read_text().split())
         for phrase in ("## The iOS Simulator", "--simulator <udid>", "`ps -o cputime=", "recordVideo",
-                       "never applies on a simulator", "any frame recorded at rest fails", "The app is left running after the run",
+                       "is not used on a simulator", "any frame at rest fails", "The app is left running after the run",
                        "about 6.8 s long, held 408 to 412 frames", "299 to 304 frames", "SIGKILL cannot be caught",
                        "status_bar <udid> override --time 9:41", "`<step>.sim_cpu_s`"):
             self.assertIn(phrase, readme)
@@ -764,8 +945,7 @@ class DocsTest(unittest.TestCase):
         skill = " ".join((root / "skills" / "ui-probe" / "SKILL.md").read_text().split())
         self.assertIn("--simulator", skill)
         self.assertIn("every frame recorded at rest after the first fails, whatever it changed", skill)
-        self.assertEqual(u.VERSION, "0.4.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.4.0")
+        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # ui-probe — watch a mobile app from outside
 
-`ui-probe` runs a scripted scenario against an Android app (or, for rest steps only, an app on the
-iOS Simulator) and records what the platform and the screen did, without anything inside the app. It answers two questions a functional test does not:
+`ui-probe` runs a scripted scenario against an Android app (or, with rests, taps and swipes, an app
+on the iOS Simulator) and records what the platform and the screen did, without anything inside the app. It answers two questions a functional test does not:
 
 - **Is the app doing work while nothing happens?** Frames drawn, CPU used and frames composed while
   the screen is at rest.
@@ -35,7 +35,8 @@ depending on host load, while its rest-window frame count stays at zero. Keep th
   versions are untested. A section name that never appears in the trace for the app is reported
   as not observed, never as a count of zero.
 
-- For the iOS Simulator instead: Xcode's command-line tools (`xcrun simctl`) and a booted simulator
+- For the iOS Simulator instead: Xcode (`xcrun simctl`, and `xcodebuild` for a scenario with a tap or a
+  swipe, which builds the input agent on first use) and a booted simulator
   with the app installed; `adb` is then not needed. See "The iOS Simulator".
 
 `ui-probe doctor [--serial <serial> | --simulator <udid>]` checks all of this, including the ffmpeg version (a version
@@ -519,23 +520,44 @@ produce packet loss.
 
 `ui-probe run --simulator <udid> --scenario <file> --out <dir>` runs a scenario on a booted iOS
 Simulator instead of an Android device (exactly one of `--serial` and `--simulator`, neither
-empty). A simulator gives no input from a command line (`simctl` has no tap), no window-tree dump,
-no frame record of the platform and nothing to detect quiet with, so this version runs **rest
-steps only**, driven from the host; there is no device script.
+empty). A simulator gives no input from a command line (`simctl` has no tap) and nothing to detect
+quiet with; its exact counts of the app's frames come from its log store (see "The simulator's log
+store"). This version runs rests, and taps and swipes at
+fractions of the display through a small UI-test agent (`ios-agent/`, see "Input on the iOS
+Simulator"), driven from the host; there is no device script. There are no lookups and no typing
+on a simulator in this version. A simulator run reads its log store.
 
-**What it means for a scenario author: any frame recorded at rest fails.** With the status bar
-frozen nothing but the app has a reason to make the display compose, and there is no second
-witness, so every recorded frame after the first counts against the app, whatever it changed. A
-screen that is never still by design (a blinking caret) needs an allowance on its rest
-(`allow.frames_max` and `allow.changed_frames_max`); frames that changed nothing have none.
+**What it means for a scenario author: any frame at rest fails.** With the status bar frozen
+nothing but the app has a reason to make the display compose: a frame the app presented (its log
+store's count) or a frame recorded at rest fails the rest, with one exception, the encoder refining a
+still picture (below). A screen that is never still by design (a blinking caret) needs an allowance
+on its rest (`allow.frames_max`, `allow.changed_frames_max`, `allow.updates_max`); frames that
+changed nothing have none.
 
 - **The scenario.** `package` is the bundle identifier (letters, digits and `-` in dot-separated
-  names). `activity`, `quiet` and `count_sections` must be absent, `until_quiet` false or absent,
-  and every step a `rest` of at least 1000 ms (the CPU time is read in steps of 0.01 s) without
-  `meminfo`, `background` or `expect`; anything else is refused before anything runs, a step of
-  another kind with a message that says the iOS Simulator has no input in this version. The
-  launch waits `launch_settle_ms` (default 6000). `allow` and the `gate` block work as described
-  below. `--trace`, `--sections` and `--no-video` cannot be used with `--simulator`.
+  names). `activity`, `quiet` and `count_sections` must be absent and `until_quiet` false or
+  absent, in the scenario and in a step. A step is a `rest` of at least 1000 ms (the CPU time is
+  read in steps of 0.01 s) without `meminfo` or `background`, a `tap` with `x` and `y`, or a
+  `swipe` with `from`, `to`, `ms` and `judge`; a tap or a swipe waits its `settle_ms` after the
+  input (default 3000 for a tap, 2500 for a swipe, as on Android). In `expect`, a rest takes only
+  `signposts_max` and a tap or a swipe only `signature` and `signposts_max`. A swipe lasts at most
+  60000 ms (what the agent accepts). Refused before anything runs, each with its own
+  message: `find` on a tap and a `text` step (a lookup or typing reads the app's accessibility
+  tree, which changed the app at rest when measured, so this version takes positions as
+  fractions) and a `key` step (a simulator has no keys to press: tap the screen's own control or
+  swipe from the edge). The launch waits `launch_settle_ms` (default 6000). `launch_env` (below)
+  is passed to the app. `allow` and the `gate` block work as described below. `--trace`,
+  `--sections` and `--no-video` cannot be used with `--simulator`.
+- **The launch environment.** `launch_env` at the top of a scenario, an object of up to 20 names
+  (capital letters, digits and `_`, starting with a letter) to strings of at most 200 characters
+  with no control character, is handed to the app's process: each pair is set as
+  `SIMCTL_CHILD_<NAME>=<value>` in the environment of the `xcrun simctl launch` call only, which
+  `simctl` passes on to the app without the prefix. Example: `"launch_env": {"API_ORIGIN":
+  "https://localhost:18443"}`. The scenario is the only source: `SIMCTL_CHILD_*` variables already
+  in ui-probe's own environment are not passed to the launch, and their names are saved in
+  `capture.json` (`launch_env_dropped`) and given in a note. The object is saved in `capture.json`
+  beside the scenario, so it is not a place for secrets. On Android `launch_env` is refused (an Android launch takes no
+  environment).
 - **The run.** The status bar is frozen first (`xcrun simctl status_bar <udid> override --time
   9:41`; a run whose override fails stops there). An override the user had set is replaced, and
   cleared (`xcrun simctl status_bar <udid> clear`) when the run ends, however it ends. The app is
@@ -547,30 +569,53 @@ screen that is never still by design (a blinking caret) needs an allowance on it
   time is read again; whether the recorder is still running is noted, its group gets SIGINT, and
   the run waits for it to write its file and exit (20 s, then the group is killed). The app is
   left running after the run.
-- **Clean-up.** The recorder is stopped and the status bar cleared on every way out of a run the
-  tool can see: an error, an interrupt (Ctrl-C), SIGTERM and SIGHUP (which also leave
-  `failed.json`, "terminated by SIGTERM", and exit with 143 or 129). SIGKILL cannot be caught: after
-  one, `pgrep -fl recordVideo` shows a recorder to stop by hand, and
-  `xcrun simctl status_bar <udid> clear` restores the clock.
-- **What is measured.** Per rest step: the window's real length (between the two CPU readings),
-  the CPU seconds and the percentage of one core, and that step's recording, which keeps a frame
-  only when the display changes. Its frames after the first are counted, and the same analysis as
+- **Clean-up**, on every way out of a run the tool can see (an error, an interrupt (Ctrl-C),
+  SIGTERM and SIGHUP, which also leave `failed.json`, "terminated by SIGTERM", and exit with 143 or
+  129), in this order: each step's recorder is stopped at the end of that step; after the last
+  step (or the one that failed), the input agent is stopped (below); then the status bar is
+  cleared. Each part runs whatever the one before it raised, every wait in it has a limit, and a
+  signal that arrives during it is held until it is done (the run then still ends as interrupted
+  or terminated). SIGKILL cannot be caught. After one, what may be left: a recorder (`pgrep -fl
+  recordVideo`, stop it by hand); the agent's `xcodebuild` and its runner app on the simulator,
+  until the agent's idle limit ends them (`xcrun simctl uninstall <udid>
+  dev.uiprobe.agent.uitests.xctrunner` removes the runner); and the frozen status bar (`xcrun simctl
+  status_bar <udid> clear` restores the clock).
+- **What is measured.** Per step: the window's real length (between the two CPU readings), the CPU
+  seconds and the percentage of one core, the log store's drawables, commits and display updates
+  for the window (below), and that step's recording, which keeps a frame only when the display
+  changes. Its frames after the first are counted, and the same analysis as
   on Android names their classes for the reader: those that changed the app's area, those whose
   change in the app's area is encoder noise, those that changed only the bands where a status bar
-  and a home indicator sit (the top 7% and the bottom 4.5%) and those that changed nothing. The
-  classes decide nothing. A process that is gone at the end of a window (a relaunched app
+  and a home indicator sit (the top 7% and the bottom 4.5%) and those that changed nothing, with
+  the largest change of any pixel (on its most changed colour channel), how many pixels changed by
+  8 levels or more, and how many of those where the previous picture was flat (a 5 by 5
+  neighbourhood spanning less than 8 levels). The classes decide nothing. A process that is gone at the end of a window (a relaunched app
   included, since only the launched process is watched) fails the process check.
 - **The gate.** CPU at rest against `rest_cpu_pct_max` (default 2.0) or the step's
   `allow.cpu_pct_max`; a CPU time that could not be read, or that went down between the two
-  readings (another process holding the pid), is a violation, since CPU is one of only two
-  witnesses here. Every frame recorded at rest after the first, against `rest_frames_max`
-  (default 0) or `allow.frames_max`; frames that changed nothing, with no allowance; frames that
-  changed any pixel, against `allow.changed_frames_max` (default none). The violation names the
-  classes. There is no exact frame count of the app on a simulator, so the rule that excuses
-  recorded frames while the app presented none never applies on a simulator. A recorder that had
+  readings (another process holding the pid), is a violation. With the log store's counts known:
+  drawables plus commits against `rest_frames_max` (default 0) or `allow.frames_max` (check
+  `rest-frames`, source "log store"), and display updates against `rest_updates_max` in the `gate`
+  block (default 0) or `allow.updates_max` (check `rest-updates`). The frames recorded at rest:
+  every one after the first against `rest_frames_max` or `allow.frames_max`, those that changed
+  nothing with no allowance, those that changed any pixel against `allow.changed_frames_max`
+  (default none), the violation naming the classes; except that they are a note, the encoder
+  refining a still picture a few seconds after motion, when all of these hold: the counts are known
+  and all 0 for the window and for the recording's own span (from `Recording started` to the
+  recorder's stop); at most 2 frames were recorded; no pixel changed by more than 24 levels on any
+  colour channel at the analysis scale (270 pixels wide); no frame changed more than 2000 pixels by
+  8 levels or more; and none of those lies where the previous picture was flat. Measured on 17 rest
+  windows of one app: the encoder's refinement changed at most 17 levels in 28 to 193 pixels (more
+  on a screen with more text), all along edges already in the picture; a 1 pt grey hairline that
+  grew changed 16 levels in 6 or 7 pixels, 4 or 5 of them on a flat area, so the flat-area count
+  holds it where the size of the change could not, and the pixel limit, a factor of ten above the
+  largest refinement measured, only bounds a wide subtle change; a 20 pt
+  spinner and a caret changed 165 or more. With the counts unknown the recorded frames are held as
+  just described, without the exception. Android's 0.3.0 rule for
+  frames recorded while the app presented none is not used on a simulator. A recorder that had
   stopped before its window ended (even with status 0) fails the recording check: its file ends
   early and would look clean. The checks a simulator cannot feed (waiting for quiet, frames at
-  launch, which app is in front, `find`, trace sections) are not run, and every simulator run
+  launch, which app is in front unless the run has input, `find`, trace sections) are not run, and every simulator run
   says so in a note rather than passing them by silence.
 - **Measured by hand** (a debug build of an app that draws its own surface, iOS 26.1, its launch
   screen). A clean build used 0.00 to 0.03 s of CPU per 5 s window and its recording held one
@@ -583,24 +628,168 @@ screen that is never still by design (a blinking caret) needs an allowance on it
   (encoder noise reached the app's area), and none once the status bar was frozen.
 - **On disk.** `raw/launch.txt` (what the launch printed), `raw/pid-<step>.txt`,
   `raw/rec-<step>.mp4` and `raw/rec-<step>.log` (the recorder's output), `raw/step-<step>.json`
-  (the two CPU readings, the window, the recorder's exit status, whether it was killed and whether
-  it was still running when the window ended), `video/<step>/` (the frames and the analysis of
+  (the two CPU readings and their wall-clock times, the recording's span by the wall clock, the
+  recorder's exit status, whether it was killed and whether it was still running when the window
+  ended), `raw/launch-env.json` (the names not passed to the launch), `video/<step>/` (the frames and the analysis of
   that recording) and `sheets/<step>.png`. `analyze`, `sheet`, `gate`, `summary` and `compare` work
   on a simulator run as on any other; `zoom` needs `--step <id>`, since each step has its own
   recording. `summary` and `compare` give a simulator's values keys of their own,
   `<step>.sim_cpu_s`, `sim_cpu_pct`, `sim_window_s`, `sim_recorded_frames`,
-  `sim_changed_app_frames`, `sim_noise_frames`, `sim_bars_only_frames` and `sim_identical_frames`,
+  `sim_changed_app_frames`, `sim_noise_frames`, `sim_bars_only_frames`, `sim_identical_frames`,
+  `sim_drawables`, `sim_commits`, `sim_updates` and `sim_signposts.<name>`,
   since they mean something else than Android's (CPU in seconds, not ticks; every frame of a
   per-step recording).
-- **Not measured.** Input of any kind; a frame count from the platform; quiet; trace sections;
-  memory; which app is in front; and timings as a phone's (the host's processor and graphics run
+- **Not measured.** Lookups and typing; quiet; trace sections; memory; which app is in front in a
+  run without input; and timings as a phone's (the host's processor and graphics run
   the simulator). `ui-probe doctor --simulator <udid>` checks `xcrun simctl`, that the simulator
   exists and is booted, and `ffmpeg` and `ffprobe`.
 
+## The simulator's log store
+
+A simulator run reads its log store once, after the last step and before the clean-up:
+`xcrun simctl spawn <udid> log show --signpost --start <launch - 2 s> --end <end + 2 s> --style
+ndjson --predicate 'processID == <pid> AND (subsystem == "com.apple.UIKit" OR subsystem ==
+"com.apple.coreanimation" ...)'`, saved as `raw/signposts.ndjson` (and what was asked and how it
+answered, `raw/signposts.json`). Then a second, small read of every process, with no predicate,
+from the end of the last step to now (`raw/signposts-tail.json`: what it asked, its exit status,
+how many events it returned and how many are stamped after the end of the last step). `log show
+--signpost` gives, for the app's process and with nothing added to the app:
+
+- **drawables**: `com.apple.coreanimation`, a category starting `CAMetalLayer`, `ClientDrawable`:
+  one per frame the app's Metal layer drew. For an app that draws its own surface they equal its
+  frames (measured: 34 recorded = 34 drawables = 34 by the app's own count; at rest 0; a faulty
+  build 300 to 302 per 5 s).
+- **commits**: `com.apple.coreanimation`, a category starting `Transaction`, `Commit`: one per
+  layer-tree commit.
+- **display updates**: `com.apple.UIKit`, a category starting `UpdateCycle`, `UpdateSequence`: one
+  per display update the app was woken for.
+
+They are not a count of what the screen showed: a UIKit app's frames are composed by the render
+server, which animates without the app, so its recorded frames exceed its commits (a tap: 62
+commits and 77 updates against 110 recorded frames). An event belongs to the step whose window (its
+two CPU readings, by the wall clock) holds its time; `run.json` gives each step its `drawables`,
+`commits` and `updates`, at rest and on input steps alike (information on input steps), and the
+same three over its recording's span (`recording_span`). The counts are known for the run only if
+the store answered (exit 0, every line JSON), holds at least one drawable or commit of the app
+between its launch and the first step (an app that started has drawn or committed something, so an
+empty answer means the store was not read), and the second read answered with at least one event
+stamped after the end of the last step (other processes log all the time, so none means the store
+may not have been read to the end; a simulator has no `logger` to write a marker with). Otherwise they are unknown
+for every step, and the run says why in one note. The rest rules that use them are under "The
+gate" above.
+
+**An app's own signposts.** `"count_signposts": {"subsystem": "<name>", "names": ["<name>", ...]}`
+(simulator only; `count_sections` stays Android's) counts, per step, the app's events of that
+subsystem whose type is `begin` or `event` and whose signpost name or message is a listed name; the
+subsystem is added to the store's predicate. `expect.signposts_max: {"<name>": N}` on a rest or an
+input step gates them (check `signposts`). A name is matched by exact equality with the
+signpost's name or its message. If the run holds no event at all of that subsystem from the app,
+launch included, every named count is unknown and each `expect.signposts_max` fails, asking whether
+the app's tracing is switched on. A name that occurs nowhere in the run, launch included, is
+unknown too (a misspelt name would otherwise read 0 and pass): its count is null and each
+`expect.signposts_max` on it fails, naming it and saying how names are matched.
+
+## A local backend over TLS: `ui-probe tls-front`
+
+An iOS app refuses plain HTTP (App Transport Security), so it cannot reach a local backend that
+speaks HTTP unless its security settings are loosened. `ui-probe tls-front --port <listen>
+--to-port <backend> --state <dir> [--log <file>]` puts TLS in front of it with no change to the
+app: it listens on 127.0.0.1 only (TLS 1.2 or newer, ALPN `http/1.1`), pipes the bytes both ways to
+127.0.0.1:<backend>, prints `listening on https://localhost:<listen> -> http://127.0.0.1:<backend>`
+once it accepts connections, and runs until it is stopped. With `--log`, one JSON line per closed
+connection (time, duration, bytes each way) and one per backend connection that was refused.
+
+The state folder holds a throwaway certificate authority (`ca.pem`: CA:TRUE with pathlen:0,
+critical; name constraints permitting DNS:localhost only, critical; key usage certificate signing;
+RSA 2048, SHA-256, 365 days) and a certificate for `localhost` (`leaf.pem`, `leaf.key`:
+DNS:localhost, server authentication, not a CA, 365 days), made with the `openssl` on PATH on first
+use (with configuration files that state the extensions, which LibreSSL needs) and reused while
+valid. The CA's key is deleted as soon as the certificate is signed, so the CA can sign nothing
+else. A certificate that has expired or is within 7 days of it is made again with a new CA, and the
+output says so: the simulator then needs the new CA. The tool marks a folder it uses with
+`.ui-probe-tls-front`: a folder it makes is 0700 and its key 0600; an existing folder is used only
+if it is empty (and then left at its mode, refused if others can open it) or holds that marker; a
+folder that is not empty and unmarked is refused, and the mode of, or the files in, a folder the
+tool did not make are never changed. A marked folder or a key that others can read is refused and
+not changed. `ui-probe tls-front --state <dir> --ca` prints the path of `ca.pem`
+(making the files if they are absent), for `xcrun simctl keychain <udid> add-root-cert <ca.pem>`.
+The tool never touches a trust store. The CA is a throwaway for a simulator: it must never be added
+to a phone's or a Mac's own trust store. It shapes nothing (the proxy does that). Pass the backend's
+address to the app with `launch_env`, for example `{"API_ORIGIN": "https://localhost:18443"}`.
+
+## Input on the iOS Simulator
+
+A scenario with a tap or a swipe on a simulator drives them through ui-probe's input agent: one
+UI test (`ios-agent/`, a hand-written Xcode project and one Swift file, naming no app) that serves
+commands on a loopback socket.
+
+- **Built once.** On the first run that needs it, `xcodebuild build-for-testing -project
+  ios-agent/Agent.xcodeproj -scheme Agent -destination 'generic/platform=iOS Simulator'
+  -derivedDataPath <temporary folder>` builds it (about 5 s) into a temporary folder under
+  `${XDG_CACHE_HOME:-$HOME/Library/Caches}/ui-probe/ios-agent/`, which is renamed to `<key>/` with
+  a `built.ok` marker only after a build that exited 0; a folder without the marker is not a build.
+  A lock file (`<key>.lock`) makes concurrent runs build one key once. The key is a hash of the
+  agent's source and of what `xcodebuild -version` prints: a new Xcode or a changed agent builds
+  anew. A failed build fails the run and names the saved build log (`<key>.build.log`). `doctor --simulator` says
+  whether the agent's source is present and whether it is built for this Xcode.
+- **Started for the run.** After the status bar is frozen and before the app is launched,
+  `xcodebuild test-without-building -xctestrun <file> -destination 'platform=iOS
+  Simulator,id=<udid>' -only-testing:AgentUITests/AgentUITests/testServe -derivedDataPath
+  raw/agent-derived-data -resultBundlePath raw/agent.xcresult` starts it (both folders are removed
+  after a test run that ended with status 0 and kept otherwise), in a process
+  group of its own, with a free loopback port, a random token, the app's bundle identifier and an
+  idle limit (the scenario's longest wait plus 120 s) passed as `TEST_RUNNER_UI_PROBE_AGENT_*`
+  variables, which `xcodebuild` hands to the test without the prefix. The run waits for its first
+  answer (120 s); an `xcodebuild` that exits first fails the run with the tail of its log
+  (`raw/agent.log`). This installs the agent's runner app (`dev.uiprobe.agent.uitests.xctrunner`)
+  on the simulator for the run's duration.
+- **What it does.** `ping` (the app's state and the display's size in points), `tap` (`x`, `y`),
+  `swipe` (`from`, `to`, `ms`) and `quit`, one JSON object per connection. Taps and drags go
+  through the system app at fractions of the display. The agent reads nothing of the app under
+  test but its state. Every command carries the run's token and a fresh random nonce; anything
+  without the token is answered with an error and does nothing. Every reply carries the
+  HMAC-SHA256 of the nonce keyed with the token, which the host checks: a reply without it (the
+  first `ping` included) did not come from the agent, and the command fails. A request must arrive
+  in full within 5 s of its connection. An issue the test framework records while a command is
+  handled (a gesture it could not perform) makes that command's reply a failure carrying the
+  issue's text. It listens on 127.0.0.1 only, and ends by itself once no command has arrived for the
+  idle limit, so a killed host cannot leave it running.
+- **Per step.** A tap or a swipe: the recorder started and awaited, CPU read, the command sent,
+  `settle_ms` waited, CPU read, a `ping` for the app's state, the recorder stopped. A rest: as
+  before, with the `ping` at the end. `raw/step-<step>.json` keeps the command, the agent's reply,
+  the round trip and the app's state. A tap is judged as a state change and a swipe as motion
+  unless its `judge` is `state`, as on Android; `run.json` carries each input step's signature,
+  its recorded frames and CPU (information, never gated) and the agent's timing.
+- **The gate.** A command the agent did not perform fails that step (check `input`); an
+  `expect.signature` that does not match fails (check `signature`); an agent whose test run ended
+  with a status other than 0 after `quit` fails the run (check `agent`: XCTest recorded an issue);
+  one the tool had to end with SIGTERM or SIGKILL is a note, since its status then says nothing; an
+  app that was not in front at
+  the end of any step, rest or input, fails the foreground check, and the run's note about what a
+  simulator did not check then leaves "which app is in front" out. A rest-only scenario starts no
+  agent, builds nothing, keeps the records it had, and says as before that the foreground was not
+  checked.
+- **Stopped on every way out** (normal end, error, interrupt, SIGTERM, SIGHUP), after the last
+  step's recorder was stopped: `quit`; up to 15 s for `xcodebuild` to exit, then SIGTERM and 5 s,
+  then SIGKILL to its group; `xcrun simctl terminate` and `xcrun simctl uninstall` of the runner
+  app (failures ignored); the derived data and result bundle removed if the test run ended with
+  status 0; then the status bar cleared. `raw/agent.json` keeps the port, the first answer and how the
+  agent ended.
+- **Why no lookups and no typing.** An accessibility read of an app can change the app it reads.
+  Measured on one app: after one lookup of a label in it (or typing through one of its
+  elements), it used 0.8% to 1.6% of a core at rest for the rest of its process's life, also after
+  the agent had quit, and once presented a frame at rest; with the agent idle and reading only
+  the app's state, the app at rest was unchanged. To measure this for another app: a rest, one
+  lookup, the same rest again, each recorded with CPU. Typing through the system app is refused by
+  the test framework, and the keyboard's keys are not in the system app's tree, so this version
+  has no lookups and no typing on a simulator: tap positions as fractions instead.
+
 ## Known limits
 
-- **Android, and the iOS Simulator for rest steps only.** Nothing here drives a physical iPhone,
-  and on a simulator there is no input, no platform frame count and no quiet detection.
+- **Android, and the iOS Simulator for rests, taps and swipes.** Nothing here drives a physical
+  iPhone. On a simulator the app's frame counts come from its log store, known only when the run
+  read the store to the end; there is no quiet detection, and input is by position only: no lookups by text and no typing (an accessibility read can change the app it
+  reads).
 - **Per-frame timings assume the device has not slept since boot.** Frame rows use the monotonic
   clock and step marks the boot clock; they agree only then. The run is flagged when they do not
   line up. Counts are unaffected; the recording then no longer decides a rest window.

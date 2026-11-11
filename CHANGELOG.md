@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.0 — 2026-11-11
+
+- ui-probe 0.5.0: scenarios with input on the iOS Simulator, and exact counts there. Taps and
+  swipes are given as fractions of the display and performed by a small UI-test agent the plugin
+  ships and builds; it never reads the app's accessibility tree, because one such read changed
+  the measured app at rest. Each step gets its own recording and signature. The simulator's log
+  store is read once per run for the frames the app drew, its layer commits and the display
+  updates it was woken for, so a rest is judged on exact counts as on Android, and an app's own
+  signposts can be counted and budgeted. 0.4.0 said a simulator keeps no exact frame count a host
+  can read: that was wrong, and this release replaces the rule built on it. Also `launch_env`
+  for the app on a simulator, and `tls-front`, TLS on loopback in front of a plain local backend
+  for apps that refuse plain HTTP. See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.9.0 — 2026-11-10
 
 - ui-probe 0.4.0: the iOS Simulator, for rest steps. `run --simulator <udid>` launches an app on
