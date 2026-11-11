@@ -225,10 +225,10 @@ class TraceTest(unittest.TestCase):
             fh.write(bundle(False) + bundle(True) + bundle(False))
         info = {}
         self.assertEqual(len(pt.read_atrace(p, info)), 3)
-        self.assertEqual(info, {"bundles": 3, "lost_bundles": 1})
+        self.assertEqual(info, {"bundles": 3, "lost_bundles": 1, "events_first_ts": 100, "events_last_ts": 100})
         info = {}
         pt.read_atrace(self.path, info)
-        self.assertEqual(info, {"bundles": 1, "lost_bundles": 0})
+        self.assertEqual(info, {"bundles": 1, "lost_bundles": 0, "events_first_ts": 5000, "events_last_ts": 5600})
 
     def test_empty_trace(self):
         p = os.path.join(self.tmp.name, "empty.pftrace")

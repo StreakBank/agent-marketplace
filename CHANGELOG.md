@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.12.0 — 2026-11-11
+
+- ui-probe 0.7.0: requests counted from outside the app. The plugin's fronts (`tls-front` for the iOS
+  Simulator and a new plain `http-front` for an Android emulator) log every HTTP/1.x request they
+  pipe (its method and path; never a query string, a header value or a body, and never a changed
+  byte), and `ui-probe run --requests <log>` counts them per step. The gate fails a request at rest
+  (`gate.rest_requests_max`, default 0, or a step's `allow.requests_max`) and a step over its
+  `expect.requests_max` or a launch over `launch_requests_max`; a request an app sends on a timer
+  can be named (`gate.periodic_requests`) and is then set aside in any step, with a note; a count
+  that could not be read is unknown and fails wherever a limit applies. Also: section counts on Android 11 and older, where every step had read as outside the
+  trace, and the compositor's per-layer count there, which had read as unknown. See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.11.0 — 2026-11-11
 
 - ui-probe 0.6.0: a rehearsal on the iOS Simulator. `ui-probe rehearse` drives a scenario once in

@@ -124,8 +124,8 @@ class InputScenarioTest(unittest.TestCase):
         self.reject({**INPUT_SCN, "until_quiet": True}, "'until_quiet' must be false or absent")
         for exp in ({"frames": 1}, {"signature": "T", "frames_max": 2}, {"sections_max": {"x": 1}}):
             self.reject(one({"id": "t", "do": "tap", "x": 0.5, "y": 0.5, "expect": exp}),
-                        "step 't': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature' and "
-                        "'signposts_max'")
+                        "step 't': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature', "
+                        "'signposts_max' and 'requests_max'")      # 0.7.0: requests_max added
         self.reject(one({"id": "r", "do": "rest", "ms": 1000, "expect": {"signature": "-"}}),
                     "step 'r': 'expect' on a rest on the iOS Simulator takes only 'signposts_max'")
         u.validate_scenario(one({"id": "t", "do": "tap", "x": 0.5, "y": 0.5, "until_quiet": False,

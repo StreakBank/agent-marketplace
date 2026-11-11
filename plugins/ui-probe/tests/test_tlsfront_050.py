@@ -182,7 +182,10 @@ class FrontTest(unittest.IsolatedAsyncioTestCase):
         await w.drain()
         self.assertEqual(await asyncio.wait_for(r.read(), 5), b"backend got: GET / HTTP/1.1\r\n\r\n")
         w.close()
-        entry = (await self.lines())[0]
+        # 0.7.0: the log starts with the front's 'listening' line, and a request line comes before 'closed'
+        entries = await self.lines(3)
+        self.assertEqual([e["event"] for e in entries], ["listening", "request", "closed"])
+        entry = entries[2]
         self.assertEqual((entry["event"], entry["bytes_up"], entry["bytes_down"]), ("closed", 18, 31))
         self.assertIn("t", entry)
 
@@ -201,7 +204,7 @@ class FrontTest(unittest.IsolatedAsyncioTestCase):
         with contextlib.suppress(ConnectionError, ssl.SSLError):
             await asyncio.wait_for(r.read(), 5)
         w.close()
-        entry = (await self.lines())[0]
+        entry = (await self.lines(2))[1]          # 0.7.0: after the 'listening' line
         self.assertEqual((entry["event"], entry["to"]), ("backend-refused", f"127.0.0.1:{self.backend_port}"))
 
 

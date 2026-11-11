@@ -15,6 +15,8 @@ from an unmodified build:
   * memory                             : dumpsys meminfo <package>
   * tap targets (find)                 : uiautomator dump, matched on the device
   * what the screen showed             : screenrecord, one video frame per screen change
+  * requests the app sent (--requests) : the log of a front the app's traffic passes through
+                                         (`ui-probe http-front`, or `tls-front` on the iOS Simulator)
 
 Three kinds of result, three rules:
   exact       counts (frames while nothing happens, CPU at rest, frames for a step that waits on
@@ -24,7 +26,8 @@ Three kinds of result, three rules:
   statistical every duration, and any count that time or the network drives: report the
               distribution, never gate on an emulator or simulator.
 
-Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, proxy, doctor. See README.md.
+Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, proxy, tls-front, http-front, doctor.
+See README.md.
 Exit codes: 0 success, 1 a gate failed, 2 an error the tool reports itself, 3 an unexpected error.
 """
 from __future__ import annotations
@@ -51,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -72,7 +75,7 @@ LAUNCH_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 LAUNCH_ENV_MAX = 20
 LAUNCH_ENV_VALUE_MAX = 200
 TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "launch_env", "count_signposts", "steps",
-            "count_sections", "gate"}
+            "count_sections", "gate", "launch_requests_max"}
 STEP_KEYS = {
     "rest": {"ms", "meminfo", "background", "allow"},
     "tap": {"x", "y", "find", "find_settle_ms", "settle_ms", "until_quiet", "quiet"},
@@ -81,12 +84,12 @@ STEP_KEYS = {
     "text": {"text", "settle_ms", "until_quiet", "quiet"},
 }
 COMMON_STEP_KEYS = {"id", "do", "expect"}
-EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max"}
+EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max", "requests_max"}
 QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
 # A rest step's allowance: limits that replace the gate's for that step. unchanged_frames_max lets
 # recorded frames that changed nothing pass up to a number (some carets compose them); without it
 # that check stays at zero, and it is what catches an invisible animation.
-ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max", "unchanged_frames_max")
+ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max", "unchanged_frames_max", "requests_max")
 FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package", "scroll"}
 # find.scroll: swipes made while a read shows no acceptable match. max is required; from and to are
 # screen fractions like a swipe step's; the swipe must move at least SCROLL_MIN_TRAVEL of the screen
@@ -175,7 +178,9 @@ SECTIONS_CONFIG = """data_sources { config { name: "linux.ftrace" ftrace_config 
 # framework-specific names under "count_sections"; the probe counts whatever names it is given.
 DEFAULT_SECTIONS = ["Choreographer#doFrame", "traversal", "draw", "Record View#draw()", "deliverInputEvent"]
 
-GATE_DEFAULTS = {"rest_frames_max": 0, "rest_cpu_pct_max": 2.0, "rest_updates_max": 0}
+# A key of gate.periodic_requests: a request as the front's log gives it, "METHOD /path/shape".
+REQUEST_KEY_RE = re.compile(r"[A-Z]+ /[^ ]*")
+GATE_DEFAULTS = {"rest_frames_max": 0, "rest_cpu_pct_max": 2.0, "rest_updates_max": 0, "rest_requests_max": 0}
 SIM_ONLY = "the iOS Simulator only: its log store is what counts it"
 
 # The line of `dumpsys activity activities` that names the resumed activity (the first match is
@@ -319,6 +324,8 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
     quiet = scn.get("quiet", {})
     check_quiet(quiet, "", QUIET_DEFAULTS)
     scenario_quiet = {**QUIET_DEFAULTS, **quiet}
+    if "launch_requests_max" in scn:
+        need(count(scn["launch_requests_max"]), "'launch_requests_max' must be a whole number of at least 0")
     if "count_sections" in scn:
         sec = scn["count_sections"]
         need(isinstance(sec, list) and all(isinstance(n, str) and n for n in sec),
@@ -326,8 +333,8 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
     if "gate" in scn:
         g = scn["gate"]
         need(isinstance(g, dict), "'gate' must be an object")
-        unknown = sorted(k for k in g if k not in GATE_DEFAULTS)
-        need(not unknown, f"unknown 'gate' keys {unknown}; known: {', '.join(GATE_DEFAULTS)}")
+        unknown = sorted(k for k in g if k not in GATE_DEFAULTS and k != "periodic_requests")
+        need(not unknown, f"unknown 'gate' keys {unknown}; known: {', '.join(GATE_DEFAULTS)}, periodic_requests")
         if "rest_frames_max" in g:
             need(count(g["rest_frames_max"]), "'gate.rest_frames_max' must be an integer >= 0")
         if "rest_cpu_pct_max" in g:
@@ -335,6 +342,19 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
         if "rest_updates_max" in g:
             need(platform != ANDROID, f"'gate.rest_updates_max' applies to {SIM_ONLY}")
             need(count(g["rest_updates_max"]), "'gate.rest_updates_max' must be an integer >= 0")
+        if "rest_requests_max" in g:
+            need(count(g["rest_requests_max"]), "'gate.rest_requests_max' must be an integer >= 0")
+        if "periodic_requests" in g:
+            allowed = g["periodic_requests"]
+            need(isinstance(allowed, dict) and allowed,
+                 "'gate.periodic_requests' must be an object of requests as the log gives them (\"METHOD /path\") "
+                 "to whole numbers of at least 1")
+            for key, n in allowed.items():
+                need(isinstance(key, str) and REQUEST_KEY_RE.fullmatch(key),
+                     f"'gate.periodic_requests' key {key!r} must be a request as the log gives it: an upper-case "
+                     "method, one space and a path that starts with '/', such as \"GET /api/v1/x/sync\"")
+                need(isinstance(n, int) and not isinstance(n, bool) and n >= 1,
+                     f"'gate.periodic_requests.{key}' must be a whole number of at least 1")
     if "count_signposts" in scn:
         need(platform != ANDROID, "'count_signposts' is refused on Android: it reads the iOS Simulator's log store "
                                   "('count_sections' counts trace sections there)")
@@ -384,7 +404,7 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
                      f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
                 need(any(k in allow for k in ALLOW_LIMITS),
                      f"step '{sid}': 'allow' needs at least one of {', '.join(ALLOW_LIMITS)}")
-                for k in ("frames_max", "changed_frames_max", "updates_max"):
+                for k in ("frames_max", "changed_frames_max", "updates_max", "requests_max"):
                     if k in allow:
                         need(count(allow[k]), f"step '{sid}': 'allow.{k}' must be an integer >= 0")
                 if "updates_max" in allow:
@@ -482,7 +502,7 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
             need(not unknown, f"step '{sid}': unknown 'expect' keys {sorted(unknown)}")
             if "signature" in exp:
                 need(isinstance(exp["signature"], str), f"step '{sid}': 'expect.signature' must be a string")
-            for k in ("frames", "frames_max"):
+            for k in ("frames", "frames_max", "requests_max"):
                 if k in exp:
                     need(count(exp[k]), f"step '{sid}': 'expect.{k}' must be an integer >= 0")
             if "sections_max" in exp:
@@ -576,9 +596,9 @@ def validate_sim_rules(scn: dict, need, mode: str = "run") -> None:
         if do == "rest":
             for key, why in SIM_REFUSED_STEP.items():
                 need(key not in step, f"step '{sid}': '{key}': {why}")
-            unknown = sorted(set(step.get("expect") or {}) - {"signposts_max"})
-            need(not unknown, f"step '{sid}': 'expect' on a rest on the iOS Simulator takes only 'signposts_max' "
-                              f"(frames at rest are gated by the limits and 'allow'); refused: {unknown}")
+            unknown = sorted(set(step.get("expect") or {}) - {"signposts_max", "requests_max"})
+            need(not unknown, f"step '{sid}': 'expect' on a rest on the iOS Simulator takes only 'signposts_max' and "
+                              f"'requests_max' (frames at rest are gated by the limits and 'allow'); refused: {unknown}")
             need(step["ms"] >= SIM_REST_MIN_MS,
                  f"step '{sid}': a rest on the iOS Simulator lasts at least {SIM_REST_MIN_MS} ms: the CPU time is read "
                  "in steps of 0.01 s, too coarse for a shorter window")
@@ -590,9 +610,9 @@ def validate_sim_rules(scn: dict, need, mode: str = "run") -> None:
                 need(step.get("ms", 300) <= SIM_SWIPE_MS_MAX,
                      f"step '{sid}': a swipe on the iOS Simulator lasts at most {SIM_SWIPE_MS_MAX} ms (what the input "
                      "agent accepts)")
-            unknown = sorted(set(step.get("expect") or {}) - {"signature", "signposts_max"})
-            need(not unknown, f"step '{sid}': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature' "
-                              f"and 'signposts_max'; refused: {unknown}")
+            unknown = sorted(set(step.get("expect") or {}) - {"signature", "signposts_max", "requests_max"})
+            need(not unknown, f"step '{sid}': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature', "
+                              f"'signposts_max' and 'requests_max'; refused: {unknown}")
 
 
 def sim_find_steps(scn: dict) -> list[dict]:
@@ -1008,30 +1028,54 @@ def parse_timestats(text: str) -> dict:
     """`dumpsys SurfaceFlinger --timestats -dump`: the display-wide frame total and, per layer, the
     frames the compositor took from it. Returns {'total': n or None, 'layers': {(uid, name): n}}.
 
-    One layer can appear in several blocks (the compositor keeps a record per display refresh rate
-    and render rate, among other keys); its frames are the sum over its blocks."""
-    head, *blocks = re.split(r"^uid = ", text, flags=re.M)
-    total = re.search(r"^totalFrames = (\d+)", head, re.M)
-    layers = {}
-    for block in blocks:
-        uid = re.match(r"(\d+)", block)
-        name = re.search(r"^layerName = (.*)$", block, re.M)
-        frames = re.search(r"^totalFrames = (\d+)", block, re.M)
-        if uid and name and frames and name.group(1).strip() != "none":
-            key = (int(uid.group(1)), name.group(1).strip())
-            layers[key] = layers.get(key, 0) + int(frames.group(1))
-    return {"total": int(total.group(1)) if total else None, "layers": layers}
+    Android 12 and newer start each layer's record with a `uid = ` line; Android 11 and older print
+    no uid, and a record starts at its `layerName = ` line: such a layer's uid is None. One layer can
+    appear in several records (the compositor keeps one per display refresh rate and render rate,
+    among other keys); its frames are the sum over its records."""
+    total = None
+    layers: dict = {}
+    blocks: list[dict] = []
+    current = None
+    for line in text.splitlines():
+        if line.startswith("uid = "):
+            uid = re.match(r"uid = (\d+)", line)
+            current = {"uid": int(uid.group(1)) if uid else None, "uid_line": True}
+            blocks.append(current)
+        elif line.startswith("layerName = "):
+            if current is None or "name" in current:
+                current = {"uid": None, "uid_line": False}       # a record without a uid line
+                blocks.append(current)
+            current["name"] = line[len("layerName = "):].strip()
+        elif line.startswith("totalFrames = "):
+            m = re.match(r"totalFrames = (\d+)", line)
+            if current is None:
+                if total is None and m:
+                    total = int(m.group(1))
+            elif "frames" not in current and m:
+                current["frames"] = int(m.group(1))
+    for b in blocks:
+        # a uid line that did not parse leaves the record out, as before
+        if b.get("name") and b["name"] != "none" and "frames" in b and (b["uid"] is not None or not b["uid_line"]):
+            key = (b["uid"], b["name"])
+            layers[key] = layers.get(key, 0) + b["frames"]
+    return {"total": total, "layers": layers}
 
 
 def app_layer_frames(stats: dict, package: str, uid: int | None) -> dict:
     """The layers that belong to the app under test: owned by its uid and, when that uid is shared
-    with the system, also named after its package."""
+    with the system or is not known, also named after its package. A layer without a uid (Android 11
+    and older print none) is the app's only when its name starts with "<package>/" or with
+    "SurfaceView - <package>/": a name that merely holds the package is another app's."""
     out = {}
     for (layer_uid, name), frames in stats["layers"].items():
-        if uid is not None and layer_uid != uid:
-            continue
-        if (uid is None or uid < 10000) and package not in name:
-            continue
+        if layer_uid is None:
+            if not (name.startswith(f"{package}/") or name.startswith(f"SurfaceView - {package}/")):
+                continue
+        else:
+            if uid is not None and layer_uid != uid:
+                continue
+            if (uid is None or uid < 10000) and package not in name:
+                continue
         out[name] = frames
     return out
 
@@ -1335,19 +1379,24 @@ def refuse_used(out: Path) -> None:
                          "directory (raw evidence is never overwritten)")
 
 
-def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False) -> dict:
+def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False,
+             requests: Path | None = None) -> dict:
+    """One measured run on Android. requests: a front's log (checked by check_request_log) whose new
+    lines are kept and counted per step."""
     validate_scenario(scn)
     refuse_used(out)
     refuse_rehearsal_folder(out)
     out.mkdir(parents=True, exist_ok=True)
     try:
-        return _run_once(serial, scn, out, trace, video, sections)
+        return _run_once(serial, scn, out, trace, video, sections, requests)
     except BaseException as exc:
         write_failed(out, exc, scn.get("name"))
         raise
 
 
-def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool) -> dict:
+def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool,
+              requests: Path | None = None) -> dict:
+    req_start = log_position(requests) if requests else None
     facts = device_facts(serial, scn["package"])
     total_s = scenario_duration_s(scn)
     limit_s = min(RECORD_LIMIT_S, total_s + 60)
@@ -1368,6 +1417,9 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
                 cfg += SECTIONS_CONFIG % scn["package"]
             tracer = start_tracer(serial, cfg, trace_dev)
             time.sleep(1.5)
+        # The device's uptime against this machine's clock, read from outside the device script: it places
+        # the request log's lines in the step windows.
+        clock_before = uptime_probes(serial) if requests else None
         started = time.time()
         # A stalled device (an ANR being processed, for instance) slows every shell call; allow for it.
         looks_up = any("find" in s for s in scn["steps"])
@@ -1384,7 +1436,9 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
         failure = lookup_failure(serial, scn, out) if looks_up else None
         if failure:
             raise failure
-        wall = time.time() - started
+        script_end = time.time()
+        wall = script_end - started
+        clock_after = uptime_probes(serial) if requests else None
         load_after = host_load()
         if tracer is not None:
             # The trace runs for the scenario's worst case; stop it once the scenario is done.
@@ -1396,8 +1450,10 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
         listing = sh(serial, f"ls {DEV_DIR}").split()
         if "done.txt" not in listing:
             raise ProbeError("the device script did not finish (no done marker); raw files were left on the device")
-        pull_raw(serial, out, listing)
+        raw = pull_raw(serial, out, listing)
         finished = True
+        if requests:
+            capture_requests_android(raw, requests, req_start, (clock_before, clock_after), (started, script_end), scn)
     finally:
         if tracer is not None:
             try:
@@ -1411,7 +1467,7 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
     (out / "capture.json").write_text(json.dumps({
         "tool": {"name": "ui-probe", "version": VERSION},
         "scenario": scn, "device": facts, "trace": trace, "video": video, "sections": sections,
-        "record_limit_s": limit_s, "tracer_output": tracer_output,
+        "record_limit_s": limit_s, "tracer_output": tracer_output, "requests_log": str(requests) if requests else None,
         "host": {"load1_before": round(load_before, 2), "load1_after": round(load_after, 2), "wall_s": round(wall, 1)},
     }, indent=1))
     try:
@@ -1919,9 +1975,9 @@ def agent_idle_s(scn: dict) -> int:
     return int(max(waits) / 1000 + AGENT_IDLE_MARGIN_S)
 
 
-def run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None) -> dict:
+def run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None, requests: Path | None = None) -> dict:
     """One measured run. rehearsal ({"path", "data"}, checked by check_rehearsal) is required when the
-    scenario has a tap with 'find'."""
+    scenario has a tap with 'find'. requests: a front's log (checked by check_request_log)."""
     validate_scenario(scn, SIM_PLATFORM)
     if sim_find_steps(scn) and rehearsal is None:
         raise ProbeError(no_rehearsal_message(scn, udid))
@@ -1939,7 +1995,7 @@ def run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None)
         for sig in (signal.SIGTERM, signal.SIGHUP):
             previous[sig] = signal.signal(sig, on_signal)
     try:
-        return _run_once_sim(udid, scn, out, rehearsal)
+        return _run_once_sim(udid, scn, out, rehearsal, requests)
     except BaseException as exc:
         write_failed(out, exc, scn.get("name"))
         raise
@@ -1957,8 +2013,10 @@ SIM_APP_STATES = {0: "unknown", 1: "not running", 2: "running in the background,
                   3: "running in the background", 4: "running in front"}
 
 
-def _run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None) -> dict:
+def _run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None,
+                  requests: Path | None = None) -> dict:
     bundle = scn["package"]
+    req_start = log_position(requests) if requests else None
     facts = sim_facts(udid, bundle)
     raw = out / "raw"
     raw.mkdir()
@@ -1991,11 +2049,14 @@ def _run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None
             except ProbeError as exc:
                 print(f"ui-probe: the simulator's status bar override could not be cleared ({exc}); clear it with "
                       f"`xcrun simctl status_bar {udid} clear`", file=sys.stderr)
+    if requests:
+        capture_requests_sim(raw, requests, req_start, (started, time.time()), scn)
     wall = time.time() - started
     (out / "capture.json").write_text(json.dumps({
         "tool": {"name": "ui-probe", "version": VERSION}, "platform": SIM_PLATFORM,
         "scenario": scn, "device": facts, "trace": False, "video": True, "sections": False,
         "status_bar_override": list(SIM_STATUS_BAR), "launch_env": scn.get("launch_env") or {},
+        "requests_log": str(requests) if requests else None,
         "launch_env_dropped": json.loads(_read_raw(raw, "launch-env.json") or "{}").get("dropped", []),
         "host": {"load1_before": round(load_before, 2), "load1_after": round(host_load(), 2), "wall_s": round(wall, 1)},
     }, indent=1))
@@ -3050,6 +3111,7 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
         "not_checked": list(SIM_NOT_CHECKED),
     }
     store_counts(raw, scn, steps_out, result)
+    request_counts(raw, steps_out, result, SIM_PLATFORM, scn, bool(cap.get("requests_log")))
     result["frame_sources"] = ["recording"] + (["log store"] if result["log_store"]["known"] else [])
     result["launch_env_dropped"] = cap.get("launch_env_dropped") or []
     if sim_needs_agent(scn):
@@ -3166,6 +3228,7 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                     fail("input", sid, "the replayed tap changed nothing on the screen (signature '-'), so it probably "
                          "missed its target; give the step expect.signature '-' if nothing is meant to change",
                          observed=got)
+            gate_requests(fail, notes, r, sid, s, step, opts, rest=False)
             if "signature" in expect:
                 got = None if rec is None or rec.get("error") else rec.get("signature")
                 if got is None:
@@ -3174,6 +3237,8 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                     fail("signature", sid, f"signature '{got}', approved '{expect['signature']}'",
                          observed=got, allowed=expect["signature"])
             continue
+        if want == "launch":
+            gate_requests(fail, notes, r, sid, s, launch_budget(scn), opts, rest=False)
         if want != "rest":
             continue
         allow = step.get("allow") or {}
@@ -3184,6 +3249,7 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
         by = lambda key: f" by the step's allowance ({reason})" if key in allow else ""
         extra = lambda key: {"limit_from": "allowance"} if key in allow else {}
         gate_signposts(fail, sid, s, step.get("expect") or {}, spec, store)
+        gate_requests(fail, notes, r, sid, s, step, opts, rest=True)
         known = s.get("drawables") is not None and s.get("commits") is not None and s.get("updates") is not None
         if known:
             presented = s["drawables"] + s["commits"]
@@ -3288,6 +3354,7 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
     for sid in records:
         if sid != "launch" and sid not in by_id:
             notes.append(f"{sid}: in the run but not in the scenario; not checked")
+    notes.extend(request_notes(r))
     return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
 
 
@@ -3308,6 +3375,9 @@ def gate_signposts(fail, sid: str, s: dict, expect: dict, spec: dict | None, sto
 def sim_run_row(path: str, r: dict) -> dict:
     row = {"run": Path(path).name, "host_load1": r["host"]["load1_before"]}
     for s in r["steps"]:
+        if "requests" in s:
+            # a count of its own key, like every simulator value; the launch window has one too
+            row[f"{s['id']}.sim_requests"] = (s["requests"] or {}).get("count")
         if s["kind"] == "launch":
             continue
         sid, rec = s["id"], s.get("recording") or {}
@@ -3588,12 +3658,15 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
                                 and marks["END"] - marks["T0"] > limit - 1.5),
     }
 
+    request_counts(raw, steps_out, result, ANDROID, scn, bool(cap.get("requests_log")), marks)
+
     if trace:
         trace_path = out / "trace.pftrace"
         if not trace_path.exists():
             result["trace_missing"] = True
         else:
-            _analyze_trace(result, steps_out, trace_path, scn, pids, order, bool(cap.get("sections")))
+            _analyze_trace(result, steps_out, trace_path, scn, pids, order, bool(cap.get("sections")),
+                           cap.get("tracer_output"), facts.get("sdk"))
 
     if video:
         exit_text = (_read_raw(raw, "sr-exit.txt") or "").strip()
@@ -3619,11 +3692,52 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
     return result
 
 
+# perfetto's own lines, stamped on the boot clock (the clock of the trace and of the marks): the
+# session's start and the moment it stopped recording.
+TRACER_CONNECTED_RE = re.compile(r"^\[\s*([0-9]+\.[0-9]+)\][^\n]*Connected to the Perfetto traced service", re.M)
+TRACER_DISABLED_RE = re.compile(r"^\[\s*([0-9]+\.[0-9]+)\][^\n]*disabling tracing", re.M)
+FRAMETIMELINE_SDK = 31      # the frame timeline starts with Android 12
+
+
+def tracer_session(output: str | None) -> tuple[int | None, int | None]:
+    """(start, stop) of the tracing session in nanoseconds on the boot clock, from what perfetto
+    printed, or None for a time it did not print."""
+    a = TRACER_CONNECTED_RE.search(output or "")
+    b = TRACER_DISABLED_RE.search(output or "")
+    return (int(round(float(a.group(1)) * 1e9)) if a else None, int(round(float(b.group(1)) * 1e9)) if b else None)
+
+
+def ftrace_span(fs: dict, ftrace: dict, tracer_output: str | None) -> tuple:
+    """(lo, hi, what decided it) for the sections of a trace without a frame timeline (Android 11 and
+    older), in nanoseconds; (None, None, None) when nothing covers.
+
+    The span of the ftrace events themselves, widened to the ftrace data source's own run only when the
+    trace holds its statistics once for the start and once for the end of the trace: then their per-CPU
+    `now_ts` are the bounds, if every one of them is above 0 and the latest start lies before the
+    earliest end; statistics that hold no `now_ts` let the session perfetto printed widen the events'
+    span instead. Anything else (a phase missing or written twice, a `now_ts` of 0, a start after an
+    end) leaves the events' own span."""
+    ev_lo, ev_hi = ftrace.get("events_first_ts"), ftrace.get("events_last_ts")
+    once = fs.get("start_packets") == 1 and fs.get("end_packets") == 1
+    starts, ends = fs.get("start_now_ns") or [], fs.get("end_now_ns") or []
+    if once and starts and ends:
+        if all(v > 0 for v in starts + ends) and max(starts) < min(ends):
+            return max(starts), min(ends), ["the ftrace data source's statistics (start and end of trace)"]
+    elif once and not starts and not ends and ev_lo is not None:
+        sess_lo, sess_hi = tracer_session(tracer_output)
+        lo = min(x for x in (ev_lo, sess_lo) if x is not None)
+        hi = max(x for x in (ev_hi, sess_hi) if x is not None)
+        return lo, hi, ["ftrace events"] + (["the tracer's output"] if (sess_lo, sess_hi) != (None, None) else [])
+    if ev_lo is None:
+        return None, None, None
+    return ev_lo, ev_hi, ["ftrace events"]
+
+
 def _analyze_trace(result: dict, steps_out: list, trace_path: Path, scn: dict, pids: dict, order: list,
-                   sections: bool) -> None:
+                   sections: bool, tracer_output: str | None = None, sdk=None) -> None:
     sys.path.insert(0, str(HERE))
     import pftrace
-    ftrace = {"bundles": 0, "lost_bundles": 0}
+    ftrace = {"bundles": 0, "lost_bundles": 0, "events_first_ts": None, "events_last_ts": None}
     try:
         tr = pftrace.read_trace(str(trace_path))
         begins_all = pftrace.read_atrace(str(trace_path), ftrace) if sections else []
@@ -3652,46 +3766,81 @@ def _analyze_trace(result: dict, steps_out: list, trace_path: Path, scn: dict, p
                          "event bundles report a loss before them)")
     result["sections_loss"] = sections_loss
     pkg = scn["package"]
-    app_rows = [r for r in tr["surface_frames"] if pkg in r.get("layer", "") and r.get("is_buffer")]
-    pid_set = sorted({r["pid"] for r in app_rows})
-    app_pid = single_pid(pids.get(order[-1]))
-    own = [r for r in app_rows if r["pid"] == app_pid]
-    jank, present = {}, {}
-    for r in own:
-        present[r["present"]] = present.get(r["present"], 0) + 1
-        for j in r["jank"]:
-            jank[j] = jank.get(j, 0) + 1
-    result["frametimeline"] = {
-        "surface_frames_all_layers": len(tr["surface_frames"]), "display_frames": len(tr["display_frames"]),
-        "app_buffer_frames": len(own), "pids_on_app_layers": pid_set,
-        "app_jank_types": jank, "app_present_types": present,
-        "layers": sorted({r["layer"] for r in own}),
-    }
-    # The span the trace holds. A trace that stopped early, or whose ring buffer overwrote its
-    # beginning, does not cover every step; a step outside the span has no trace-based counts.
+    # The span the trace's stamped packets hold. A trace that stopped early, or whose ring buffer
+    # overwrote its beginning, does not cover every step; a step outside the span has no frame
+    # timeline counts. Event bundles carry no packet timestamp and are not in this span.
     first_ts, last_ts = tr["first_ts"], tr["last_ts"]
     result["trace_span_s"] = [first_ts / 1e9, last_ts / 1e9] if first_ts is not None else None
     result["trace_truncated"] = tr["truncated"]
-
-    def covered(st):
-        return (not loss and first_ts is not None and st["start_s"] is not None and st["end_s"] is not None
-                and first_ts <= st["start_s"] * 1e9 and st["end_s"] * 1e9 <= last_ts)
-
-    # The compositor's own count per step: frames of the app's layers from any of its processes
-    # (a restart changes the pid), whatever toolkit drew them. Trace and marks share the boot clock.
     own_pids = {int(t) for p in pids.values() for t in p.split() if t.isdigit()}
-    uncovered = []
-    for st in steps_out:
-        st["trace_covered"] = covered(st)
-        if not st["trace_covered"]:
+    # Android 11 and older: no frame timeline, and stamped packets that end early. Only a capture that says
+    # so (its API level) and a trace without a single frame-timeline packet take this path; anything
+    # else is read exactly as 0.6.0 read it.
+    level = int(sdk) if str(sdk).strip().isdigit() else None
+    old_android = level is not None and level < FRAMETIMELINE_SDK and not tr.get("frametimeline_packets")
+    if old_android:
+        # No frame timeline: its counts are unknown, never 0.
+        result["frametimeline"] = None
+        result["frametimeline_unavailable"] = (
+            f"the device has no frame timeline (Android API {level}; it starts with Android 12, API {FRAMETIMELINE_SDK})")
+        for st in steps_out:
+            st["trace_covered"] = None
             st["frames_compositor"] = None
-            uncovered.append(st["id"])
-            continue
-        lo, hi = st["start_s"] * 1e9, st["end_s"] * 1e9
-        st["frames_compositor"] = sum(1 for r in app_rows if r["pid"] in own_pids and lo <= (r.get("start") or 0) < hi)
-    result["trace_uncovered_steps"] = uncovered
-    result["frame_sources"].append("compositor-trace")
+        result["trace_uncovered_steps"] = []
+    else:
+        app_rows = [r for r in tr["surface_frames"] if pkg in r.get("layer", "") and r.get("is_buffer")]
+        pid_set = sorted({r["pid"] for r in app_rows})
+        app_pid = single_pid(pids.get(order[-1]))
+        own = [r for r in app_rows if r["pid"] == app_pid]
+        jank, present = {}, {}
+        for r in own:
+            present[r["present"]] = present.get(r["present"], 0) + 1
+            for j in r["jank"]:
+                jank[j] = jank.get(j, 0) + 1
+        result["frametimeline"] = {
+            "surface_frames_all_layers": len(tr["surface_frames"]), "display_frames": len(tr["display_frames"]),
+            "app_buffer_frames": len(own), "pids_on_app_layers": pid_set,
+            "app_jank_types": jank, "app_present_types": present,
+            "layers": sorted({r["layer"] for r in own}),
+        }
+
+        def covered(st):
+            return (not loss and first_ts is not None and st["start_s"] is not None and st["end_s"] is not None
+                    and first_ts <= st["start_s"] * 1e9 and st["end_s"] * 1e9 <= last_ts)
+
+        # The compositor's own count per step: frames of the app's layers from any of its processes
+        # (a restart changes the pid), whatever toolkit drew them. Trace and marks share the boot clock.
+        uncovered = []
+        for st in steps_out:
+            st["trace_covered"] = covered(st)
+            if not st["trace_covered"]:
+                st["frames_compositor"] = None
+                uncovered.append(st["id"])
+                continue
+            lo, hi = st["start_s"] * 1e9, st["end_s"] * 1e9
+            st["frames_compositor"] = sum(1 for r in app_rows if r["pid"] in own_pids and lo <= (r.get("start") or 0) < hi)
+        result["trace_uncovered_steps"] = uncovered
+        result["frame_sources"].append("compositor-trace")
     if sections:
+        # The span that decides whether a step's sections were recorded. With a frame timeline (Android
+        # 12 and later) it is the stamped packets' span, as for the frame timeline. Without one, the
+        # stamped packets end early (an ftrace bundle carries no packet timestamp), so it is the span of
+        # the ftrace events themselves; it is widened to the ftrace data source's own run only when the
+        # trace holds its statistics for both the start and the end of the trace: then their `now_ts`
+        # are the bounds, or, if they hold none, the session perfetto printed. A screen at rest emits
+        # no event, so the last event can come well before the end of the last step.
+        if not old_android:
+            sec_lo, sec_hi = first_ts, last_ts
+            span_from = ["stamped packets"] if first_ts is not None else None
+        else:
+            sec_lo, sec_hi, span_from = ftrace_span(tr.get("ftrace_stats") or {}, ftrace, tracer_output)
+        result["sections_span_s"] = [sec_lo / 1e9, sec_hi / 1e9] if sec_lo is not None else None
+        result["sections_span_from"] = span_from
+
+        def sections_covered(st):
+            return (not loss and sec_lo is not None and st["start_s"] is not None and st["end_s"] is not None
+                    and sec_lo <= st["start_s"] * 1e9 and st["end_s"] * 1e9 <= sec_hi)
+
         wanted = list(dict.fromkeys(DEFAULT_SECTIONS + list(scn.get("count_sections", []))))
         begins = [b for b in begins_all if b["tgid"] in own_pids]
         match = lambda b, w: b["name"] == w or b["name"].startswith(w + " ")
@@ -3700,8 +3849,12 @@ def _analyze_trace(result: dict, steps_out: list, trace_path: Path, scn: dict, p
         observed = {w for w in wanted if any(match(b, w) for b in begins)}
         result["sections_total"] = len(begins)
         result["sections_not_observed"] = [w for w in wanted if w not in observed]
+        sec_uncovered = []
         for st in steps_out:
-            if not st["trace_covered"] or sections_loss:
+            st["sections_covered"] = sections_covered(st)
+            if not st["sections_covered"]:
+                sec_uncovered.append(st["id"])
+            if not st["sections_covered"] or sections_loss:
                 st["sections"] = {w: None for w in wanted}
                 st["sections_all"] = None
                 continue
@@ -3709,6 +3862,625 @@ def _analyze_trace(result: dict, steps_out: list, trace_path: Path, scn: dict, p
             inside = [b for b in begins if lo <= b["ts"] < hi]
             st["sections"] = {w: (sum(1 for b in inside if match(b, w)) if w in observed else None) for w in wanted}
             st["sections_all"] = len(inside)
+        # With lost data every count is unknown and the gate says so once; this list is for the rest.
+        result["sections_uncovered_steps"] = [] if loss else sec_uncovered
+
+
+# --------------------------------------------------------------------------------------------
+# requests, counted from the log of a front the app's traffic passes through
+# --------------------------------------------------------------------------------------------
+#
+# `ui-probe http-front` (an Android emulator reaches it as 10.0.2.2) and `ui-probe tls-front` (the iOS
+# Simulator) log every HTTP/1.x request they pipe, stamped with this machine's clock. A run given the
+# log with --requests notes where the log ends at its start, reads what was appended (and, to follow
+# the connections the front could not read, what the same front process wrote before), and places
+# the requests in the step windows: on the simulator they are this machine's clock already; on
+# Android the marks are the device's /proc/uptime, mapped to this machine's clock by reading
+# /proc/uptime through adb before and after the device script. A count is known only when the run
+# can show the front saw everything the app sent in that window.
+
+REQUEST_EVENTS = ("request", "unparsed", "upgrade", "backend-refused")
+REQUEST_MARGIN_S = SIM_LOG_MARGIN_S   # lines kept around the run's window, as for the log store
+REQUEST_TOP_PATHS = 20
+REQUESTS_FILE = "requests.jsonl"
+REQUESTS_META = "requests-meta.json"
+UPTIME_PROBES = 3               # reads of /proc/uptime before and after the device script
+UPTIME_RESOLUTION_S = 0.01      # /proc/uptime has two decimals
+CLOCK_DRIFT_MAX_S = 0.1         # the two offsets may differ by this plus half of each round trip
+# Above this the counts are unknown ("adb answered too slowly"). No bound on the uncertainty keeps a
+# tap's own request out of a neighbouring rest: an input takes 0.43 to 0.46 s from its step's start mark
+# to the app on an Android 11 emulator (`input` starts a runtime first), but about 0.01 s on an Android 14
+# one (`input` is `cmd input`; `input tap` returned in 0.01 s, 3 of 3), so a tap's request can follow
+# its start mark by a few tens of milliseconds. That is why the zone at a border between a rest and an
+# input step goes to the step (request_windows), not to the rest.
+CLOCK_UNCERTAINTY_MAX_S = 0.2
+CLOCK_NOTE_ABOVE_S = 0.1        # the gate says how far each rest's window was narrowed above this
+NO_REQUEST_LOG = "not counted: the run was given no request log"
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def front_pid(text: str) -> int | None:
+    """The pid in the log's last `listening` line, or None when there is no such line with a pid."""
+    pid = None
+    found = False
+    for line in text.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and e.get("event") == "listening":
+            found = True
+            pid = e.get("pid") if isinstance(e.get("pid"), int) and not isinstance(e.get("pid"), bool) else None
+    return pid if found else None
+
+
+def process_running(pid: int | None) -> bool:
+    """Whether a process with this id exists (one of another user counts)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def check_request_log(path: str) -> Path:
+    """The front's log a run counts requests from; refused unless it exists, holds the line a front
+    writes when it starts listening, and the front that wrote the last such line is running."""
+    p = Path(path)
+    if not p.is_file():
+        raise ProbeError(f"--requests {path}: no such file. Start the front with `--log {path}` first "
+                         "(`ui-probe http-front` for an Android emulator, `ui-probe tls-front` for the iOS Simulator)")
+    try:
+        text = p.read_text(errors="replace")
+    except OSError as exc:
+        raise ProbeError(f"--requests {path} cannot be read: {exc.strerror or exc}") from exc
+    if not any(isinstance(e, dict) and e.get("event") == "listening" for e in _json_lines(text)):
+        raise ProbeError(f"--requests {path} holds no 'listening' line, so it is not the log of a front: start "
+                         f"`ui-probe http-front` or `ui-probe tls-front` with `--log {path}`")
+    pid = front_pid(text)
+    if not process_running(pid):
+        raise ProbeError(f"the front that wrote {path} is not running (pid {pid}): start it again with --log {path}")
+    return p.resolve()
+
+
+def _json_lines(text: str):
+    for line in text.splitlines():
+        try:
+            yield json.loads(line)
+        except ValueError:
+            yield None
+
+
+def log_position(path: Path) -> dict:
+    """Where the log ends now, which file it is, and whether the front that writes it is running."""
+    try:
+        st = os.stat(path)
+        text = Path(path).read_text(errors="replace")
+    except OSError as exc:
+        raise ProbeError(f"the request log {path} cannot be read: {exc.strerror or exc}") from exc
+    pid = front_pid(text)
+    return {"size": st.st_size, "inode": st.st_ino, "device": st.st_dev, "front_pid": pid,
+            "front_alive": process_running(pid)}
+
+
+def _write_private(path: Path, text: str) -> None:
+    """A file only its owner can read (0600), whether it existed or not."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        data = text.encode()
+        while data:
+            data = data[os.write(fd, data):]
+    finally:
+        os.close(fd)
+
+
+def save_requests(raw: Path, source: Path, start: dict, window: tuple, clock: dict, reason: str | None) -> None:
+    """Read the log after the run and save raw/requests.jsonl and raw/requests-meta.json (both 0600).
+
+    Kept: the request, unparsed, upgrade and backend-refused lines appended since `start` whose time
+    lies in the run's window (this machine's clock) widened by REQUEST_MARGIN_S. Followed: every
+    connection the front could not read (from its upgrade or unparsed line to its closed line) since
+    the last `listening` line before `start`, so that one that became opaque before the run and was
+    still open during it is seen. Recorded: whether the front was running at the start and at the end.
+    What could not be read is a reason (the run's counts are then unknown); a file that cannot be
+    written raises ProbeError."""
+    lo, hi = window
+    meta = {"source": str(source), "offset_start": start["size"], "offset_end": None,
+            "window": [lo, hi], "margin_s": REQUEST_MARGIN_S, "clock": clock, "reason": reason,
+            "kept": 0, "unreadable_lines": 0, "partial_tail_bytes": 0, "restarts": [], "stops": [], "opaque": [],
+            "front": {"pid_at_start": start.get("front_pid"), "alive_at_start": start.get("front_alive"),
+                      "pid_at_end": None, "alive_at_end": None, "port": None, "accepting_at_end": None}}
+    kept = []
+    sys.path.insert(0, str(HERE))
+    import httppipe
+    try:
+        # Does the front still accept? Its last `listening` line names the port. This comes after the
+        # device part, so after the last request line of the run could be written; the probe's own
+        # `closed` line (on http-front) lies after the run's window.
+        last = httppipe.last_listening(str(source)) or {}
+        meta["front"]["port"] = last.get("port")
+        meta["front"]["accepting_at_end"] = httppipe.port_accepts(last.get("port"))
+        st = os.stat(source)
+        meta["offset_end"] = st.st_size
+        if (st.st_ino, st.st_dev) != (start["inode"], start["device"]):
+            meta["reason"] = meta["reason"] or "the request log was replaced during the run (another file has its name now)"
+        elif st.st_size < start["size"]:
+            meta["reason"] = meta["reason"] or "the request log was cut during the run (it is shorter than at the start)"
+        else:
+            with open(source, "rb") as fh:
+                data = fh.read(st.st_size)
+            pid_end = front_pid(data.decode("utf-8", "replace"))
+            meta["front"].update(pid_at_end=pid_end, alive_at_end=process_running(pid_end))
+            # Follow the connections from the last `listening` line before the start: the front process
+            # that was running when the run began.
+            begin = 0
+            for m in re.finditer(rb"[^\n]*\n", data[:start["size"]]):
+                try:
+                    e = json.loads(m.group(0))
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("event") == "listening":
+                    begin = m.start()
+            *lines, tail = data[begin:].split(b"\n")
+            meta["partial_tail_bytes"] = len(tail)      # a line still being written, after the run
+            keep_lo = None if lo is None else lo - REQUEST_MARGIN_S
+            keep_hi = None if hi is None else hi + REQUEST_MARGIN_S
+            opaque_open: dict = {}
+            intervals = []
+            offset = begin
+            for line in lines:
+                appended = offset >= start["size"]
+                offset += len(line) + 1
+                if not line.strip():
+                    continue
+                try:
+                    e = json.loads(line)
+                    t = e["t"] if isinstance(e, dict) else None
+                except (ValueError, KeyError):
+                    t = e = None
+                if not isinstance(t, (int, float)) or isinstance(t, bool):
+                    meta["unreadable_lines"] += 1
+                    continue
+                event = e.get("event")
+                if event == "listening":
+                    # a new front process: the connections of the last one are gone with it
+                    for iv in opaque_open.values():
+                        iv["to"] = t
+                    opaque_open = {}
+                    if appended:
+                        meta["restarts"].append(t)
+                    continue
+                if event == "stopping" and appended:
+                    meta["stops"].append(t)
+                if event in ("upgrade", "unparsed") and e.get("conn") not in opaque_open:
+                    iv = {"conn": e.get("conn"), "kind": event, "why": e.get("why"), "from": t, "to": None}
+                    opaque_open[e.get("conn")] = iv
+                    intervals.append(iv)
+                elif event == "closed" and e.get("conn") in opaque_open:
+                    opaque_open.pop(e.get("conn"))["to"] = t
+                if appended and event in REQUEST_EVENTS and keep_lo is not None and keep_lo <= t <= keep_hi:
+                    kept.append(line.decode("utf-8", "replace"))
+            if keep_lo is not None:
+                meta["opaque"] = [iv for iv in intervals if iv["from"] <= keep_hi and (iv["to"] is None or iv["to"] >= keep_lo)]
+    except OSError as exc:
+        meta["reason"] = meta["reason"] or f"the request log could not be read at the end of the run: {exc.strerror or exc}"
+    meta["kept"] = len(kept)
+    try:
+        _write_private(raw / REQUESTS_FILE, "".join(line + "\n" for line in kept))
+        _write_private(raw / REQUESTS_META, json.dumps(meta, indent=1))
+    except OSError as exc:
+        raise ProbeError(f"the requests of the run could not be saved in {raw}: {exc.strerror or exc}") from exc
+
+
+def uptime_probes(serial: str, probes: int = UPTIME_PROBES, clock=time.time) -> dict:
+    """`probes` reads of the device's /proc/uptime, each bracketed by this machine's clock; the read
+    with the shortest round trip is kept: its offset is the middle of the bracket minus the uptime.
+    {'known': False, 'reason'} when no read gave a value."""
+    tried = []
+    for _ in range(probes):
+        h0 = clock()
+        try:
+            text = sh(serial, "cat /proc/uptime", timeout=30)
+        except ProbeError as exc:
+            tried.append({"error": str(exc)[:200]})
+            continue
+        h1 = clock()
+        m = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)\s", text + " ")
+        if not m:
+            tried.append({"error": f"the device answered {text.strip()[:80]!r}", "round_trip_s": round(h1 - h0, 6)})
+            continue
+        tried.append({"host_before": h0, "host_after": h1, "uptime": float(m.group(1)), "round_trip_s": round(h1 - h0, 6)})
+    good = [t for t in tried if "uptime" in t]
+    if not good:
+        return {"known": False, "probes": tried,
+                "reason": "the device's /proc/uptime could not be read from this machine (" +
+                          ("; ".join(t["error"] for t in tried) or "no probe ran") + ")"}
+    best = min(good, key=lambda t: t["round_trip_s"])
+    mid = (best["host_before"] + best["host_after"]) / 2
+    return {"known": True, "uptime": best["uptime"], "host": mid, "offset_s": mid - best["uptime"],
+            "round_trip_s": best["round_trip_s"], "probes": tried}
+
+
+def android_request_clock(before: dict | None, after: dict | None) -> tuple[dict, str | None]:
+    """The mapping of the device's uptime to this machine's clock: the straight line through the two
+    kept probes (before and after the device script), its uncertainty, and why it is unknown (None
+    when known)."""
+    clock = {"platform": ANDROID, "known": False, "before": before, "after": after}
+    for name, g in (("before", before), ("after", after)):
+        if g is None or not g.get("known"):
+            return clock, (g or {}).get("reason") or f"the device's clock was not read {name} the device script"
+    drift = abs(after["offset_s"] - before["offset_s"])
+    half = before["round_trip_s"] / 2 + after["round_trip_s"] / 2
+    u = round(half + UPTIME_RESOLUTION_S + drift, 6)
+    clock.update(drift_s=round(drift, 6), uncertainty_s=u)
+    if drift > CLOCK_DRIFT_MAX_S + half:
+        return clock, (f"the device's clock and this machine's moved apart by {drift:.3f} s during the run (the emulator "
+                       "was paused, or a clock was set)")
+    if u > CLOCK_UNCERTAINTY_MAX_S:
+        return clock, (f"the device's clock is mapped to this machine's only to within {u:.3f} s (above "
+                       f"{CLOCK_UNCERTAINTY_MAX_S} s): adb answered too slowly")
+    clock["known"] = True
+    return clock, None
+
+
+def uptime_to_host(clock: dict, uptime: float | None) -> float | None:
+    if uptime is None or not clock.get("known"):
+        return None
+    b, a = clock["before"], clock["after"]
+    if a["uptime"] == b["uptime"]:
+        return uptime + b["offset_s"]
+    slope = (a["host"] - b["host"]) / (a["uptime"] - b["uptime"])
+    return b["host"] + (uptime - b["uptime"]) * slope
+
+
+def capture_requests_android(raw: Path, source: Path, start: dict, probes: tuple, bracket: tuple, scn: dict) -> None:
+    """After the device part of an Android run: the clock mapping (probes: the groups read before and
+    after the device script), checked against this machine's own bracket of the script, then the log.
+    Without a mapping the lines between the device script's start and end on this machine's clock are
+    kept, and the counts are unknown."""
+    clock, reason = android_request_clock(*probes)
+    window = bracket
+    if reason is None:
+        try:
+            marks = parse_marks(_read_raw(raw, "marks.txt") or "")
+        except ProbeError as exc:
+            marks, reason = {}, str(exc)
+        lo = uptime_to_host(clock, marks.get("launch.start"))
+        hi = uptime_to_host(clock, marks.get(f"{scn['steps'][-1]['id']}.end"))
+        u = clock["uncertainty_s"]
+        if lo is None or hi is None:
+            reason = reason or "the run holds no mark of its launch or of the end of its last step"
+        elif not (bracket[0] - u <= lo <= bracket[1] + u and bracket[0] - u <= hi <= bracket[1] + u):
+            clock["known"] = False
+            reason = (f"the clock mapping puts the launch at {lo:.3f} and the end of the last step at {hi:.3f}, outside "
+                      f"the time this machine ran the device script ({bracket[0]:.3f} to {bracket[1]:.3f}, widened by "
+                      f"{u:.3f} s)")
+        else:
+            window = (lo, hi)
+    save_requests(raw, source, start, window, clock, reason)
+
+
+def capture_requests_sim(raw: Path, source: Path, start: dict, bracket: tuple, scn: dict) -> None:
+    """After the device part of a simulator run: the steps are timed on this machine's clock."""
+    launch = json.loads(_read_raw(raw, "launch-time.json") or "{}").get("wall")
+    last = json.loads(_read_raw(raw, f"step-{scn['steps'][-1]['id']}.json") or "{}").get("wall_after")
+    clock = {"platform": SIM_PLATFORM, "known": True, "uncertainty_s": 0.0,
+             "mapping": "none: the steps are timed on this machine's clock"}
+    reason = None if launch is not None and last is not None else \
+        "the run holds no time of its launch or of the end of its last step"
+    save_requests(raw, source, start, (launch, last) if reason is None else bracket, clock, reason)
+
+
+def request_windows(raw: Path, steps_out: list[dict], platform: str, clock: dict, scn: dict, marks: dict) -> dict:
+    """Each step's request window on this machine's clock, (lo, hi, gap start or None, gap length in
+    seconds), half-open and
+    disjoint, so that every request is counted in one step at most. A rest runs on to where the next
+    step starts putting anything into the app (its lookup's first swipe on Android, a replayed swipe on
+    the simulator, else its start): the tail after the rest's own end is its gap. The last step ends
+    where the run's window ends, at its own end. Where a rest borders an input step (the launch counts
+    as one), in either order, the input step takes the zone of width u (the clock's uncertainty) on the
+    rest's side, and the rest's window shrinks by as much, at most half of the rest's length (its own
+    length plus its gap), so that two input steps around a short rest meet in its middle; between two
+    rests, or two input steps, the border is the mark itself. A first or last step that is a rest is
+    widened outward by u (it has no neighbour there)."""
+    u = clock.get("uncertainty_s") or 0.0
+    by_id = {s["id"]: s for s in scn["steps"]}
+    order = [st["id"] for st in steps_out]
+    own, next_start = {}, {}
+    if platform == SIM_PLATFORM:
+        data = {sid: json.loads(_read_raw(raw, f"step-{sid}.json") or "{}") for sid in order if sid != "launch"}
+        first = next((data[sid].get("wall_before") for sid in order if sid != "launch"), None)
+        own["launch"] = (json.loads(_read_raw(raw, "launch-time.json") or "{}").get("wall"), first)
+        for sid in order:
+            if sid != "launch":
+                own[sid] = (data[sid].get("wall_before"), data[sid].get("wall_after"))
+        for n, sid in enumerate(order[:-1]):
+            if sid == "launch":
+                continue
+            nxt = order[n + 1]
+            replayed = (data[nxt].get("resolved") or {}).get("swipes")
+            next_start[sid] = data[sid].get("rec_wall_end") if replayed else data[nxt].get("wall_before")
+    else:
+        for st in steps_out:
+            own[st["id"]] = (uptime_to_host(clock, st.get("start_s")), uptime_to_host(clock, st.get("end_s")))
+        for n, sid in enumerate(order[:-1]):
+            nxt = by_id.get(order[n + 1]) or {}
+            scroll = "find" in nxt and "scroll" in nxt["find"]
+            mark = f"{nxt['id']}.find_start" if scroll else f"{nxt['id']}.start"
+            next_start[sid] = uptime_to_host(clock, marks.get(mark))
+    rests = {sid for sid in order if (by_id.get(sid) or {}).get("do") == "rest"}
+    win = {}
+    for sid in order:
+        lo, hi = own.get(sid, (None, None))
+        if lo is None or hi is None:
+            continue
+        gap_from, gap_s = None, 0.0
+        if sid in rests and next_start.get(sid) is not None and next_start[sid] > hi:
+            gap_from, gap_s, hi = hi, next_start[sid] - hi, next_start[sid]
+        win[sid] = [lo, hi, gap_from, gap_s]
+    placed = [sid for sid in order if sid in win]
+    # What an input step takes from a neighbouring rest is u, at most half of the rest's length (with its
+    # gap), so that two input steps on either side of a short rest meet in its middle and never cross. An
+    # input's own request can follow its start mark by 0.01 s on newer Android: no bound on u keeps it out
+    # of the rest before it, so the zone the clock cannot place goes to the step, whose budget holds it.
+    length = {sid: max(0.0, win[sid][1] - win[sid][0]) for sid in placed}
+    for a, b in zip(placed, placed[1:]):
+        if (a in rests) == (b in rests):
+            continue                                  # two rests (or two input steps): the marks decide
+        if a in rests:
+            win[a][1] -= min(u, length[a] / 2)
+            win[b][0] = min(win[b][0], win[a][1])
+        else:
+            win[a][1] += min(u, length[b] / 2)
+            win[b][0] = max(win[b][0], win[a][1])
+    if placed and placed[0] in rests:
+        win[placed[0]][0] -= u
+    if placed and placed[-1] in rests:
+        win[placed[-1]][1] += u
+    windows = {sid: (None, None, None, 0.0) for sid in order}
+    for sid, (lo, hi, gap_from, gap_s) in win.items():
+        windows[sid] = (lo, max(lo, hi), gap_from, round(gap_s, 3))
+    return windows
+
+
+def request_counts(raw: Path, steps_out: list[dict], result: dict, platform: str, scn: dict,
+                   requested: bool, marks: dict | None = None) -> None:
+    """Each step's requests: {'count', 'by_path'} (the REQUEST_TOP_PATHS most frequent 'METHOD /path'; a
+    rest also 'gap_s' and 'in_gap'), or {'count': None, 'reason'}. A run captured without --requests
+    gets no 'requests'; one captured with it always does. Known only when the run can show the front
+    saw everything the app sent: the front ran from the start to the end, did not start again during
+    the run, refused no connection to the backend, carried no connection it could not read, and passed
+    at least one request between the launch and the end of the last step; and, on Android, the clock
+    was mapped. A value not read is unknown, never zero."""
+    meta_text = _read_raw(raw, REQUESTS_META)
+    if meta_text is None and not requested:
+        return
+    meta = None
+    if meta_text is None:
+        reason = f"the run was given a request log, but raw/{REQUESTS_META} is missing: the run kept no record of it"
+    else:
+        try:
+            meta = json.loads(meta_text)
+            reason = meta.get("reason") if isinstance(meta, dict) else None
+        except ValueError:
+            meta = None
+        if not isinstance(meta, dict):
+            meta, reason = None, f"raw/{REQUESTS_META} cannot be read: the run kept no usable record of its request log"
+    meta = meta or {}
+    clock = meta.get("clock") or {}
+    u = clock.get("uncertainty_s") or 0.0
+    lo, hi = (meta.get("window") or [None, None])[:2]
+    front = meta.get("front") or {}
+    if reason is None and front.get("alive_at_start") is not True:
+        reason = (f"the front (pid {front.get('pid_at_start')}) was not running at the start of the run: what the app "
+                  "sent was not piped and is not counted")
+    if reason is None and meta.get("restarts"):
+        reason = ("the front started listening again after the run began (it was restarted): what the app sent while "
+                  "it was down was not piped and is not counted")
+    if reason is None and front.get("pid_at_end") != front.get("pid_at_start"):
+        reason = (f"the front's pid changed during the run ({front.get('pid_at_start')}, then {front.get('pid_at_end')}): "
+                  "what the app sent while it was down was not piped and is not counted")
+    if reason is None and meta.get("stops"):
+        reason = "the front was told to stop during the run: what the app sent after that was not piped and is not counted"
+    if reason is None and front.get("alive_at_end") is not True:
+        reason = (f"the front (pid {front.get('pid_at_end')}) was no longer running at the end of the run: what the app "
+                  "sent after it stopped was not piped and is not counted")
+    if reason is None and front.get("accepting_at_end") is not True:
+        reason = (f"the front (pid {front.get('pid_at_end')}) was running but no longer accepted connections on port "
+                  f"{front.get('port')} at the end of the run: what the app sent was not piped and is not counted")
+    if reason is None and meta.get("unreadable_lines"):
+        n = meta["unreadable_lines"]
+        reason = (f"{_plural(n, 'line')} the front process wrote {'is' if n == 1 else 'are'} not the front's JSON, so "
+                  "what the front saw cannot be followed")
+    if reason is None and (lo is None or hi is None):
+        reason = "the run holds no window of its launch and its last step"
+    events = []
+    for n, line in enumerate((_read_raw(raw, REQUESTS_FILE) or "").splitlines(), 1):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            e = None
+        if not isinstance(e, dict) or not isinstance(e.get("t"), (int, float)):
+            reason = reason or f"raw/{REQUESTS_FILE} line {n} is not a front's JSON line"
+            continue
+        events.append(e)
+    requests = [e for e in events if e.get("event") == "request"]
+    if reason is None:
+        refused = [e for e in events if e.get("event") == "backend-refused" and lo - u <= e["t"] <= hi + u]
+        if refused:
+            reason = (f"the backend refused {_plural(len(refused), 'connection')} from the front during the run (the "
+                      f"first {max(0.0, refused[0]['t'] - lo):.1f} s after the launch): what the app sent on them was "
+                      "not read")
+    if reason is None:
+        opaque = [iv for iv in meta.get("opaque") or []
+                  if iv["from"] <= hi + u and (iv.get("to") is None or iv["to"] >= lo - u)]
+        upgrades = [iv for iv in opaque if iv.get("kind") == "upgrade"]
+        unparsed = [iv for iv in opaque if iv.get("kind") == "unparsed"]
+        if upgrades:
+            one = len(upgrades) == 1
+            reason = (f"{_plural(len(upgrades), 'connection')} asked for an upgrade (`Connection: upgrade` or CONNECT) "
+                      f"and {'was' if one else 'were'} open during the run: what followed on {'it' if one else 'them'} is "
+                      "not HTTP/1.x requests the front can count")
+        elif unparsed:
+            whys = sorted({str(iv.get("why")) for iv in unparsed})
+            reason = (f"{_plural(len(unparsed), 'connection')} carried bytes the front could not read as HTTP/1.x "
+                      f"({'; '.join(whys)}), so their requests are not counted")
+    if reason is None and not any(lo <= e["t"] <= hi for e in requests):
+        reason = ("no request passed through the front between the launch and the end of the last step: the app's "
+                  "traffic is probably not going through the front (is the app pointed at it?)")
+    windows = request_windows(raw, steps_out, platform, clock, scn, marks or {}) if reason is None else {}
+    placed = set()
+    rests = {s["id"] for s in scn["steps"] if s["do"] == "rest"}
+    for st in steps_out:
+        if reason is not None:
+            st["requests"] = {"count": None, "reason": reason}
+            continue
+        w_lo, w_hi, gap_from, gap_s = windows.get(st["id"], (None, None, None, 0.0))
+        if w_lo is None or w_hi is None:
+            st["requests"] = {"count": None, "reason": "the run holds no window for this step"}
+            continue
+        inside = [e for e in requests if w_lo <= e["t"] < w_hi]          # the windows are disjoint
+        placed.update(id(e) for e in inside)
+        tally: dict = {}
+        for e in inside:
+            key = f"{e.get('method')} {e.get('path')}"
+            tally[key] = tally.get(key, 0) + 1
+        top = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[:REQUEST_TOP_PATHS]
+        st["requests"] = {"count": len(inside), "by_path": dict(top)}
+        if st["id"] in rests:
+            st["requests"].update(gap_s=gap_s,
+                                  in_gap=sum(1 for e in inside if gap_from is not None and e["t"] >= gap_from))
+    loose = [e for e in requests if id(e) not in placed]
+    between = [e for e in loose if lo is not None and lo <= e["t"] <= hi] if reason is None else None
+    between_paths: dict = {}
+    for e in between or []:
+        key = f"{e.get('method')} {e.get('path')}"
+        between_paths[key] = between_paths.get(key, 0) + 1
+    summary_clock = {k: clock.get(k) for k in ("platform", "known", "uncertainty_s", "drift_s", "mapping") if k in clock}
+    result["requests"] = {"known": reason is None, "reason": reason, "log": meta.get("source"),
+                          "requests": len(requests),
+                          "between_steps": len(between) if between is not None else None,
+                          "between_paths": dict(sorted(between_paths.items(), key=lambda kv: (-kv[1], kv[0]))[:REQUEST_TOP_PATHS]),
+                          "in_margins": len(loose) - len(between) if reason is None else None,
+                          "front": front or None, "clock": summary_clock}
+
+
+def describe_paths(by_path: dict | None) -> str:
+    return ", ".join(f"{k} x{v}" for k, v in (by_path or {}).items()) or "no path"
+
+
+def request_notes(r: dict) -> list[str]:
+    """What the gate says once per run about its request counts (nothing for a run without a log)."""
+    block = r.get("requests")
+    if not block or not block.get("known"):
+        return []
+    out = []
+    u = (block.get("clock") or {}).get("uncertainty_s") or 0.0
+    if u > CLOCK_NOTE_ABOVE_S:
+        out.append(f"the device's clock was mapped to this machine's to within {u:.3f} s, so each rest's request window "
+                   "was narrowed by that much (at most half of the rest) where it meets an input step or the launch: a "
+                   "request that close to an input step is counted in that step, not in the rest")
+    if block.get("between_steps"):
+        out.append(f"{_plural(block['between_steps'], 'request')} fell between steps, after an input step's window, and "
+                   f"{'was' if block['between_steps'] == 1 else 'were'} not gated: "
+                   f"{describe_paths(block.get('between_paths'))}")
+    return out
+
+
+def launch_budget(scn: dict) -> dict | None:
+    """The scenario's `launch_requests_max` as the launch step's `expect.requests_max`, or None."""
+    if "launch_requests_max" not in scn:
+        return None
+    return {"id": "launch", "expect": {"requests_max": scn["launch_requests_max"]}}
+
+
+def periodic_split(rec: dict, periodic: dict) -> tuple:
+    """(held, set aside, cut) for one step's request record against the scenario's periodic requests:
+    requests of a periodic kind are set aside up to their number, the rest is held. `cut` is True when
+    the step's `by_path` (the 20 most frequent paths) does not add up to its count, so that a periodic
+    request may be among the paths cut away and the set-aside cannot be computed."""
+    count = rec.get("count")
+    by_path = rec.get("by_path") or {}
+    if count is None:
+        return None, {}, False
+    cut = bool(periodic) and sum(by_path.values()) != count
+    aside = {k: min(by_path[k], n) for k, n in periodic.items() if by_path.get(k)}
+    return count - sum(aside.values()), aside, cut
+
+
+def gate_requests(fail, notes: list, r: dict, sid: str, s: dict, step: dict | None, opts: dict, rest: bool) -> None:
+    """The request checks of one step: 'rest-requests' (a rest, against gate.rest_requests_max or the
+    step's allow.requests_max) when the run was given a request log, and 'requests' (expect.requests_max,
+    or launch_requests_max on the launch) on any step. Requests of a kind the scenario's gate block names
+    in `periodic_requests` (a request an app sends on a timer, at any moment) are set aside up to their
+    number wherever a limit or a budget applies; the rest is held against it. An unknown count fails
+    wherever a limit applies."""
+    block = r.get("requests")
+    expect = (step or {}).get("expect") or {}
+    if block is None:
+        if "requests_max" in expect:
+            fail("requests", sid, NO_REQUEST_LOG, allowed=expect["requests_max"])
+        return
+    rec = s.get("requests") or {}
+    count = rec.get("count")
+    why = rec.get("reason") or block.get("reason") or "the run holds no count for this step"
+    by_path = rec.get("by_path") or {}
+    periodic = opts.get("periodic_requests") or {}
+    held, aside, cut = periodic_split(rec, periodic)
+    set_aside = f"; {sum(aside.values())} of a periodic kind set aside: {describe_paths(aside)}" if aside else ""
+    cut_why = (f"requests of a periodic kind could not be set aside: the run kept only the {len(by_path)} most "
+               f"frequent paths of this step's {count} requests, so a periodic one may be among those cut")
+    extra = {"set_aside": aside} if aside else {}
+    failed = applies = False
+    if rest:
+        applies = True
+        allow = (step or {}).get("allow") or {}
+        limit = allow.get("requests_max", opts["rest_requests_max"])
+        granted = "requests_max" in allow
+        by = f" by the step's allowance ({allow.get('reason')})" if granted else ""
+        gap = (f", {rec.get('in_gap')} of them in the {rec.get('gap_s')} s between the end of this rest and the next step"
+               if rec.get("in_gap") else "")
+        if count is None:
+            failed = True
+            fail("rest-requests", sid, f"requests at rest were not counted: {why}")
+        elif cut:
+            failed = True
+            fail("rest-requests", sid, cut_why)
+        elif held > limit:
+            failed = True
+            fail("rest-requests", sid, f"{_plural(held, 'request')} sent at rest "
+                 f"({describe_paths(by_path)}{gap}{set_aside}), allowed {limit}{by}", observed=held, allowed=limit,
+                 paths=by_path, **extra, **({"limit_from": "allowance"} if granted else {}))
+        elif granted and held > opts["rest_requests_max"]:
+            notes.append(f"{sid}: {held} requests sent at rest, above the limit of {opts['rest_requests_max']} that "
+                         f"would otherwise apply; passed on the step's allowance of {limit} ({allow.get('reason')})")
+    if "requests_max" in expect:
+        applies = True
+        n = expect["requests_max"]
+        if count is None:
+            failed = True
+            fail("requests", sid, f"requests were not counted: {why}", allowed=n)
+        elif cut:
+            failed = True
+            fail("requests", sid, cut_why, allowed=n)
+        elif held > n:
+            failed = True
+            fail("requests", sid, f"{_plural(held, 'request')} ({describe_paths(by_path)}{set_aside}), "
+                 f"approved at most {n}", observed=held, allowed=n, paths=by_path, **extra)
+    if applies and aside and not failed:
+        total = sum(aside.values())
+        notes.append(f"{sid}: {total} request{'s' if total != 1 else ''} of a periodic kind set aside "
+                     f"({describe_paths(aside)}), by the scenario's gate block (periodic_requests)")
 
 
 # --------------------------------------------------------------------------------------------
@@ -3873,6 +4645,8 @@ def run_row(path: str, r: dict) -> dict:
             row[f"{sid}.sec.{name}"] = count
         if "sections_all" in s:
             row[f"{sid}.sec.ALL"] = s["sections_all"]
+        if "requests" in s:
+            row[f"{sid}.requests"] = (s["requests"] or {}).get("count")
     v = r.get("video")
     if v:
         row["video.frames"] = v["frames"]
@@ -3973,8 +4747,20 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
     if trace_loss:
         notes.append("the trace lost data (" + "; ".join(trace_loss) + "); its counts are unavailable")
     else:
-        for sid in r.get("trace_uncovered_steps") or []:
-            notes.append(f"{sid}: the trace did not cover this step; its trace counts are unavailable")
+        # A run from 0.7.0 on says which steps its ftrace events covered, apart from its frame timeline.
+        sec_uncovered = r.get("sections_uncovered_steps")
+        ft_uncovered = r.get("trace_uncovered_steps") or []
+        for sid in ft_uncovered:
+            if sec_uncovered is not None and sid not in sec_uncovered:
+                notes.append(f"{sid}: the trace's frame timeline did not cover this step; its frame-timeline counts are "
+                             "unavailable")
+            else:
+                notes.append(f"{sid}: the trace did not cover this step; its trace counts are unavailable")
+        for sid in sec_uncovered or []:
+            if sid not in ft_uncovered:
+                notes.append(f"{sid}: the trace's ftrace events did not cover this step; its section counts are unavailable")
+    if r.get("frametimeline_unavailable"):
+        notes.append(f"{r['frametimeline_unavailable']}: the compositor's frame-timeline counts are unavailable, not 0")
     if r.get("sections_loss"):
         notes.append(f"{r['sections_loss']}; section counts are unavailable")
     launch = r.get("launch") or {}
@@ -4174,13 +4960,15 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                     msg = f"'{name}' was not counted: {r['sections_loss']}"
                 elif name in (r.get("sections_not_observed") or []):
                     msg = f"'{name}' never appeared in the trace for this app; the build or the platform may not emit it"
-                elif s.get("trace_covered") is False:
+                elif s.get("sections_covered", s.get("trace_covered")) is False:
                     msg = f"'{name}' was not counted: the trace did not cover this step"
                 else:
                     msg = f"'{name}' was not counted; record with --sections and list it in count_sections"
                 fail("sections", sid, msg)
             elif got > limit:
                 fail("sections", sid, f"{got} '{name}' sections, approved at most {limit}", observed=got, allowed=limit)
+        gate_requests(fail, notes, r, sid, s, step if step is not None else launch_budget(scn), opts,
+                      rest=s["kind"] == "rest")
     for sid in records:
         if sid not in order:
             notes.append(f"{sid}: in the run but not in the scenario; not checked")
@@ -4190,6 +4978,7 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
     if r.get("clock_mismatch_suspected"):
         notes.append("per-frame rows do not line up with the step marks (the device may have slept since boot); frame "
                      "timings are unreliable and the recording cannot be placed in the step windows; frame counts are not affected")
+    notes.extend(request_notes(r))
     return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
 
 
@@ -4341,7 +5130,10 @@ def compare(base_dirs: list[str], head_dirs: list[str], metrics: list[str], alph
     table = {}
     for k in keys:
         col_a, col_b = [row.get(k) for row in base], [row.get(k) for row in head]
-        if all(isinstance(v, str) or v is None for v in col_a + col_b):
+        if all(v is None for v in col_a + col_b):
+            # nothing was read on either side (a count that is unknown): never "same"
+            table[k] = {"n_base": 0, "n_head": 0, "verdict": "unknown", "reason": "missing on both sides"}
+        elif all(isinstance(v, str) or v is None for v in col_a + col_b):
             sa, sb = sorted({v for v in col_a if v}), sorted({v for v in col_b if v})
             table[k] = {"n_base": len(col_a), "n_head": len(col_b), "base": sa, "head": sb,
                         "verdict": "same" if sa == sb else "different", "reason": "set of values"}
@@ -4482,6 +5274,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="a simulator scenario with a tap by 'find': the rehearsal.json of `ui-probe rehearse`")
     r.add_argument("--rehearsal-max-age-s", default=None, metavar="N",
                    help=f"refuse a rehearsal that finished more than N seconds ago (default {REHEARSAL_MAX_AGE_S})")
+    r.add_argument("--requests", default=None, metavar="FILE",
+                   help="count the app's requests per step from this log of a running front "
+                        "(`ui-probe http-front --log` or `tls-front --log`)")
     h = sub.add_parser("rehearse", help="drive a simulator scenario once, with lookups and typing, in an app process "
                                         "that is then ended; nothing is measured")
     h.add_argument("--simulator", metavar="UDID", default=None, help="a booted iOS Simulator")
@@ -4524,6 +5319,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("proxy", help="a shaping forward proxy: latency and a rate limit per connection", add_help=False)
     sub.add_parser("tls-front", help="TLS in front of a plain local backend, for an app on the iOS Simulator",
                    add_help=False)
+    sub.add_parser("http-front", help="a plain front for a plain local backend, for an app on an Android emulator; "
+                                      "with --log it logs the requests it pipes", add_help=False)
     d = sub.add_parser("doctor", help="check the host tools, and a device if --serial or --simulator is given")
     dt = d.add_mutually_exclusive_group()
     dt.add_argument("--serial", default=None)
@@ -4535,6 +5332,10 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, str(HERE))
             import tlsfront
             return tlsfront.main(argv[1:])
+        if argv[:1] == ["http-front"]:
+            sys.path.insert(0, str(HERE))
+            import httpfront
+            return httpfront.main(argv[1:])
         if argv[:1] == ["proxy"]:
             sys.path.insert(0, str(HERE))
             import shapeproxy
@@ -4608,12 +5409,14 @@ def _dispatch(args) -> int:
                 raise ProbeError("--rehearsal and --rehearsal-max-age-s apply only with --simulator: on Android a "
                                  "lookup happens inside the run")
             validate_scenario(scn)
+        # Refused before a run folder exists: the log must be a running front's.
+        requests = check_request_log(args.requests) if args.requests is not None else None
         base = Path(args.out)
         refuse_rehearsal_folder(base)
         for i in range(1, args.runs + 1):
             rid = f"run-{i:02d}"
             if args.simulator:
-                res = run_once_sim(args.simulator, scn, base / rid, rehearsal)
+                res = run_once_sim(args.simulator, scn, base / rid, rehearsal, requests)
                 line = {"run": rid, "load": res["host"]["load1_before"]}
                 for st in res["steps"]:
                     if st["kind"] == "rest":
@@ -4623,7 +5426,8 @@ def _dispatch(args) -> int:
                         line[st["id"]] = {"signature": st.get("signature"), "ok": reply.get("ok")}
                 print(json.dumps(line), flush=True)
                 continue
-            res = run_once(args.serial, scn, base / rid, args.trace or args.sections, not args.no_video, args.sections)
+            res = run_once(args.serial, scn, base / rid, args.trace or args.sections, not args.no_video, args.sections,
+                           requests)
             line = {"run": rid, "load": res["host"]["load1_before"], "launch_ms": res["launch"]["total_time_ms"]}
             for st in res["steps"]:
                 line[st["id"]] = frame_count(st)[0]
@@ -4685,7 +5489,9 @@ def _dispatch(args) -> int:
         for k, v in out["metrics"].items():
             extra = f"median {v.get('median_base')} -> {v.get('median_head')}" if "median_base" in v else \
                     (f"{v.get('base')} -> {v.get('head')}" if "base" in v else "")
-            print(f"{v['verdict']:9s} {k:44s} {extra}  ({v['reason']})")
+            # how many values each side had: a run whose value is unknown is left out of the metric
+            print(f"{v['verdict']:9s} {k:44s} {extra}  ({v['reason']}; values: {v.get('n_base')} base, "
+                  f"{v.get('n_head')} head)")
     elif args.cmd == "zoom":
         sys.path.insert(0, str(HERE))
         import ui_video

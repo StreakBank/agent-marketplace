@@ -19,8 +19,11 @@ server authentication; not a CA; 365 days). Both are made again when either has 
 and the key 0600; a folder that is not empty and holds no marker of this tool, or a folder or key that
 others can read, is refused, never quietly changed.
 
-With --log, one JSON line per closed connection (time, duration, bytes each way) and one per backend
-connection that was refused.
+With --log, the front also reads the requests it pipes and writes one JSON line per request (its
+method and its path without the query string), per connection closed or refused, and when it starts
+listening (see httppipe.py, which this front and `ui-probe http-front` share). It offers only
+http/1.1 in ALPN, which is what keeps the requests readable. No header value, query string or body
+is logged, and no byte is changed.
 
 usage: ui-probe tls-front --port 18443 --to-port 8080 --state <dir> [--log <file>]
        ui-probe tls-front --state <dir> --ca           (print the path of ca.pem, making it if absent)
@@ -29,16 +32,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 import shutil
-import signal
 import ssl
 import stat
 import subprocess
 import sys
-import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from httppipe import Front as PipeFront, FrontError, port  # noqa: E402  (re-exported: FrontError, port)
 
 RENEW_WITHIN_S = 7 * 86400
 DAYS = 365
@@ -61,10 +64,6 @@ extendedKeyUsage = serverAuth
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature, keyEncipherment
 """
-
-
-class FrontError(RuntimeError):
-    """A condition the caller must see; exit status 2."""
 
 
 def _openssl(state: Path, *args: str) -> None:
@@ -153,86 +152,18 @@ def server_context(state: Path) -> ssl.SSLContext:
     return ctx
 
 
-class Front:
+class Front(PipeFront):
+    """TLS on 127.0.0.1:<port> with the state folder's certificate, piped to 127.0.0.1:<to_port>."""
+
     def __init__(self, port: int, to_port: int, state: Path, log_path: str | None):
-        self.port, self.to_port, self.state, self.log_path = port, to_port, state, log_path
+        super().__init__(port, to_port, log_path)
+        self.state = state
 
-    def log(self, event: dict) -> None:
-        if self.log_path:
-            with open(self.log_path, "a") as f:
-                f.write(json.dumps({"t": round(time.time(), 3), **event}) + "\n")
+    def ssl_context(self) -> ssl.SSLContext:
+        return server_context(self.state)
 
-    @staticmethod
-    async def pipe(reader, writer, counter: dict, key: str) -> None:
-        try:
-            while True:
-                data = await reader.read(65536)
-                if not data:
-                    break
-                counter[key] += len(data)
-                writer.write(data)
-                await writer.drain()
-        except (ConnectionError, ssl.SSLError, OSError):
-            pass
-        finally:
-            try:
-                if writer.can_write_eof():
-                    writer.write_eof()
-                else:
-                    writer.close()
-            except (OSError, RuntimeError):
-                pass
-
-    async def handle(self, client_reader, client_writer) -> None:
-        started = time.monotonic()
-        counter = {"up": 0, "down": 0}
-        try:
-            backend_reader, backend_writer = await asyncio.open_connection("127.0.0.1", self.to_port)
-        except OSError as exc:
-            self.log({"event": "backend-refused", "to": f"127.0.0.1:{self.to_port}", "error": str(exc)[:200]})
-            client_writer.close()
-            return
-        try:
-            await asyncio.gather(self.pipe(client_reader, backend_writer, counter, "up"),
-                                 self.pipe(backend_reader, client_writer, counter, "down"))
-        finally:
-            for w in (backend_writer, client_writer):
-                try:
-                    w.close()
-                except (OSError, RuntimeError):
-                    pass
-            self.log({"event": "closed", "duration_s": round(time.monotonic() - started, 3),
-                      "bytes_up": counter["up"], "bytes_down": counter["down"]})
-
-    async def start(self) -> asyncio.AbstractServer:
-        """Listen on the loopback address only. Returned for the caller (and the tests) to own."""
-        return await asyncio.start_server(self.handle, "127.0.0.1", self.port, ssl=server_context(self.state))
-
-    async def serve(self) -> None:
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):       # before the listening line, which callers wait for
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except (NotImplementedError, RuntimeError):
-                pass
-        server = await self.start()
-        print(f"listening on https://localhost:{self.port} -> http://127.0.0.1:{self.to_port}", flush=True)
-        try:
-            await stop.wait()
-        finally:
-            server.close()
-            await server.wait_closed()
-
-
-def port(text: str) -> int:
-    try:
-        value = int(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a port number") from None
-    if not 1 <= value <= 65535:
-        raise argparse.ArgumentTypeError(f"port {value} is outside 1 to 65535")
-    return value
+    def listening_line(self, port: int) -> str:
+        return f"listening on https://localhost:{port} -> http://127.0.0.1:{self.to_port}"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -241,7 +172,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--ca", action="store_true", help="print the path of ca.pem (making it if absent) and exit")
     ap.add_argument("--port", type=port, help="the TLS port to listen on, on 127.0.0.1")
     ap.add_argument("--to-port", type=port, help="the plain backend's port on 127.0.0.1")
-    ap.add_argument("--log", default=None, help="one JSON line per closed or refused connection")
+    ap.add_argument("--log", default=None, help="one JSON line per request read, per connection closed or refused, "
+                                                "and when the front starts listening")
     args = ap.parse_args(argv)
     if not args.ca:
         if args.port is None or args.to_port is None:
@@ -265,6 +197,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         asyncio.run(Front(args.port, args.to_port, state, args.log).serve())
+    except FrontError as exc:
+        print(f"ui-probe tls-front: {exc}", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"ui-probe tls-front: cannot listen on 127.0.0.1:{args.port}: {exc.strerror or exc}", file=sys.stderr)
         return 2

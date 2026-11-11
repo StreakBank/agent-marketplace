@@ -38,6 +38,9 @@ results. This rule adds only what the plugin deliberately does not know.
   `ui-probe proxy` with `--map-host` for a backend the emulator reaches as 10.0.2.2>, and which scenarios
   carry `find.scroll` for targets that move below the fold.
 - **Content:** <how the data a scenario sees is pinned: seed, account, fixture backend>.
+- **Request counts, if used:** <which front (`ui-probe http-front` on Android, `tls-front` on the
+  simulator), its ports and log file, how the app is pointed at it, and which scenarios run with
+  `--requests`>.
 
 ## Gate policy
 
@@ -45,6 +48,10 @@ results. This rule adds only what the plugin deliberately does not know.
 - **Blocking or advisory:** <which checks block; which only report>.
 - **Limits that differ from the defaults:** <e.g. rest CPU budget, with the reason>.
 - **Rest steps with an `allow`:** <which screens are never still by design, and who approves an allowance>.
+- **Request budgets:** <`rest_requests_max` if not 0, each scenario's `launch_requests_max` (the
+  cold start), which steps carry `expect.requests_max`, the request an app that polls by design
+  sends on a timer (`gate.periodic_requests`: name it, as the log gives it), which rests poll by design
+  (`allow.requests_max`), and who approves a change>.
 - **Approved baselines:** <where `expect` values are reviewed and who approves a change>.
 - **Timings:** <never gated here / gated only on real devices through `compare`>.
 

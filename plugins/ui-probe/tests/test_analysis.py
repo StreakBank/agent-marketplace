@@ -497,10 +497,21 @@ CLEAN_STATS = {"packets": 1, "chunks_overwritten": 0, "chunks_discarded": 0, "pa
                "writer_packet_loss": 0, "flushes_failed": 0, "final_flush": 1}
 
 
-def fake_trace(first_ts, last_ts, surface=(), truncated=False, **stats):
+def fake_trace(first_ts, last_ts, surface=(), truncated=False, frametimeline_packets=10, **stats):
     return {"packets": 10, "surface_frames": list(surface), "display_frames": [], "processes": {}, "network": {},
             "unterminated": 0, "first_ts": first_ts, "last_ts": last_ts, "truncated": truncated,
-            "stats": {**CLEAN_STATS, **stats}}
+            "stats": {**CLEAN_STATS, **stats}, "frametimeline_packets": frametimeline_packets}
+
+
+def fake_atrace(trace, begins, **info_extra):
+    """read_atrace's stand-in: the begins, and in `info` an ftrace event span equal to the trace's packet span
+    (0.7.0: sections are covered by the span of the ftrace events, which carry no packet timestamp)."""
+    def atrace(path, info=None):
+        if info is not None:
+            info.update(bundles=40, lost_bundles=0, events_first_ts=trace["first_ts"], events_last_ts=trace["last_ts"])
+            info.update(info_extra)
+        return list(begins)
+    return atrace
 
 
 def frame(ts):
@@ -516,7 +527,7 @@ class TraceCoverageAndSectionsTest(Base):
         cap = Capture(self.root, scn=scn, trace=True, sections=True)
         (cap.dir / "trace.pftrace").write_bytes(b"")
         with mock.patch.object(pftrace, "read_trace", return_value=trace), \
-                mock.patch.object(pftrace, "read_atrace", return_value=begins):
+                mock.patch.object(pftrace, "read_atrace", side_effect=fake_atrace(trace, begins)):
             run = cap.analyze()
         return cap, run
 

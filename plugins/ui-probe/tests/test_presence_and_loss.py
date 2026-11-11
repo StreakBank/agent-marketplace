@@ -305,7 +305,9 @@ class TraceLossTest(Base):
 
         def atrace(path, info=None):
             if info is not None:
-                info.update(bundles=40, lost_bundles=lost_bundles)
+                # 0.7.0: the ftrace events' own span, here the trace's packet span
+                info.update(bundles=40, lost_bundles=lost_bundles, events_first_ts=trace["first_ts"],
+                            events_last_ts=trace["last_ts"])
             return list(begins)
 
         with mock.patch.object(pftrace, "read_trace", return_value=trace), \

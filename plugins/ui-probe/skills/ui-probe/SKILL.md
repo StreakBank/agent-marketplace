@@ -1,6 +1,6 @@
 ---
 name: ui-probe
-description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rests, taps and swipes (lookups and typing there in a rehearsal); needs no changes to the app.
+description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames, CPU or network requests at rest), how many requests a step sends, whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rests, taps and swipes (lookups and typing there in a rehearsal); needs no changes to the app.
 allowed-tools:
   - Bash
   - Read
@@ -25,7 +25,7 @@ different device or build for the one asked for.
 ## The rules that decide everything
 
 1. **Counts are exact, gate them.** Frames and CPU while the screen is at rest; frames for a step
-   that waits on nothing; trace sections per step.
+   that waits on nothing; trace sections per step; requests per step, counted by a front.
 2. **Sequences are structural, gate them against an approved signature.**
 3. **Durations are statistical. Never gate a duration, and never quote one from an emulator or
    simulator as if it were a phone's.** Report the spread; use `compare` for base against head.
@@ -106,6 +106,33 @@ matched exactly; a name that occurs nowhere in the run is unknown and fails its 
 whose test run ended with an issue fails the run (check `agent`). `ui-probe tls-front` puts TLS with a throwaway CA
 (for a simulator only) in front of a plain local backend.
 
+## Counting requests
+
+The requests the app sends are counted by a front its traffic passes through, never inside the
+app: `ui-probe http-front --port <listen> --to-port <backend> --log <file>` for an Android emulator
+(the app talks plain HTTP to `http://10.0.2.2:<listen>`), or `ui-probe tls-front ... --log <file>`
+for the iOS Simulator. Start the front as its own process and wait for its `listening on` line, then
+`ui-probe run ... --requests <file>`: each step gets `requests` (a count and the 20 most frequent
+`METHOD /path`), and the gate fails a rest that sent any (`gate.rest_requests_max`, default 0;
+`allow.requests_max` with a `reason` for a screen that polls by design), a step over its
+`expect.requests_max`, and a launch over the scenario's `launch_requests_max` (the cold start's
+budget). For one known request the app sends on a timer at any moment, name it in the gate block,
+`"periodic_requests": {"GET /path/shape": 1}`: it is set aside up to that number in every step where
+a limit or budget applies, and nothing else is; never give a budget a request of slack for it. A
+rest's window runs on to the next step's start (nothing is put into the
+app in between). A count is known only when the run shows the front saw everything; otherwise it is
+unknown, never 0, and fails wherever a limit applies: no request between the launch and the end of
+the last step (the app is probably not pointed at the front), the front not running at the start or
+the end, restarted during the run, refused by the backend, or carrying a connection it could not
+read (an upgrade or a WebSocket, HTTP/2, anything not HTTP/1.x, even one opened before the run), or
+on Android a device clock that could not be mapped (or only to within more than 0.2 s). A front that
+is told to stop, restarts, or no longer accepts during or after the run makes its counts unknown;
+stop a front before starting another on the same log (it refuses a log another front writes). The
+log holds methods and the shape of each path only (a segment made only of lower-case letters, dots,
+hyphens and underscores stays, so a user name such as `alice` stays; any other is `:id`; no query
+string, header value or body), in a 0600 file. HTTP/1.x only; a streaming response is one request. Keep the front for the app under test
+alone during a run: it cannot tell clients apart.
+
 ## Reading a run
 
 1. `ui-probe gate <dir>` first. Exit 1 means a violation; exit 2 means the tool could not do its
@@ -128,6 +155,7 @@ What the at-rest checks mean when they fail:
 | the app's area changed at rest | a visible animation or content that never settles |
 | a note that recorded frames changed nothing or changed the app's area while the app presented no frame | another layer (the status bar made the display compose) or encoder noise; not a violation, `zoom` to see it. With any count above 0 they stay violations |
 | CPU at rest without frames | background work on a timer or a busy loop |
+| requests at rest | a poll, a refresh on a timer, or a retry loop against a backend that answers: the message names the paths, and how many came in the gap before the next step. Unknown counts say why (often: the app is not pointed at the front; a backend that refused the front's connection makes them unknown, so a retry loop against a backend that is down shows as unknown, not as a count) |
 | never went quiet, "the app kept drawing" | loading that does not finish, or an animation with no end |
 | never went quiet, "the display kept changing while the app was idle" | something outside the app's own frame count: a system animation, the keyboard, another window, or a surface the app draws outside its views. Read the sheet before blaming the app |
 | another app was in front | the rest window did not show the app's screen: an earlier tap left the app, a system dialog covers it, or a back press closed it. The zero it counted says nothing. Read the sheet of the step before, fix the scenario or the app, and run again |

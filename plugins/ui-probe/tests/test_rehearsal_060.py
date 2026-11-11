@@ -1333,8 +1333,8 @@ class DocsTest(unittest.TestCase):
         self.assertIn("### Validation, 0.6.0", (root / "PROVENANCE.md").read_text())
         skill = " ".join((root / "skills" / "ui-probe" / "SKILL.md").read_text().split())
         self.assertIn("ui-probe rehearse", skill)
-        self.assertEqual(u.VERSION, "0.6.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.6.0")
+        # 0.7.0: the version moved on; the manifest still names the code's version
+        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
 
 
 if __name__ == "__main__":

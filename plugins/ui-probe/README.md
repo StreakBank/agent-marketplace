@@ -4,7 +4,7 @@
 on the iOS Simulator) and records what the platform and the screen did, without anything inside the app. It answers two questions a functional test does not:
 
 - **Is the app doing work while nothing happens?** Frames drawn, CPU used and frames composed while
-  the screen is at rest.
+  the screen is at rest, and, through a front the app's traffic passes, the requests it sends.
 - **What did each step look like on the way?** The sequence of visual states a tap passes through,
   read from a screen recording: a clean transition, a transition through a skeleton or a flash, a
   flicker that leaves a state and returns to it.
@@ -16,7 +16,7 @@ text or content description. It names no app, screen, endpoint or UI framework.
 
 | Kind | What it is | What to do with it |
 |---|---|---|
-| Exact | A count that happens because the app did something: frames and CPU at rest, frames for a step that waits on nothing, trace sections per step | Gate it. Equality or a budget, no tolerance |
+| Exact | A count that happens because the app did something: frames and CPU at rest, frames for a step that waits on nothing, trace sections per step, requests per step | Gate it. Equality or a budget, no tolerance |
 | Structural | The order of visual states a step passes through (its signature) | Gate it against an approved signature |
 | Statistical | Every duration, and any count that time or the network drives (frames in a fling, in a cross-fade, in a skeleton that animates until data arrives) | Report the distribution. Never gate it on an emulator or simulator. Compare base and head with `compare` |
 
@@ -126,8 +126,11 @@ with different files is not replaced without `--force`. The scripts can also be 
 - `count_sections` is the adapter for framework knowledge: with `--sections` the probe counts the
   trace sections you name, per step. It learns nothing about the framework itself.
 - `expect` per step: `signature` (a string), `frames` and `frames_max` (integers),
-  `sections_max` (section name to integer). These are the baselines you approve; add them once a
-  screen is stable.
+  `sections_max` (section name to integer), `requests_max` (an integer; needs `run --requests`, see
+  "Counting requests"). These are the baselines you approve; add them once a screen is stable.
+- `launch_requests_max` at the top level (a whole number, 0 or more; both platforms): the budget for
+  the launch step's request count, gated as `expect.requests_max` is on a step. A cold start is the
+  budget most worth holding.
 - Fixed waits must add up to less than the recorder's 180 s limit. Split longer scenarios.
 
 More keys, one example each:
@@ -170,10 +173,14 @@ change what is gated:
   scenario's block and in a step's (where the check uses the scenario's value for a key the step
   leaves out). `until_quiet`, `meminfo` and `background` are `true` or `false`. `count_sections`
   is a list of names.
-- The `gate` block takes only `rest_frames_max` (an integer) and `rest_cpu_pct_max` (a number).
+- The `gate` block takes only `rest_frames_max` (an integer), `rest_cpu_pct_max` (a number),
+  `rest_requests_max` (an integer), `rest_updates_max` (an integer; the iOS Simulator only) and
+  `periodic_requests` (an object from a request as the front's log gives it, an upper-case method,
+  one space and a path that starts with `/`, to a whole number of at least 1; see "Counting
+  requests").
 - `allow` takes `frames_max` and `changed_frames_max` (integers), `cpu_pct_max` (a number),
   `unchanged_frames_max` (an integer of at least 1), `updates_max` (an integer; the iOS Simulator
-  only) and `reason` (required), and at least one of the limits. `find` takes `text` or `desc` (a
+  only), `requests_max` (an integer) and `reason` (required), and at least one of the limits. `find` takes `text` or `desc` (a
   non-empty string of at most 200 characters on one line, with no tab, no other control
   character, no surrogate and no character outside the Basic Multilingual Plane: the window-tree
   dump never writes those as they are, so they could never match; the error names the character),
@@ -285,11 +292,16 @@ keeps `failed.json`, and `gate` fails the run (see "Runs that did not complete")
 
 ```
 <dir>/run-01/
-  capture.json          device facts, the scenario as run, host load, the tracer's output
+  capture.json          device facts, the scenario as run, host load, the tracer's output, the request log given
   failed.json           only when the run did not complete: the error, the step if known, the time (UTC)
   device-script.sh      the exact script that ran on the device
   raw/                  what the device script wrote:
     marks.txt             step marks on the device's boot clock
+    requests.jsonl        with --requests: the front's request, unparsed, upgrade and backend-refused lines of
+                          the run (written by the host, not the device; 0600)
+    requests-meta.json    with --requests: the log's path, the byte offsets read, the window, the clock mapping,
+                          the front's pid and whether it ran at the start and the end, the connections it could
+                          not read, and why the counts are unknown when they are (0600)
     am-start.txt          the launch command's output
     gfx-<step>.txt        the platform's frame records at the end of each step (launch included)
     sf-<step>.txt         the compositor's statistics at the end of each step
@@ -368,6 +380,8 @@ exits 1 on a violation.
 | Foreground | another app's activity was the resumed one at the end of launch or of a rest step (a tap that left the app, a permission dialog, the launcher after a back press too many), or the app was in front in a rest marked `"background": true` |
 | Recording | a requested recording is missing or unusable, the recorder exited with a non-zero status or had stopped before the scenario ended, or the scenario ran past the recorder's limit |
 | Trace | a requested trace is missing |
+| Requests at rest | the run was given `--requests` and the app sent more requests in a rest step than `rest_requests_max` (default 0, or the step's `allow.requests_max`); the message names the paths. A count that is unknown fails too |
+| Requests | a step's `expect.requests_max` is exceeded, its count is unknown, or the run was given no request log ("not counted: the run was given no request log") |
 | Expectations | a step's `expect` is not met, or cannot be checked (no aligned recording for a signature, a section the app never emitted, a trace that lost data) |
 | Missing step, scenario | a step of the scenario has no record in the run, or its kind differs |
 | Analysis | a capture has no `run.json`, or one older than the capture: run `ui-probe analyze` |
@@ -549,10 +563,10 @@ on its rest (`allow.frames_max`, `allow.changed_frames_max`, `allow.updates_max`
   read in steps of 0.01 s) without `meminfo` or `background`, a `tap` with `x` and `y`, or a
   `swipe` with `from`, `to`, `ms` and `judge`; a tap or a swipe waits its `settle_ms` after the
   input (default 3000 for a tap, 2500 for a swipe, as on Android). In `expect`, a rest takes only
-  `signposts_max` and a tap or a swipe only `signature` and `signposts_max`. A swipe lasts at most
-  60000 ms (what the agent accepts), and so does a step's `settle_ms` and a `find.scroll.settle_ms`
-  (each is a wait between two commands to the agent, which ends itself after an idle limit). A tap
-  may name its target with `find` (`text` or `desc`,
+  `signposts_max` and `requests_max`, and a tap or a swipe only `signature`, `signposts_max` and
+  `requests_max`. A swipe lasts at most 60000 ms (what the agent accepts), and so does a step's
+  `settle_ms` and a `find.scroll.settle_ms` (each is a wait between two commands to the agent, which
+  ends itself after an idle limit). A tap may name its target with `find` (`text` or `desc`,
   `nth`, `timeout_ms`, `scroll`) instead of `x` and `y`; such a run needs `--rehearsal` (see "A
   rehearsal on the iOS Simulator"). Refused before anything runs, each with its own message:
   `find.package` (it names an Android window), `find_settle_ms` (a measured run looks nothing up;
@@ -713,8 +727,11 @@ speaks HTTP unless its security settings are loosened. `ui-probe tls-front --por
 --to-port <backend> --state <dir> [--log <file>]` puts TLS in front of it with no change to the
 app: it listens on 127.0.0.1 only (TLS 1.2 or newer, ALPN `http/1.1`), pipes the bytes both ways to
 127.0.0.1:<backend>, prints `listening on https://localhost:<listen> -> http://127.0.0.1:<backend>`
-once it accepts connections, and runs until it is stopped. With `--log`, one JSON line per closed
-connection (time, duration, bytes each way) and one per backend connection that was refused.
+once it accepts connections, and runs until it is stopped. With `--log`, it also reads the
+requests it pipes and writes one JSON line per request, per closed connection (time, duration,
+bytes each way, requests read) and per backend connection that was refused, and one when it starts
+listening: see "Counting requests". It offers only `http/1.1` in ALPN, and that is what makes the
+requests readable: a client that would speak HTTP/2 is given HTTP/1.1.
 
 The state folder holds a throwaway certificate authority (`ca.pem`: CA:TRUE with pathlen:0,
 critical; name constraints permitting DNS:localhost only, critical; key usage certificate signing;
@@ -733,6 +750,201 @@ not changed. `ui-probe tls-front --state <dir> --ca` prints the path of `ca.pem`
 The tool never touches a trust store. The CA is a throwaway for a simulator: it must never be added
 to a phone's or a Mac's own trust store. It shapes nothing (the proxy does that). Pass the backend's
 address to the app with `launch_env`, for example `{"API_ORIGIN": "https://localhost:18443"}`.
+
+## Counting requests: `ui-probe http-front` and `run --requests`
+
+A screen that fetches while it is at rest, or a step that fetches the same thing twice, costs
+battery and data, and no frame count shows it. The requests the app sends are counted outside the
+app, by a front its traffic already passes through, with nothing added to the app and nothing asked
+of the backend:
+
+- **Android emulator:** `ui-probe http-front --port <listen> --to-port <backend> [--log <file>]`,
+  a plain front for a plain local backend. It listens on 127.0.0.1 only, pipes the bytes both ways
+  to 127.0.0.1:<backend>, prints `listening on http://127.0.0.1:<listen> -> http://127.0.0.1:<backend>`
+  and runs until it is stopped; `--port` and `--to-port` must differ. The emulator reaches this
+  machine's loopback as `10.0.2.2`, so point the app at `http://10.0.2.2:<listen>`.
+- **Both fronts, stopping and their log.** A front told to stop (SIGTERM, SIGINT, or SIGHUP) writes a
+  `stopping` line, stops accepting, closes every connection it holds (each gets its `closed` line)
+  and exits within 2 s, whatever its clients do: an app's keep-alive connection does not keep it
+  alive. SIGHUP stops it only when SIGHUP was not ignored when it started: a front started with
+  `nohup ... &` keeps nohup's choice and outlives the shell or terminal that started it. One log,
+  one front: a front given `--log FILE` refuses to start (exit 2, before it listens) when the file's
+  last `listening` line names a running process other than itself that is a front (its command line
+  holds `http-front` or `tls-front`) whose `--log` is this same file (a relative `--log` is read
+  against that process's folder): "<FILE> is being written by another front (pid N); stop it or give
+  this one its own log". A pid that is gone, that is now some other program (after a reboot), or that
+  is a front writing another log or none is no obstacle. Stop the old front before starting a new one on the
+  same log.
+- **iOS Simulator:** `ui-probe tls-front ... --log <file>` (above), which the app reaches as
+  `https://localhost:<listen>`.
+
+Then `ui-probe run ... --requests <file>` (either platform) counts the requests per step. A count
+is known only when the run can show the front saw everything the app sent; anything else is unknown,
+never 0, and an unknown count fails every rest.
+
+**The log.** JSON, one line per event, each line one `write` appended to the file, `t` this machine's
+clock with three decimals. The front makes the file 0600 at every write, whether it existed or not:
+
+- `{"t", "event": "listening", "port", "to_port", "pid"}` once, when the front starts listening, so
+  the file exists before the first connection;
+- `{"t", "event": "request", "conn", "method", "path", "query"}` the moment a request's head is
+  complete: the **shape** of the path without its query string, at most 300 characters, and whether
+  a query was there. A path segment is written as it is only if it is made of lower-case letters,
+  dots, hyphens and underscores, starting with a letter, at most 32 characters
+  (`[a-z][a-z._-]{0,31}`), or is a version (`v1` to `v999`); any other segment is written as `:id`,
+  so `/api/v1/users/u42/profile` becomes `/api/v1/users/:id/profile`, a camelCase word such as
+  `getUser` becomes `:id` (that is the price), and a segment holding `;`, `=`, `@`, `:` or `%`
+  becomes `:id`. For a target in absolute form the rule applies after the host is removed. This is a
+  reduction, not a guarantee: a segment made only of lower-case letters, dots, hyphens and
+  underscores stays, so a user name such as `alice` stays, which is why the file is 0600. There is
+  no option to log full paths;
+- `{"t", "event": "unparsed", "conn", "why"}` once for a connection whose bytes are not HTTP/1.x
+  (an HTTP/2 preface, a head over 64 KiB, a start line or a header that does not parse, a body
+  length that cannot be read); its bytes go on being piped and it is not read again;
+- `{"t", "event": "upgrade", "conn"}` after a request that carries `Connection: upgrade` or a
+  CONNECT (logged with the path `(tunnel)`): the front stops reading that connection, whatever the
+  server answers, because it does not see the answer;
+- `{"t", "event": "closed", "conn", "duration_s", "bytes_up", "bytes_down", "requests"}`,
+  `{"t", "event": "backend-refused", "to", "error"}` and `{"t", "event": "stopping", "signal"}`.
+
+No header value, no query string and no body is ever written. The reader is a side observation:
+every byte is forwarded as it arrives and only then read, never held back, reordered or changed,
+whatever the reader concludes. It reads the start line and the headers up to the empty line, then
+the body by `Content-Length`, by chunked transfer coding (chunk sizes, extensions, trailers) or
+none, then the next request on the same connection (keep-alive, pipelining); a head or a chunk size
+may arrive split at any byte.
+
+**What a run keeps.** `run --requests <file>` refuses, before a run folder exists, a file that is
+absent, holds no `listening` line, or whose last `listening` line names a front process that is not
+running ("the front that wrote <file> is not running (pid N): start it again with --log <file>"; a
+process of another user counts as running). At the start of each run it notes where the file ends
+and whether that front is running; after the device part it checks the front again, reads what was
+appended, and keeps the `request`, `unparsed`, `upgrade` and `backend-refused` lines whose `t` lies
+in the run's window (from the launch to the end of the last step) widened by a 2 s margin, as for
+the simulator's log store. It also reads what the same front process wrote before the run (from its
+`listening` line on), to follow every connection the front stopped reading. At the end it also
+checks that the front still accepts: a TCP connection to 127.0.0.1 on the `port` of the front's
+`listening` line must be accepted within 2 s. That probe sends nothing and closes at once; on
+`http-front` (which opens a connection to the backend for it, and closes it) it leaves one `closed`
+line with no request, after the run's window, and on `tls-front` nothing (a client that left before
+its handshake). It saves `raw/requests.jsonl` and
+`raw/requests-meta.json` (the log's path, the offsets, the window, the clock mapping, the front's pid,
+whether it ran at the start and at the end and whether it accepted at the end, those connections,
+and why the counts are unknown when they are), both 0600; a run that cannot write them fails.
+`run.json` gives each step, launch included, `requests`: `{"count": N, "by_path": {"GET /x": 2,
+...}}` (the 20 most frequent `METHOD /path`), or `{"count": null, "reason": ...}`. `summary` and
+`compare` see the counts as `<step>.requests` (Android) and `<step>.sim_requests` (simulator). A run
+whose count is unknown is left out of that metric: `summary` counts only the values it has (`n`),
+and each row of `compare` shows how many values each side had ("values: 5 base, 0 head"); with none
+on one side or on both the verdict is `unknown`.
+
+**A rest runs on to the next step.** Between the end of a rest and the start of the next step the
+tool only reads counters or looks a target up, and nothing is put into the app, so a request there
+is a request at rest. For request counting, a rest's window runs from its start to where the next
+step starts (on Android its lookup's first swipe when its `find` has `scroll`, else its start; on
+the simulator the end of the rest's own recording when the next tap replays swipes, else that tap's
+start), and the last step's to the end of the run's window. The rest's `requests` adds `gap_s`, how
+long that tail was, and `in_gap`, how many of its requests fell there, and its failure says so.
+On Android the tail before a step that looks its target up is long: 5.6 to 5.7 s in the first live
+runs on an Android 14 emulator, all of it at rest.
+Every request is counted in exactly one step, or in none: requests that fell after an input step's
+window and before the next step are `between_steps` (with their paths in `between_paths`), not
+gated, and the gate notes them once per run; requests outside the run's window that no step took
+are `in_margins`, for information. The counts of the steps plus `between_steps` plus `in_margins`
+equal the requests the run kept.
+
+**Known, or unknown with the reason.** The counts of a run are unknown when: the front was not
+running at the start or at the end of the run, or no longer accepted connections at the end; it
+started listening again at any time after the run began (a `listening` line after the run's start
+offset, wherever it lies: the old front died at a time nobody knows), or its pid at the end differs
+from the one at the start; it was told to stop after the run began (a `stopping` line); it logged a `backend-refused`
+during the run (what the app sent on that connection was not read); any connection was opaque
+(from its `upgrade` or `unparsed` line until its `closed` line) at any time during the run, one that
+became opaque before the run and was still open included; no request at all lies between the
+launch and the end of the last step (a request in the margins proves nothing: the app's traffic is
+probably not going through the front); the log was cut or replaced, or holds a line since the
+front's `listening` line that is not the front's JSON; a run was given a log but kept no record of
+it; or, on Android, the clock could not be mapped (below). That last proof (one request in the run)
+is necessary, not sufficient: the front cannot tell two clients apart, so nothing else may use it
+during a run.
+
+**The step windows.** On the simulator the steps are timed on this machine's clock already. On
+Android the marks are the device's `/proc/uptime`. The device script is the same as without
+`--requests`: nothing is added to the measured path. The host reads `/proc/uptime` with `adb shell
+cat /proc/uptime` three times right before the device script starts and three times right after it
+ends, each read bracketed by its own clock, and in each group keeps the read with the shortest round
+trip; its offset is the middle of the bracket minus the uptime. The mapping is the straight line
+through the two kept reads, so a slow drift is followed. Its uncertainty is half of each round trip,
+plus 0.01 s (the resolution of `/proc/uptime`), plus the difference of the two offsets (in the first
+live runs on an Android 14 emulator the mapping was known in every run, with an uncertainty of
+0.033 and 0.037 s and offsets 0.001 and 0.005 s apart). The counts
+are unknown when a group gave no read, when the two offsets differ by more than 0.1 s plus half of
+each round trip (the emulator was paused, or a clock was set), when the uncertainty is above 0.2 s
+("adb answered too slowly"), or when the mapped launch or end of the last step falls outside the
+time this machine ran the device script (widened by the uncertainty); the reason gives the times.
+A device whose adb round trip is long (a remote or rented device) therefore cannot have its
+requests counted. Where a rest borders an input step (the launch counts as one), in either order,
+the input step takes the zone of width `u` (the uncertainty) on the rest's side and the rest's
+window shrinks by as much: a rest followed by a tap ends `u` before where it would end (the tap's
+start mark, or its lookup's first swipe), and a rest after a tap starts no earlier than the tap's
+end plus `u`. A request the clock cannot place on one side of the border is counted in the step,
+once. A step takes at most half of the rest's length (with its gap), so that two steps on either
+side of a short rest meet in its middle and never cross; between two rests, or two input steps, the
+border is the mark itself. A first or last step that is a rest is widened outward by `u`. The zone
+goes to the step because no bound on `u` keeps a tap's own request out of the rest before it: on an
+Android 11 emulator an input reaches the app 0.43 to 0.46 s after its step's start mark (`input`
+starts a runtime first), but `input tap` returned in about 0.01 s on an Android 14 emulator, where
+`input` is `cmd input`, and a certifying run there (uncertainty 0.062 s, the machine under load)
+saw two taps' own requests reach the front 10 to 26 ms after their start marks. The cost: a request
+the app sends at rest within `u` of an input step is counted in that step, where the step's budget
+(`expect.requests_max`) holds it and the rest rule does not; with `u` at 0.03 to 0.06 s and a rest
+of 5 s or more that is about 1 to 2 % of the rest. The gate says how far each rest was narrowed
+once per run when the uncertainty is above 0.1 s.
+
+**The gate.** A rest step fails (`rest-requests`) when the app sent more requests than
+`gate.rest_requests_max` (default 0) or the step's `allow.requests_max` (with its `reason`, as the
+other allowances), naming the paths. Any step with `expect.requests_max: N` fails (`requests`) above
+N, and so does the launch step above the scenario's `launch_requests_max` (the budget for the launch
+step's request count; check `requests` on step `launch`, naming the paths). When the run was given
+`--requests` and its counts are unknown, every rest step and every step with a request budget
+(`expect.requests_max`, or `launch_requests_max` for the launch) fails with the reason. When the run
+was given no request log there is no request check at all, except that a step with a request budget
+fails: "not counted: the run was given no request log". The budgets are read from the scenario kept
+with the run, so a run captured without them is gated as before.
+
+**An app that sends a request on a timer.** An app that sends one known request at any moment by
+design (a session kept alive once a minute, at a random phase) can have it fall in any step. A
+budget with one request of slack for it (`allow.requests_max: 1` on a rest, or a step's
+`expect.requests_max` raised by one) lets any new request through instead, which is the fault a
+budget exists to catch. Name it instead in the scenario's gate block:
+`"gate": {"periodic_requests": {"GET /api/v1/x/sync": 1}}`, a request as the front's log gives it
+(method, one space, the path's shape) to how many any one step may hold on the timer's account. In
+every step where a request limit or budget applies (a rest against `rest_requests_max` or its
+`allow.requests_max`, a step with `expect.requests_max`, the launch with `launch_requests_max`),
+requests of a periodic kind are set aside up to their number, and what remains (other paths, and
+the excess of a periodic one) is held against the limit or budget. A step that sends the same
+request itself (a refresh that includes it) has one of its own set aside too, so its budget is the
+count that remains. A failure still names every path it counted and gives the held number and what
+was set aside ("1 of a periodic kind set aside: GET /api/v1/x/sync x1"); a step that passed with
+requests set aside gets one note naming them and the gate block as the source, so every timer
+request shows in the gate's output (a step with no limit and no budget gets no note). Setting aside
+needs every path of the step, and `run.json` keeps only the 20 most frequent paths of a step: when
+any was cut away, a step where a limit or budget applies fails as unknown rather than guess.
+`run.json`, `summary` and `compare` keep the raw counts; `gate.json`'s `limits` shows the map when
+the scenario has one.
+
+**Limits.** HTTP/1.x only: on Android the app must talk plain HTTP to the front (the emulator
+is told nothing; point the app's backend address at it), and tls-front never offers HTTP/2. An app
+that keeps a WebSocket open, or a client that asks for an upgrade to HTTP/2 on plain HTTP, cannot
+have its requests counted by a front: every run of it is unknown. That includes a client that offers
+an upgrade to HTTP/2 on plain HTTP by itself (Java's `java.net.http` does, and curl with `--http2`).
+A backend that restarts during a run makes the run unknown too (the front logs the connections it
+refused). A streaming response (server-sent events, a long poll) is one request, however long it
+lasts. Only traffic through the front is counted: a request to any other host, or one a cache inside
+the app answered, is not seen. The front should carry nothing but the app under test during a run,
+since it cannot tell two clients apart. On Android a lookup's reads of the window tree (`find`) lie
+inside the tail of the rest before the step, so a request such a read caused in the app would be held
+against that rest.
 
 ## Input on the iOS Simulator
 
@@ -933,6 +1145,23 @@ without `--rehearsal`, and the refusal says what to run first.
   holds a rehearsal (its marker or `rehearsal.json`) or lies inside one, and `rehearse --out` one
   that holds a run at any depth or a rehearsal, or lies inside another rehearsal.
 
+## What each Android version gives
+
+- **Android 12 and newer (API 31+)**: everything above. The compositor's per-layer statistics
+  carry each layer's uid; `--trace` records the frame timeline. A trace is read exactly as 0.6.0
+  read it, also one that holds no frame-timeline packet, and also any trace from a capture that gives
+  no API level.
+- **Android 11 and older (API 30 and lower)**, when the capture gives that API level and the trace
+  holds no frame-timeline packet: no frame timeline. A `--trace` run reports the
+  frame-timeline counts (`frames_compositor`) as unavailable, never 0, with a note that the device
+  has none; `--sections` still counts trace sections, over the span the ftrace data source itself
+  recorded (see "A trace covers only the time it holds" below). The compositor's per-layer
+  statistics print no uid: a layer is the app's only when its name starts with `<package>/` or with
+  `SurfaceView - <package>/` (a name that merely holds the package is another app's). Measured on
+  an Android 11 emulator, where 0.6.0 and older read no layer and left `frames_layers` unknown, and
+  covered no step after the launch with sections: re-analysing such a capture with 0.7.0 gives
+  both.
+
 ## Known limits
 
 - **Android, and the iOS Simulator for rests, taps and swipes.** Nothing here drives a physical
@@ -946,8 +1175,20 @@ without `--rehearsal`, and the refusal says what to run first.
 - **Per-frame records hold the last 120 frames.** Keep steps short enough that fewer are drawn
   between two snapshots, or rely on the totals, which are not limited.
 - **A trace covers only the time it holds.** A trace that stopped early gives no trace counts
-  for the steps outside its span; the run lists those steps. A trace whose buffer overwrote data
-  cannot say which steps lost it, so all of its counts are dropped.
+  for the steps outside its span; the run lists those steps (`trace_uncovered_steps`, and
+  `sections_uncovered_steps` for sections). On Android 12 and later, and for any capture that gives
+  no API level, the span is that of the trace's stamped packets, for the frame timeline and for
+  sections alike, as in 0.6.0. On Android 11 and older without a frame-timeline packet, the stamped
+  packets end early (an ftrace event bundle carries no packet timestamp), so the span for sections
+  is that of the ftrace events themselves. It is widened to the ftrace data source's own run only
+  when the trace holds the data source's statistics (`FtraceStats`) exactly once for the start and
+  once for the end of the trace: their per-CPU `now_ts` are then the bounds (the latest start and
+  the earliest end) if every one of them is above 0 and the start lies before the end; statistics
+  that hold no `now_ts` let the session perfetto printed widen the events' span instead
+  (`capture.json`'s tracer output, on the same boot clock). Anything else leaves the events' own
+  span. A screen at rest emits no event, so the last event can
+  come long before the end of the last step while the data source still recorded. A trace whose
+  buffer overwrote data cannot say which steps lost it, so all of its counts are dropped.
 - **The foreground check looks at the end of a step, at launch and at rests only.** An app that
   left the foreground and returned within one step is not noticed, and a dialog the app shows in
   its own window is still the app.
@@ -965,6 +1206,15 @@ without `--rehearsal`, and the refusal says what to run first.
   an error or a signal, and the host switches them off and stops the recorder when a run fails.
 - **Timings from an emulator or simulator say nothing about a phone.** The host's processor and
   graphics stack set them.
+- **One client per front.** A front's log holds what reached it, not who sent it: a second
+  device running the app, a browser or a script that reaches the backend through the same front
+  during a run has its requests counted in that run's steps. Give each client that runs at the
+  same time a front and a log of its own, or run them one after another.
+- **A request sent at rest within the clock's uncertainty of an input step counts in that step.**
+  On Android the request windows meet where the clock cannot place a request, and the input step
+  takes that zone (see "Counting requests"): the rest rule does not see such a request, the step's
+  `expect.requests_max` does. With an uncertainty of 0.03 to 0.06 s and a rest of 5 s or more, that
+  is about 1 to 2 % of the rest.
 
 ## Project shim
 

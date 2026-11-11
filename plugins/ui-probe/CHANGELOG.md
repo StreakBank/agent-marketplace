@@ -1,5 +1,130 @@
 # Changelog — ui-probe
 
+## 0.7.0 — 2026-11-11
+
+Requests counted from outside the app, per step, by the front the app's traffic passes through. A
+count is known only when the run can show the front saw everything the app sent; anything else is
+unknown, never 0, and fails every rest.
+
+- The fronts share a module, `httppipe.py`: the byte pipe, the log, and a reader of HTTP/1.x
+  requests that observes the client's bytes after they were handed on (never holding one back,
+  reordering or changing it). `tls-front` keeps its command line, its state folder rules and its
+  messages; it moved onto the shared pipe.
+- `ui-probe http-front --port P --to-port Q [--log FILE]`: the same pipe for a plain backend, with
+  no TLS and no state folder, on 127.0.0.1 only, printing `listening on http://127.0.0.1:P ->
+  http://127.0.0.1:Q`; for an Android emulator, which reaches this machine as 10.0.2.2. `--port` and
+  `--to-port` must differ. Installed with the other scripts and reachable through the launcher.
+- With `--log`, both fronts write (one `write` per line, appended; the file is made 0600 at every
+  write, whether it existed or not) a `listening` line when they start listening (`port`, `to_port`,
+  `pid`), a `request` line the moment a request's head is complete (`conn`, `method`, the **shape**
+  of the path without its query string, cut to 300 characters, `query` true or false), an
+  `unparsed` line once for a connection that is not HTTP/1.x (an HTTP/2 preface, a head over 64 KiB,
+  a start line or a header that does not parse, a body length that cannot be read), and an
+  `upgrade` line after a request with `Connection: upgrade` or a CONNECT. A path segment is written
+  as it is only if it matches `[a-z][a-z._-]{0,31}` (lower case only) or `v[0-9]{1,3}`; any other,
+  a camelCase word included, is `:id` (after the host of an absolute-form target is removed). The `closed` line gains `conn` and `requests`;
+  `backend-refused` is unchanged. The reader handles `Content-Length`, chunked transfer coding
+  (sizes, extensions, trailers), keep-alive and pipelining, and heads and chunk sizes split at any
+  byte. No header value, query string or body is ever logged. **Changed:** a front's log now starts
+  with the `listening` line, holds request lines, where it held only `closed` and `backend-refused`
+  lines, and is 0600.
+- Both fronts stop when told to: on SIGTERM, SIGINT, or SIGHUP unless it was ignored when they started
+  (as under `nohup`), they write `{"t", "event": "stopping", "signal"}`, stop accepting, close every
+  connection they hold (each gets its `closed` line) and exit within 2 s, whatever the clients do. **Changed:** `tls-front` used to wait for its clients'
+  connections to close, so an app's keep-alive connection kept a stopped front alive, and a script
+  that restarted it left two processes writing one log. One log, one front: a front refuses to start
+  (exit 2, before it listens) on a log whose last `listening` line names another running front
+  (`ps -o command=` holds `http-front` or `tls-front`) whose `--log` resolves to the same file; a pid
+  that is gone, is another program, or is a front on another log or none is no obstacle.
+- `ui-probe run ... --requests FILE` (Android and the iOS Simulator): refused before a run folder
+  exists when FILE is absent, holds no `listening` line, or the front process its last `listening`
+  line names is not running. Each run notes where the log ends and whether the front runs; after the
+  device part it checks the front again, keeps the `request`, `unparsed`, `upgrade` and
+  `backend-refused` lines appended in the run's window (from the launch to the end of the last
+  step, 2 s margin), follows every connection the same front process stopped reading (from its
+  `upgrade` or `unparsed` line to its `closed` line, back to that process's `listening` line), and
+  checks that the front's port still accepts a TCP connection within 2 s (the probe sends nothing),
+  and saves `raw/requests.jsonl` and `raw/requests-meta.json` (path, offsets, window, clock mapping,
+  the front's pid and state at the start and the end, whether it accepted at the end, those
+  connections, reason), both 0600; a run that cannot write them fails. `capture.json` records
+  `requests_log`.
+- Android: the device script is unchanged (byte for byte the same as 0.6.0's). The host reads the
+  device's `/proc/uptime` through `adb shell` three times before the device script and three times
+  after it, keeps the read with the shortest round trip in each group, and maps uptime to its own
+  clock by the straight line through the two. Its uncertainty (half of each round trip, plus 0.01 s,
+  plus the difference of the two offsets) is a zone at each border between a rest and an input step
+  (the launch counts as one), in either order: the input step takes the zone, at most half of the
+  rest's length with its gap (between two rests, or two input steps, the mark is the border), so that
+  every request is counted in one step at most. The zone goes to the step because an input can reach
+  the app about 0.01 s after its step's start mark on Android 14 (0.43 to 0.46 s on Android 11): a
+  certifying run counted two taps' own requests in the rests before them when the rest took it. A
+  request sent at rest within the uncertainty of an input step is therefore counted in the step
+  (about 1 to 2 % of a 5 s rest). Unknown when a group has no read, the offsets differ by more than
+  0.1 s plus half of each round trip, the uncertainty is above 0.2 s (a device with a long adb round
+  trip cannot have its requests counted), or the mapped launch or end of the last step lies outside
+  the time this machine ran the device script.
+- `run.json`: each step, launch included, gets `requests` (`count` and the 20 most frequent
+  `METHOD /path` in `by_path`, or `count` null with its `reason`; a rest also `gap_s` and `in_gap`),
+  and the run a `requests` block (known, reason, totals, `between_steps` and `between_paths`,
+  `in_margins`, the front, the clock). A rest's request window runs on to where the next step starts
+  putting anything into the app, and for the last step to the end of the run's window; the counts of
+  the steps plus `between_steps` plus `in_margins` equal the requests kept. Counts are unknown when
+  the front was not running at the start or the end, no longer accepted at the end, started listening
+  again at any time after the run began, changed its pid, was told to stop after the run began,
+  logged `backend-refused` during the run, or carried a
+  connection it could not read at any time during the run (one opened before it included); when no
+  request lies between the launch and the end of the last step; when the log was cut or replaced or
+  holds a line since the front's `listening` line that is not its JSON; when a run given a log kept
+  no record of it; and, on Android, when the clock could not be mapped. `summary` and `compare` see
+  `<step>.requests` (Android) and `<step>.sim_requests` (simulator) as numbers; a run whose count is
+  unknown is left out of that metric. **Changed:** `compare` of a metric with no value on either side
+  now says `unknown` ("missing on both sides"), where it said `same`, and each printed row of
+  `compare` now ends with how many values each side had ("values: 5 base, 0 head").
+- The gate: a rest with more requests than `gate.rest_requests_max` (new, default 0) or its
+  `allow.requests_max` (new, with the step's `reason`) fails as `rest-requests`, naming the paths and
+  how many came in the gap before the next step; any step over `expect.requests_max` (new) fails as
+  `requests`, and so does the launch over the scenario's `launch_requests_max` (new, top level, a whole
+  number of 0 or more, both platforms: the budget for the launch step's request count, read from the
+  scenario kept with the run). With a request log and unknown counts, every rest and every step with
+  a request budget fails with the reason. Without a request log there is no request check, except
+  that a request budget fails "not counted: the run was given no request log". For an app that sends
+  a request on a timer, `gate.periodic_requests` (new: a request as the log gives it, "METHOD
+  /path", to a whole number of at least 1) sets requests of that kind aside up to their number in
+  every step where a request limit or budget applies (a rest, `expect.requests_max`,
+  `launch_requests_max`); what remains is held, a failure names what was set aside, a passing step
+  gets a note naming it, and such a step whose `by_path` was cut to the 20 most frequent paths fails
+  as unknown. `run.json`, `summary` and `compare` keep the raw counts; `gate.json`'s `limits` shows
+  the map only when the scenario has it. On the
+  iOS Simulator `expect.requests_max` is accepted on rests, taps and swipes. Notes for requests
+  between steps (after an input step's window) and for a clock uncertainty above 0.1 s.
+- **`gate.json`:** every run's `limits` now holds `rest_requests_max` (0 unless the scenario's gate
+  block sets it). Runs captured before 0.7.0 hold no request counts and gate exactly as before
+  otherwise (checked: the gate's text, exit status and JSON for 846 saved captures of 0.1.0 to
+  0.6.0, 381 of them on a simulator, in 451 folders, equal under 0.6.0 as released and this version
+  apart from that key).
+- **Behaviour change, Android 11 and older:** re-analysing a capture from Android 11 or older with
+  0.7.0 gives per-layer frames (`frames_layers`) and section coverage where older versions gave
+  none. Nothing changes for Android 12 and later, nor for a capture that gives no API level: the new
+  rules below apply only when the capture gives an API level below 31 and the trace holds no
+  frame-timeline packet.
+  - Sections: every step of a `--sections` run had failed `[sections]` with "the trace did not cover
+    this step", because the covered span came from stamped packets only and an ftrace event bundle
+    carries no packet timestamp. Without a frame timeline the span is now that of the ftrace events
+    themselves (`read_atrace` reports it), widened only when the trace holds the ftrace data
+    source's statistics (`FtraceStats`) exactly once for the start and once for the end of the trace
+    (`read_trace` reports them): their per-CPU `now_ts` are then the bounds when every one is above 0
+    and the latest start lies before the earliest end, or, in statistics without one, the session
+    perfetto printed. Anything else leaves the events' own span.
+    `run.json` gives `sections_span_s`, `sections_span_from`, per step `sections_covered`, and
+    `sections_uncovered_steps`.
+  - A trace with no frame-timeline packet (`read_trace` now counts them) reports the frame timeline
+    as unavailable (`frametimeline` null, `frametimeline_unavailable`, `frames_compositor` and
+    `trace_covered` null, no `compositor-trace` source) with a note naming the device's API level,
+    never 0 frames.
+  - Per-layer frames: `--timestats` there prints no `uid = ` line and the parser split the layers on
+    it. A record now also starts at its `layerName = ` line, with an unknown uid, and such a layer is
+    the app's only when its name starts with `<package>/` or `SurfaceView - <package>/`.
+
 ## 0.6.0 — 2026-11-11
 
 A rehearsal on the iOS Simulator: lookups and typing in an app process that is thrown away, and

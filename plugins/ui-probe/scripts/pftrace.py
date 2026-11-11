@@ -9,6 +9,7 @@ data source; knows nothing about any particular app.
 """
 from __future__ import annotations
 
+import struct
 import sys
 from collections import defaultdict
 
@@ -16,6 +17,7 @@ from collections import defaultdict
 F_FTRACE_EVENTS = 1
 F_PROCESS_TREE = 2
 F_TIMESTAMP = 8
+F_FTRACE_STATS = 34
 F_TRACE_STATS = 35
 F_FRAME_TIMELINE_EVENT = 76
 F_NETWORK_PACKET = 88
@@ -108,6 +110,21 @@ def buffer_loss(stats: bytes) -> dict:
     return out
 
 
+def ftrace_phase(stats: bytes) -> tuple[int | None, list[int]]:
+    """One FtraceStats message: its phase (1 start of trace, 2 end of trace) and the `now_ts` of each of
+    its per-CPU statistics, in nanoseconds on the trace clock. Field numbers: FtraceStats{phase=1,
+    cpu_stats=2}, FtraceCpuStats{now_ts=7 (a double, in seconds)}."""
+    phase, now = None, []
+    for f, w, v in fields(stats):
+        if f == 1 and w == 0:
+            phase = v
+        elif f == 2 and w == 2:
+            for cf, cw, cv in fields(v):
+                if cf == 7 and cw == 1:
+                    now.append(int(round(struct.unpack("<d", cv.to_bytes(8, "little"))[0] * 1e9)))
+    return phase, now
+
+
 def jank_names(mask: int) -> list[str]:
     if mask == 0:
         return ["Unspecified"]
@@ -116,9 +133,16 @@ def jank_names(mask: int) -> list[str]:
 
 def read_trace(path: str) -> dict:
     """Return {'surface_frames': [...], 'display_frames': [...], 'processes': {pid: cmdline},
-    'network': {uid: {'packets': n, 'bytes': n}}, 'first_ts', 'last_ts', 'truncated', 'stats'}.
-    Timestamps are nanoseconds on the trace clock; first_ts and last_ts are the earliest and latest
-    packet timestamps (None in a trace without any), the span the trace actually holds.
+    'network': {uid: {'packets': n, 'bytes': n}}, 'first_ts', 'last_ts', 'truncated', 'stats',
+    'frametimeline_packets'}. Timestamps are nanoseconds on the trace clock; first_ts and last_ts are
+    the earliest and latest packet timestamps (None in a trace without any), the span the trace
+    actually holds. A packet of ftrace events carries no packet timestamp (its events carry their
+    own: see read_atrace), so it is not in that span. frametimeline_packets counts the packets of the
+    frame timeline: none on a device without one (Android 11 and older). 'ftrace_stats' says whether
+    the ftrace data source wrote its statistics at the start and at the end of the trace (FtraceStats,
+    phases 1 and 2, written by the data source itself; they carry no packet timestamp): how many of
+    each, and every per-CPU `now_ts` of each phase (nanoseconds), from which the caller decides
+    whether they bound anything.
 
     'stats' holds the service's own data-loss counters (see buffer_loss), each the largest value
     over the trace's statistics packets (they are cumulative), and 'packets', how many statistics
@@ -132,6 +156,8 @@ def read_trace(path: str) -> dict:
     net = defaultdict(lambda: {"packets": 0, "bytes": 0})
     pkts, truncated = packets(data)
     first_ts = last_ts = None
+    ftl_packets = 0
+    fstats = {"start_packets": 0, "end_packets": 0, "start_now_ns": [], "end_now_ns": []}
     stats = {"packets": 0, "chunks_overwritten": 0, "chunks_discarded": 0, "patches_failed": 0,
              "writer_packet_loss": 0, "flushes_failed": 0, "final_flush": None}
     for pkt in pkts:
@@ -152,6 +178,14 @@ def read_trace(path: str) -> dict:
                     stats[key] = max(stats[key], one[key])
                 if one["final_flush"] is not None:
                     stats["final_flush"] = one["final_flush"]
+            elif f == F_FTRACE_STATS and w == 2:
+                phase, now = ftrace_phase(v)
+                if phase == 1:
+                    fstats["start_packets"] += 1
+                    fstats["start_now_ns"].extend(now)
+                elif phase == 2:
+                    fstats["end_packets"] += 1
+                    fstats["end_now_ns"].extend(now)
             elif f == F_PROCESS_TREE and w == 2:
                 for pf, pw, pv in fields(v):
                     if pf == 1 and pw == 2:  # ProcessTree.processes
@@ -174,6 +208,7 @@ def read_trace(path: str) -> dict:
                 net[uid]["bytes"] += length
         if ftl is None:
             continue
+        ftl_packets += 1
         for ef, ew, ev in fields(ftl):
             if ew != 2:
                 continue
@@ -211,7 +246,7 @@ def read_trace(path: str) -> dict:
     return {"packets": len(pkts), "surface_frames": surface, "display_frames": display,
             "processes": processes, "network": {str(k): v for k, v in net.items()},
             "unterminated": len(open_frames), "first_ts": first_ts, "last_ts": last_ts, "truncated": truncated,
-            "stats": stats}
+            "stats": stats, "frametimeline_packets": ftl_packets, "ftrace_stats": fstats}
 
 
 def read_atrace(path: str, info: dict | None = None) -> list[dict]:
@@ -223,13 +258,17 @@ def read_atrace(path: str, info: dict | None = None) -> list[dict]:
     PrintFtraceEvent.buf=2.
 
     If info is given it receives 'bundles' and 'lost_bundles': how many event bundles the trace
-    holds and how many of them report that the kernel dropped events before them."""
+    holds and how many of them report that the kernel dropped events before them; and
+    'events_first_ts' and 'events_last_ts': the earliest and latest time of any ftrace event in
+    them, print or not (None when there is none). Event bundles carry no packet timestamp, so these
+    are the times the ftrace data source is known to have been recording."""
     with open(path, "rb") as fh:
         data = fh.read()
     out = []
     stacks: dict[int, list[dict]] = {}
     events = []
     bundles = lost = 0
+    ev_first = ev_last = None
     for pkt in packets(data)[0]:
         for f, w, v in fields(pkt):
             if f != F_FTRACE_EVENTS or w != 2:
@@ -245,6 +284,8 @@ def read_atrace(path: str, info: dict | None = None) -> list[dict]:
                 for ef, ew, ev in fields(bv):
                     if ef == 1 and ew == 0:
                         ts = ev
+                        ev_first = ev if ev_first is None else min(ev_first, ev)
+                        ev_last = ev if ev_last is None else max(ev_last, ev)
                     elif ef == 2 and ew == 0:
                         tid = ev
                     elif ef == 3 and ew == 2:
@@ -268,7 +309,7 @@ def read_atrace(path: str, info: dict | None = None) -> list[dict]:
                 row = st.pop()
                 row["dur"] = ts - row["ts"]
     if info is not None:
-        info.update(bundles=bundles, lost_bundles=lost)
+        info.update(bundles=bundles, lost_bundles=lost, events_first_ts=ev_first, events_last_ts=ev_last)
     return out
 
 
