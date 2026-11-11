@@ -110,12 +110,13 @@ class InputScenarioTest(unittest.TestCase):
 
     def test_refusals(self):
         one = lambda st: {**INPUT_SCN, "steps": [st]}
-        lookup = "a lookup or typing reads the app's accessibility tree, which changed the app at rest when measured, so " \
-                 "this version takes positions as fractions"
-        self.reject(one({"id": "f", "do": "tap", "find": {"text": "Go"}}), f"step 'f': 'find' is refused on the iOS "
-                                                                           f"Simulator: {lookup}")
-        self.reject(one({"id": "x", "do": "text", "text": "abc"}), f"step 'x': a 'text' step is refused on the iOS "
-                                                                    f"Simulator: {lookup}")
+        # 0.6.0: 'find' is accepted (replayed from a rehearsal, see test_rehearsal_060); typing is refused in a run
+        u.validate_scenario(one({"id": "f", "do": "tap", "find": {"text": "Go"}}), u.SIM_PLATFORM)
+        self.reject(one({"id": "x", "do": "text", "text": "abc"}),
+                    "step 'x': a 'text' step is refused in a measured run on the iOS Simulator: a field that has had focus "
+                    "changes the app for the rest of its life, so a measured run never types: put the typing in a "
+                    "scenario of its own and drive it with `ui-probe rehearse` (for example to sign in before the "
+                    "measured scenarios)")
         self.reject(one({"id": "k", "do": "key", "code": 4}), "step 'k': a 'key' step is refused on the iOS Simulator: a "
                     "simulator has no keys to press; tap the screen's own control or swipe from the edge")
         self.reject(one({"id": "t", "do": "tap", "x": 0.5, "y": 0.5, "until_quiet": True}),
@@ -185,13 +186,18 @@ class CacheKeyTest(unittest.TestCase):
                                  "AgentUITests/AgentUITests.swift"})
         swift = (u.AGENT_DIR / "AgentUITests" / "AgentUITests.swift").read_text()
         code = "\n".join(l for l in swift.splitlines() if not l.strip().startswith("//"))
-        # no lookup, no typing, no read of the app under test but its state; loopback only; a token
-        for banned in ("typeText", "descendants", "matching(", ".label", "staticTexts", "buttons", "keys", "app.frame",
-                       "app.tap", "app.coordinate"):
-            self.assertNotIn(banned, code, banned)
-        self.assertEqual([l.strip() for l in code.splitlines() if "app." in l and "XCUIApplication" not in l],
+        # 0.6.0: reads of the app under test and typing exist only behind the rehearsal mode. Outside the
+        # rehearsal-only functions, nothing reads the app but its state; input goes through the system app.
+        handle = code[code.index("private func handle("):code.index("private func rect(")]
+        served = code[:code.index("private func rect(")]
+        for banned in ("typeText", "descendants", "matching(", ".label", "staticTexts", "buttons", "snapshot()",
+                       "app.frame", "app.tap", "app.coordinate"):
+            self.assertNotIn(banned, served, banned)
+        self.assertEqual([l.strip() for l in served.splitlines() if "app." in l and "XCUIApplication" not in l],
                          ['return ["ok": true, "app_state": Int(app.state.rawValue), "screen": [Double(screen.width), '
-                          'Double(screen.height)]]'])
+                          'Double(screen.height)],'])
+        self.assertIn('lookups = env["UI_PROBE_AGENT_LOOKUPS"] == "1"', code)
+        self.assertIn('case "find", "type", "labels":\n            guard lookups else {', handle)
         for needed in ('inet_addr("127.0.0.1")', 'env["UI_PROBE_AGENT_TOKEN"]', '(obj["token"] as? String) != token',
                        "UI_PROBE_AGENT_IDLE_S", "lastCommand", '"ok": false'):
             self.assertIn(needed, code, needed)
@@ -453,13 +459,12 @@ class DocsAndInstallTest(unittest.TestCase):
                        "permitting DNS:localhost only", "The CA's key is deleted as soon as the certificate is signed",
                        "a folder that is not empty and unmarked is refused",
                        "On a simulator the app's frame counts come from its log store",
-                       "There are no lookups and no typing on a simulator in this version"):
+                       "A measured run never looks an element up and never types"):
             self.assertIn(phrase, readme, phrase)
         self.assertIn("## 0.5.0", (root / "CHANGELOG.md").read_text())
         skill = " ".join((root / "skills" / "ui-probe" / "SKILL.md").read_text().split())
-        self.assertIn("There are no lookups and no typing there", skill)
-        self.assertEqual(u.VERSION, "0.5.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.5.0")
+        self.assertIn("A measured run never looks up and never types", skill)
+        # the version itself is checked by test_rehearsal_060 (0.6.0)
 
     @unittest.skipUnless(shutil.which("sh"), "no sh")
     def test_install_copies_the_agent_beside_the_scripts(self):

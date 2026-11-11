@@ -16,6 +16,7 @@ nothing is fetched at run time.
 | The trace's own loss counters | `pftrace.buffer_loss` | Perfetto `protos/perfetto/common/trace_stats.proto` at v59.1: `TraceStats` (buffer_stats = 1, flushes_failed = 14, final_flush_outcome = 15) and `BufferStats` (chunks_overwritten = 3, chunks_discarded = 18, trace_writer_packet_loss = 19). The definitions describe the first two as "loss of data" |
 | The resumed-activity line of `dumpsys activity activities` | `ui_probe.parse_foreground` | Android platform, `frameworks/base/services/core/java/com/android/server/wm/`; the line is matched by any of three names it has carried, and the component is read from the `ActivityRecord{...}` text. Format confirmed on API 34 only |
 | Per-frame timestamp track in a `screenrecord` file | `ui_video.recorder_timestamps` | Android platform, `frameworks/av/cmds/screenrecord/`; layout confirmed against a capture on API 34 (255 timestamps for 255 frames). The platform source describes the values as system time in the elapsed-realtime clock, the clock of the step marks |
+| An installed app's `Info.plist` on the iOS Simulator | `ui_probe.app_identity` | Apple's Information Property List keys `CFBundleShortVersionString`, `CFBundleVersion` and `CFBundleExecutable` (Bundle Resources documentation), read with Python's `plistlib` (binary or XML) from the path `xcrun simctl get_app_container` prints; checked by the unit tests on a binary plist they write, not yet against a real simulator's bundle |
 
 Field numbers in `pftrace.py` were read from the published protobuf definitions, not recalled.
 
@@ -260,6 +261,74 @@ listener on the port; two runs at once, and the build lock under two real builds
 the tool (read by hand once: no drawables, 62 commits against 110 recorded frames on a tap, since the render
 server animates without the app, so its count at rest is its commits); a software keyboard (the simulator had a
 hardware keyboard connected) and any typed text; an iPad; landscape; another Xcode or iOS version.
+
+### Validation, 0.6.0
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-11 | Unit tests | macOS (Python 3.12.8), `python3 -B -m unittest discover -s plugins/ui-probe/tests -q` | 633 tests pass (the run printed `Ran 633 tests` and `OK`); none runs the real `xcodebuild`, `xcrun` or `ps` (the stand-ins of 0.5.0, whose agent now also serves `find`, `type` and `labels` when started with `TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS=1`) |
+| 2026-11-11 | The lookup rule | an agent object in the test process with a fake clock: found after two reads that agree, a read with no match first, a match that moves, a match first seen at the timeout, two matches without `nth`, `nth` counted from one in the order of the tree, a match off the screen, a match on the screen that the hit test says a tap would not reach (with and without the `under` hint, and `moved` and `not_asked` told apart), a match with a `visible` part, scrolling that reaches it and that runs out, more matches than listed, a `find` or a scroll swipe the agent refused | each behaves as Android's `find_el` does for the same reads, with the statuses and messages built as `lookup_failure` builds them |
+| 2026-11-11 | `rehearse` and `run --rehearsal` end to end | the stand-ins on PATH, a binary `Info.plist` and an executable written by the test | `rehearsal.json`'s content (no typed text in any file of the folder, the agent's log included: the stand-in agent writes XCTest's typing lines; the result bundle and derived data removed when the scenario types, whatever the test run's status), the commands in order, the agent's mode at the first `ping` in both commands, the app launched before the agent starts in a rehearsal and its settle counted from the launch, the app terminated and its process checked after a rehearsal that succeeded, one that failed and one whose agent did not start, each refusal of `run` (digest, udid, a step not covered, an app that changed or whose identity cannot be read, too old, a screen of another size), the rehearsal's swipes sent before the step's recorder starts and then the tap, a replayed swipe the agent refused gated as `input`, `resolved` in `run.json`, the gate's note, and rehearsal folders passed over by `gate` and `summary` behave as designed. No simulator was touched |
+| 2026-11-11 | That the new tests can fail | 91 mutants (and four more on the encoder-frame limit, all red), one exact replacement each in a copy of the plugin, then `test_rehearsal_060.py` (or the class named for the mutant): the lookup rule (on the screen, covered, two reads, exactly one, `nth`, the grace read, the swipe limit, the listed matches), the agent's mode and its environment, the screen size, the replay and its order, the gate's check and note, `resolved` in the analysis, each check of `run --rehearsal`, the app's termination and the process check, the typed text kept out of `rehearsal.json` and `lookup-failed.txt`, the two validation modes, `find.package` and `find_settle_ms`, the refusals of both commands, the rest's cap, the typed count, `lookup-failed.txt` and the `labels` read, the rehearsal folder's marker, its skipping, the gate's notes and the refusals of each folder kind, and the rehearsal's order (the app launched before the agent starts, the settle not cut short, the app terminated when the agent fails to start), and fix round 1 (the hit-test verdict, the match named first, `visible` recorded, the agent log's rewrite, the result bundle's removal, element values left out, the note in `failed.json`, the simulator's wording for a value that cannot be matched, `moved` and `under` in the message), and `allow.unchanged_frames_max` (applied on each platform, its note on each, its validation, its place among the allowances, not reached by `frames_max`), and the review's fixes (a rehearsal marker in an ancestor, runs at any depth, no silent skip of a run inside a rehearsal folder and the rehearsal's own `raw/` excused, the full rest, a replayed tap that changed nothing and its `-` signature, an unusable recording, the bundle digest with its paths, its links not followed and an unreadable bundle, both waits bounded, both idle limits, the refusal before the folder, the app in front after the launch and after each step) | 89 turned a test red; two could not be applied as written (one anchor occurred twice, one not at all) and, applied again with a corrected anchor, turned a test red too; one mutant turned another test red while its own test skipped itself; with the test's guard fixed, its own test went red too |
+
+Not validated by these tests, and validated live below: the agent's `find`, `type` and `labels` on a
+simulator; what XCTest's hit test says on real screens; a real bundle read through `xcrun simctl
+get_app_container`; a replayed tap landing on the element it was found for.
+
+### Live validation, 0.6.0
+
+2026-11-11, on an iOS 26.1 simulator of an iPhone 16e with Xcode 26.3, against a debug build of an
+app that draws its own surface through Metal and emits signposts when asked to, reaching a backend
+on the same machine through `tls-front`; and against a faulty build of it that redraws an element
+behind zero alpha every frame. An independent reviewer read the whole change. Its nine findings (a
+run written inside a rehearsal folder vanished from `gate`; a rehearsal that capped its rests could
+look a target up on a screen still loading; a sentence that said signatures verified every replayed
+tap; an app identity that covered only the versions and the executable; an idle limit that left out
+the waits around scroll swipes; a refusal that left a folder behind; a rehearsal that never checked
+the app was in front; a `truncated` flag set when nothing was left out; a typed character in the
+text of an XCTest issue) were fixed before release.
+
+Three things were changed on what the simulator showed.
+
+- **What a tap would reach.** A first rule read it from the tree (an element later in the tree
+  over the target's centre). It called a Back button covered by text that had scrolled under the top
+  bar, and stopped a full run. A second (the part of the frame that the ancestors' frames leave) was
+  wrong on a screen whose framework reports some frames cut under a floating bar. XCTest's own hit
+  test was right in 19 of 20 cases on two screens (a top bar over scrolled content, a floating tab
+  bar, elements scrolled out); its one error was a button cut by the lower edge of its scrolling
+  area, whose centre lay outside the part on the display. The agent now asks the hit test, and moves
+  the tap point into the part that the scrolling area leaves.
+- **The order of the app and the agent.** When the agent first met an earlier process of the app,
+  its first read of the tree after a relaunch waited 63 s (three reproductions; a new application
+  object per read changed nothing). A rehearsal launches the app first and starts the agent after.
+- **How many frames the encoder may add to a still screen.** The excuse allowed two. In the
+  certifying batch two rest windows of a clean build held three, with every count zero, and failed
+  their runs. Across 523 still rest windows in four batches, 52 held such frames: 32 one, 18 two,
+  2 three (12 to 17 levels, 19 to 190 pixels, none in a flat area). The limit is now 6. The suite
+  and four mutants of that rule were run on the change, and all four turned a test red.
+
+The rows below were run with the released code. Where a row says "captured earlier", the
+recordings were made by the code as it stood before that last change, which is read only when a
+run is gated, and they were gated again with the released code.
+
+| What | Against | Result |
+|---|---|---|
+| Lookups by label in a rehearsal | ten rehearsals in one batch: nine scenarios and a sign-in (captured earlier) | 47 taps found by text or description, each after 2 or 3 reads of the tree that agreed, in 415 to 2512 ms; 4 scroll swipes brought a target clear of a bar; a rehearsal took 34 to 88 s, its rests at full length |
+| Typing | the sign-in: a phone number and a code, 10 and 6 characters, into the field with keyboard focus, with the software keyboard up (captured earlier) | both accepted by the app (the next lookup only succeeds for a signed-in user); 1.4 and 1.7 s a character. The kept folder holds neither text: `rehearsal.json` gives the two counts, the 16 typing lines of the agent's log are rewritten, and the result bundle and derived data are gone |
+| What a rehearsal leaves in the app | the app relaunched after the rehearsal's process was thrown away, signed in (captured earlier) | 199 of 200 rest windows without an allowance are zero on every count (drawables, commits, display updates, three signposts), 0.0% to 1.2% of one core; the one that is not is the app's own doing (below). In a process that was read, the same app keeps a display link running at rest (measured for 0.5.0) |
+| Replayed positions | 55 runs of eleven scenarios in blocking mode, 26 signatures as baselines (captured earlier) | 185 taps and 20 scroll swipes replayed by position, a tap in 346 to 478 ms; none failed `input`; the approved signature held on 130 of 130 steps, and 80 further steps (first openings, classed `TD` or varying) changed the screen every time |
+| The gate on those runs | the same 55 runs, gated with the released code | 54 pass. One fails `rest-updates` alone: after a pull on one list the app was woken for 123 display updates in the 5 s rest, with no frame drawn (the pull's own window held 211, against 129 to 138 in the 19 other pulls of that scenario in two batches). That is the app, found by this run. Gated with the limit of two, two more failed on three encoder frames each |
+| A rest that draws by design | a focused text field: one rest in five runs (captured earlier), and one run of the same rest without its allowance | 30 frames drawn and 70 display updates in every window, 30 to 32 recorded, 13 to 15 of them a visible change and 15 to 19 none, 1.8% to 2.4% of one core: passes on `frames_max`, `changed_frames_max`, `unchanged_frames_max`, `updates_max` and `cpu_pct_max` set just above. Without the allowance it fails on each of them |
+| A faulty build through the same replay | the build that redraws every frame, eleven scenarios, one run each, rehearsed and signed in the same way | every run fails; 41 of 41 rest steps fail (300 to 303 drawables and display updates in 5 s, 11% to 27% of one core), the focused-field rest on 301 draws against its 34; no signature and no `input` failure, so every replayed tap landed |
+| What `run` refuses | a scenario with `find` and no rehearsal; the rehearsal of another scenario; a rehearsal older than `--rehearsal-max-age-s` | exit 2 each, with the reason, before a run folder exists |
+| The app's identity | a rehearsal, then another build of the app installed, then the first build installed again | with the other build `run` refuses the rehearsal (exit 2, no folder) and names the sha256 of the executable then and now; with the first build back it accepts the rehearsal again, so installing a build again leaves its bundle digest as it was |
+| A lookup that cannot succeed | a label that is on no screen; a label that is on the screen under a floating bar | the rehearsal stops with exit 2: `not_found` after 13 reads, with `lookup-failed.txt` listing what the screen held, and the app no longer running; and "a tap would not reach it", naming as a hint what lies over the target |
+| Signals | SIGTERM in the middle of a rehearsal | exit 143, `failed.json` names the signal, and no agent, runner app, status-bar override or app process is left |
+| Earlier versions' runs | ten folders of runs saved by 0.2.0, 0.3.0 and 0.5.0, six from Android and four from a simulator, four that pass and six that fail, gated by 0.5.0 and by this version | `gate` prints the same and exits the same on all ten; its JSON differs in the version only |
+
+Not validated on a simulator: an app that moved to the background during a rehearsal (held by unit
+tests; not provoked); `nth`; a target that needs more than one scroll swipe; two rehearsals at once; a
+simulator with a hardware keyboard connected; an iPad; landscape; another Xcode or iOS version.
 
 ## Pinned external tool (optional)
 

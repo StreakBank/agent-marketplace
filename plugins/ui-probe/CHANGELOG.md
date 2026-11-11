@@ -1,5 +1,80 @@
 # Changelog — ui-probe
 
+## 0.6.0 — 2026-11-11
+
+A rehearsal on the iOS Simulator: lookups and typing in an app process that is thrown away, and
+the positions found replayed by coordinate in the process that is measured.
+
+- `ui-probe rehearse --simulator <udid> --scenario <file> --out <dir>` launches the app, then starts
+  the input agent for a rehearsal (`TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS=1`; the agent's first read of the app ties its later
+  reads to the process running then, so the app comes first) and drives the scenario once: a tap with
+  `find` is looked up by the Android rule (exactly one match on the screen without `nth`, the nth
+  in the order of the tree with it, the same frame in two reads in a row, `find.timeout_ms`,
+  `find.scroll`, the statuses `found`, `not_found`, `not_visible` and `unstable`), where a match
+  counts only when part of it is on the display and XCTest's hit test says a tap would reach it,
+  and the tap goes to the middle of the part on the display (moved into the part a scrolling area
+  leaves when the middle is cut off); a `text` step
+  types into the field with keyboard focus; rests wait their full `ms`, so a lookup reads the screen
+  the run will tap; after the launch settle and after every step the app must be in front (state
+  4), recorded per step. A simulator that is not booted or an app not installed is a refusal that
+  leaves no folder. Nothing is recorded,
+  measured or gated. A failed lookup writes `lookup-failed.txt` with the matches of the last read
+  and the app's labelled elements (no element value when the scenario types). When the scenario
+  types, the agent's log is rewritten without the typed characters and its result bundle and
+  derived data are removed. However it ends, the app is terminated and its process must be
+  gone within 5 s. On success `rehearsal.json` holds the scenario's digest, the udid, the screen
+  size, the app's identity (version, build, the sha256 of its executable and a digest of every file
+  in the bundle: sorted relative paths with each file's sha256, a link by its target text), the
+  finish time and,
+  per step, the match used, its centre and the swipes made; for a `text` step only the number of
+  characters typed.
+- `ui-probe run --simulator ... --rehearsal <file> [--rehearsal-max-age-s N]`: a simulator scenario
+  may hold taps with `find`, and such a run needs a rehearsal. Before the first run the rehearsal
+  must match the scenario (digest), the simulator, every tap with `find`, the installed app (an
+  identity that cannot be read fails), and be at most N seconds old (default 3600); at the agent's
+  first `ping` the screen size must equal the rehearsal's. Before a tap with `find` starts its
+  recorder, the rehearsal's swipes for it are sent, each with its settle time; the tap goes to the
+  rehearsed centre. `run.json` records it as `resolved`; a replayed swipe the agent did not
+  perform fails the step (check `input`), and so does a replayed tap whose recording shows no
+  visual change (signature `-`) unless its `expect.signature` is `-`; the gate adds one note per
+  run that used a rehearsal. Only an approved `expect.signature` verifies where a replayed tap
+  landed.
+- A rehearsal folder is not a run: `rehearse` writes `rehearsal-started.json` into it before anything
+  else; `gate`, `summary` and `compare` pass over such a folder (a failed or killed rehearsal
+  included) instead of counting it as a run that did not complete, and `gate` prints one note for
+  each one whose rehearsal did not complete. A run marker inside a rehearsal folder (other than
+  its own `raw/` and `failed.json`) stops them with an error naming it. `run --out` refuses a
+  folder holding a rehearsal or inside one, and `rehearse --out` one holding a run at any depth or
+  a rehearsal, or inside another rehearsal.
+- On the simulator a step's `settle_ms` and `find.scroll.settle_ms` are at most 60000, and the
+  agent's idle limit covers every wait the host makes between two commands (replayed swipes with
+  their settle times; in a rehearsal each lookup up to its timeout).
+- `allow.unchanged_frames_max` (a whole number of at least 1, with the step's `reason`) on a rest,
+  on both platforms: recorded frames that changed nothing fail only above it. Without it the check
+  stays at zero, and `frames_max` or `changed_frames_max` does not reach it. Measured need: a
+  focused text field on the iOS Simulator whose caret composed 15 to 19 such frames per 5 s rest.
+- **Changed:** the excuse for the video encoder's own frames at rest on a simulator covers up to 6
+  recorded frames, where it covered 2. In 523 still rest windows of a clean build, 52 held such
+  frames: 32 one, 18 two and 2 three, and those two windows failed runs in which every count was
+  zero. The other conditions are unchanged (every count known and zero over the recording, no
+  pixel changed by more than 24 levels, at most 2000 pixels changed, none where the picture was
+  flat). A simulator run of 0.5.0 that failed on exactly three to six such frames passes when gated
+  again.
+- The agent's mode is checked at its first `ping` in both commands (`"lookups"`): an agent in the
+  other mode is a failed start, and the measured run's agent never inherits the switch from
+  ui-probe's environment.
+- Validation for the simulator has two modes. In both: `find` on a tap allowed (`text` or `desc`,
+  `nth`, `timeout_ms`, `scroll`); `find.package` and `find_settle_ms` refused; `key` refused. A
+  `find` value holding a control character is refused on the simulator in words of its own (a
+  character outside the Basic Multilingual Plane, which only Android's window-tree dump cannot
+  write, is allowed there). A
+  `text` step is allowed in `rehearse` only, and its refusal in a run says to put the typing in a
+  scenario of its own and drive it with `ui-probe rehearse`. `expect`, `allow` and rest lengths are
+  checked alike in both, so that one file serves both commands.
+- The agent (`ios-agent/`) serves `find`, `type` and `labels` only when started for a rehearsal,
+  and reports its mode in `ping`. Its source changed, so it is built anew on first use.
+- Android is unchanged.
+
 ## 0.5.0 — 2026-11-11
 
 Input on the iOS Simulator: taps and swipes by fractions of the display, a signature per step.

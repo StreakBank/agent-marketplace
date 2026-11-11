@@ -24,7 +24,7 @@ Three kinds of result, three rules:
   statistical every duration, and any count that time or the network drives: report the
               distribution, never gate on an emulator or simulator.
 
-Commands: run, analyze, summary, gate, compare, sheet, zoom, proxy, doctor. See README.md.
+Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, proxy, doctor. See README.md.
 Exit codes: 0 success, 1 a gate failed, 2 an error the tool reports itself, 3 an unexpected error.
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -83,9 +83,10 @@ STEP_KEYS = {
 COMMON_STEP_KEYS = {"id", "do", "expect"}
 EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max"}
 QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
-# A rest step's allowance: limits that replace the gate's for that step. There is deliberately no
-# limit for recorded frames that changed nothing: that check is what catches an invisible animation.
-ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max")
+# A rest step's allowance: limits that replace the gate's for that step. unchanged_frames_max lets
+# recorded frames that changed nothing pass up to a number (some carets compose them); without it
+# that check stays at zero, and it is what catches an invisible animation.
+ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max", "unchanged_frames_max")
 FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package", "scroll"}
 # find.scroll: swipes made while a read shows no acceptable match. max is required; from and to are
 # screen fractions like a swipe step's; the swipe must move at least SCROLL_MIN_TRAVEL of the screen
@@ -254,10 +255,11 @@ def _is_comment(key) -> bool:
     return isinstance(key, str) and key.endswith("comment")
 
 
-def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
+def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run") -> None:
     """Reject a malformed scenario with a message that names the problem. No silent defaults.
-    platform is ANDROID, SIM_PLATFORM (rest steps only, see validate_sim_rules) or "any" (the
-    package may be either kind of id; used for a gate override before the run's platform is known)."""
+    platform is ANDROID, SIM_PLATFORM (see validate_sim_rules) or "any" (the package may be either
+    kind of id; used for a gate override before the run's platform is known). sim_mode, for
+    SIM_PLATFORM only, is "run" (a measured run) or "rehearse" (`ui-probe rehearse`, which may type)."""
     def need(cond, msg):
         if not cond:
             raise ProbeError(f"scenario: {msg}")
@@ -377,8 +379,7 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
                 allow = step["allow"]
                 need(isinstance(allow, dict), f"step '{sid}': 'allow' must be an object")
                 unknown = sorted(k for k in allow if k not in ALLOW_LIMITS + ("reason",))
-                need(not unknown, f"step '{sid}': unknown 'allow' keys {unknown}; known: {', '.join(ALLOW_LIMITS)}, reason"
-                     " (there is no allowance for recorded frames that changed nothing)")
+                need(not unknown, f"step '{sid}': unknown 'allow' keys {unknown}; known: {', '.join(ALLOW_LIMITS)}, reason")
                 need(isinstance(allow.get("reason"), str) and allow["reason"].strip(),
                      f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
                 need(any(k in allow for k in ALLOW_LIMITS),
@@ -388,6 +389,10 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
                         need(count(allow[k]), f"step '{sid}': 'allow.{k}' must be an integer >= 0")
                 if "updates_max" in allow:
                     need(platform != ANDROID, f"step '{sid}': 'allow.updates_max' applies to {SIM_ONLY}")
+                if "unchanged_frames_max" in allow:
+                    v = allow["unchanged_frames_max"]
+                    need(isinstance(v, int) and not isinstance(v, bool) and v >= 1,
+                         f"step '{sid}': 'allow.unchanged_frames_max' must be a whole number of at least 1")
                 if "cpu_pct_max" in allow:
                     need(number(allow["cpu_pct_max"]) and allow["cpu_pct_max"] >= 0,
                          f"step '{sid}': 'allow.cpu_pct_max' must be a number >= 0")
@@ -404,7 +409,14 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
                 value = find[named[0]]
                 need(isinstance(value, str) and value and len(value) <= TEXT_MAX and not ("\n" in value or "\r" in value),
                      f"step '{sid}': 'find.{named[0]}' must be a non-empty string of at most {TEXT_MAX} characters, on one line")
-                bad = unmatchable_char(value)
+                if platform == SIM_PLATFORM:
+                    bad = next((ch for ch in value if ord(ch) < 0x20 or 0x7F <= ord(ch) <= 0x9F
+                                or 0xD800 <= ord(ch) <= 0xDFFF), None)
+                    need(bad is None,
+                         f"step '{sid}': 'find.{named[0]}' holds {bad!r} (U+{ord(bad or ' '):04X}), a control character "
+                         "or a lone surrogate; on the iOS Simulator a lookup value must be printable text (it is "
+                         "compared with an element's accessibility label or value)")
+                bad = unmatchable_char(value) if platform != SIM_PLATFORM else None
                 need(bad is None,
                      f"step '{sid}': 'find.{named[0]}' holds {bad!r} (U+{ord(bad or ' '):04X}), which the window-tree dump "
                      "never writes as it is (a tab, a control character, a surrogate, a character outside the Basic "
@@ -489,7 +501,7 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
     if platform == SIM_PLATFORM:
         # One recording per rest step on a simulator, by a recorder with no time limit: the Android
         # recorder's 180 s limit on the whole scenario does not apply.
-        validate_sim_rules(scn, need)
+        validate_sim_rules(scn, need, sim_mode)
         return
     fixed = scenario_duration_s(scn, worst_case=False)
     need(fixed <= RECORD_LIMIT_S - 10,
@@ -497,7 +509,8 @@ def validate_scenario(scn: dict, platform: str = ANDROID) -> None:
 
 
 # What a scenario for the iOS Simulator may hold: there is no input from a command line, no
-# window-tree dump, no platform frame record and no quiet detection, so only rest steps run.
+# window-tree dump, no platform frame record and no quiet detection. Input goes through the input
+# agent (ios-agent/), by position in a measured run.
 SIM_REST_MIN_MS = 1000
 SIM_REFUSED_TOP = {
     "activity": "the iOS Simulator launches the app by its bundle identifier ('package'); 'activity' does not apply",
@@ -510,14 +523,24 @@ SIM_REFUSED_STEP = {
 }
 
 
-# Input on a simulator goes through the input agent (ios-agent/), by position only.
 SIM_INPUT_KINDS = ("tap", "swipe")
 SIM_SWIPE_MS_MAX = 60000
-SIM_NO_LOOKUP = ("a lookup or typing reads the app's accessibility tree, which changed the app at rest when "
-                 "measured, so this version takes positions as fractions (a tap's 'x' and 'y', a swipe's 'from' and 'to')")
+SIM_SETTLE_MS_MAX = 60000     # a wait the host makes between two agent commands; the agent has an idle limit
+SIM_MODES = ("run", "rehearse")
+# Why a measured run never reads the app or types (measured: either changes the app at rest for the
+# rest of its process's life), and what to do instead.
+SIM_NO_TYPING = ("a field that has had focus changes the app for the rest of its life, so a measured run never types: "
+                 "put the typing in a scenario of its own and drive it with `ui-probe rehearse` (for example to sign "
+                 "in before the measured scenarios)")
 
 
-def validate_sim_rules(scn: dict, need) -> None:
+def validate_sim_rules(scn: dict, need, mode: str = "run") -> None:
+    """The simulator's rules. mode "run" (a measured run): a tap may name its target with 'find', to
+    be replayed from a rehearsal; a 'text' step is refused. mode "rehearse": the same, and a 'text'
+    step is allowed. 'expect', 'allow' and rest lengths are checked alike in both modes, so that one
+    file serves both commands; a rehearsal ignores them."""
+    if mode not in SIM_MODES:
+        raise ValueError(f"unknown simulator mode {mode!r}")
     for key, why in SIM_REFUSED_TOP.items():
         need(key not in scn, f"'{key}': {why}")
     need(not scn.get("until_quiet", False), "'until_quiet' must be false or absent: there is no quiet detection on the "
@@ -525,11 +548,31 @@ def validate_sim_rules(scn: dict, need) -> None:
                                             "'settle_ms'")
     for step in scn["steps"]:
         sid, do = step["id"], step["do"]
-        need(not (do == "tap" and "find" in step), f"step '{sid}': 'find' is refused on the iOS Simulator: {SIM_NO_LOOKUP}")
-        need(do != "text", f"step '{sid}': a 'text' step is refused on the iOS Simulator: {SIM_NO_LOOKUP}")
+        if do == "tap" and "find" in step:
+            need("package" not in step["find"],
+                 f"step '{sid}': 'find.package' is refused on the iOS Simulator: it names the package of an Android "
+                 "window; a lookup on a simulator reads the app under test only")
+            need("find_settle_ms" not in step,
+                 f"step '{sid}': 'find_settle_ms' is refused on the iOS Simulator: a measured run looks nothing up "
+                 "(the tap is replayed from the rehearsal), and the swipes it replays wait their 'find.scroll.settle_ms'")
+            if "scroll" in step["find"]:
+                need(find_scroll(step)["ms"] <= SIM_SWIPE_MS_MAX,
+                     f"step '{sid}': 'find.scroll.ms' on the iOS Simulator is at most {SIM_SWIPE_MS_MAX} (what the "
+                     "input agent accepts)")
+                need(find_scroll(step)["settle_ms"] <= SIM_SETTLE_MS_MAX,
+                     f"step '{sid}': 'find.scroll.settle_ms' on the iOS Simulator is at most {SIM_SETTLE_MS_MAX}: it is a "
+                     "wait between two commands to the input agent, which ends itself after an idle limit")
+        if do != "rest" and "settle_ms" in step:
+            need(step["settle_ms"] <= SIM_SETTLE_MS_MAX,
+                 f"step '{sid}': 'settle_ms' on the iOS Simulator is at most {SIM_SETTLE_MS_MAX}: it is a wait between "
+                 "two commands to the input agent, which ends itself after an idle limit")
+        if do == "text":
+            need(mode == "rehearse", f"step '{sid}': a 'text' step is refused in a measured run on the iOS Simulator: "
+                                     f"{SIM_NO_TYPING}")
         need(do != "key", f"step '{sid}': a 'key' step is refused on the iOS Simulator: a simulator has no keys to "
                           "press; tap the screen's own control or swipe from the edge")
-        need(do == "rest" or do in SIM_INPUT_KINDS, f"step '{sid}': a '{do}' step is refused on the iOS Simulator")
+        need(do == "rest" or do in SIM_INPUT_KINDS or do == "text",
+             f"step '{sid}': a '{do}' step is refused on the iOS Simulator")
         if do == "rest":
             for key, why in SIM_REFUSED_STEP.items():
                 need(key not in step, f"step '{sid}': '{key}': {why}")
@@ -550,6 +593,11 @@ def validate_sim_rules(scn: dict, need) -> None:
             unknown = sorted(set(step.get("expect") or {}) - {"signature", "signposts_max"})
             need(not unknown, f"step '{sid}': 'expect' on a tap or a swipe on the iOS Simulator takes only 'signature' "
                               f"and 'signposts_max'; refused: {unknown}")
+
+
+def sim_find_steps(scn: dict) -> list[dict]:
+    """The taps that name their target with 'find'."""
+    return [s for s in scn["steps"] if s["do"] == "tap" and "find" in s]
 
 
 def sim_needs_agent(scn: dict) -> bool:
@@ -1259,7 +1307,7 @@ def lookup_failure(serial: str, scn: dict, out: Path, check: bool = True) -> Loo
 RUN_MARKERS = ("capture.json", "run.json", FAILED_RUN, "device-script.sh", "raw")
 
 
-def write_failed(out: Path, exc: BaseException, scenario: str | None = None) -> None:
+def write_failed(out: Path, exc: BaseException, scenario: str | None = None, extra: dict | None = None) -> None:
     """Leave failed.json in a run folder whose run did not complete, so that gate, summary and
     compare see the run instead of passing over it. Never raises: the original failure is reported."""
     if isinstance(exc, ProbeError):
@@ -1274,6 +1322,7 @@ def write_failed(out: Path, exc: BaseException, scenario: str | None = None) -> 
         (out / FAILED_RUN).write_text(json.dumps({
             "tool": {"name": "ui-probe", "version": VERSION}, "scenario": scenario, "error": error,
             "step": getattr(exc, "step", None), "time_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            **(extra or {}),
         }, indent=1))
     except OSError as err:
         print(f"ui-probe: could not write {out / FAILED_RUN}: {err.strerror or err}", file=sys.stderr)
@@ -1289,6 +1338,7 @@ def refuse_used(out: Path) -> None:
 def run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, sections: bool = False) -> dict:
     validate_scenario(scn)
     refuse_used(out)
+    refuse_rehearsal_folder(out)
     out.mkdir(parents=True, exist_ok=True)
     try:
         return _run_once(serial, scn, out, trace, video, sections)
@@ -1374,13 +1424,14 @@ def _run_once(serial: str, scn: dict, out: Path, trace: bool, video: bool, secti
 
 
 # --------------------------------------------------------------------------------------------
-# iOS Simulator: rest steps only, driven from the host
+# iOS Simulator, driven from the host
 # --------------------------------------------------------------------------------------------
 #
 # The app is a process on the host, so its CPU time is read with `ps`; the display is recorded with
 # `xcrun simctl io <udid> recordVideo`, which keeps a frame only when the display changes. There is
 # no input from a command line, no window-tree dump, no platform frame record and no quiet
-# detection, so a simulator run has rest steps only and is judged by CPU and the recording alone.
+# detection: input goes through the input agent (below), and a run is judged by CPU, the log store
+# and the recording.
 
 SIM_RECORD_START_TIMEOUT_S = 20   # until the recorder prints "Recording started"
 SIM_RECORD_STOP_TIMEOUT_S = 20    # after SIGINT, until the recorder has written its file and exited
@@ -1672,15 +1723,23 @@ def tail(path: Path, lines: int = 12) -> str:
         return "no log"
 
 
-class SimAgent:
-    """The input agent under `xcodebuild test-without-building`, in a process group of its own."""
+AGENT_LOOKUPS_ENV = "TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS"
 
-    def __init__(self, udid: str, bundle: str, idle_s: int, raw: Path):
-        self.udid, self.raw = udid, raw
+
+class SimAgent:
+    """The input agent under `xcodebuild test-without-building`, in a process group of its own.
+    lookups=True starts it for a rehearsal (it then also serves find, type and labels); a measured
+    run never sets it, and the variable is removed from what the agent inherits."""
+
+    def __init__(self, udid: str, bundle: str, idle_s: int, raw: Path, lookups: bool = False, keep_results: bool = True):
+        self.udid, self.raw, self.lookups, self.keep_results = udid, raw, lookups, keep_results
         xctestrun = ensure_agent_built()
         self.port, self.token = free_port(), secrets.token_hex(16)
         env = dict(os.environ, TEST_RUNNER_UI_PROBE_AGENT_PORT=str(self.port), TEST_RUNNER_UI_PROBE_AGENT_TOKEN=self.token,
                    TEST_RUNNER_UI_PROBE_AGENT_BUNDLE=bundle, TEST_RUNNER_UI_PROBE_AGENT_IDLE_S=str(idle_s))
+        env.pop(AGENT_LOOKUPS_ENV, None)
+        if lookups:
+            env[AGENT_LOOKUPS_ENV] = "1"
         self.log_path = raw / "agent.log"
         self.log = open(self.log_path, "wb")
         # Without these, every agent run leaves a folder and a result bundle in Xcode's default derived
@@ -1695,7 +1754,7 @@ class SimAgent:
         except OSError as exc:
             self.log.close()
             raise ProbeError(f"cannot start the input agent with xcodebuild: {exc.strerror or exc}") from exc
-        self.record = {"port": self.port, "xctestrun": str(xctestrun), "idle_s": idle_s}
+        self.record = {"port": self.port, "xctestrun": str(xctestrun), "idle_s": idle_s, "lookups": lookups}
 
     def proof(self, nonce: str) -> str:
         return hmac.new(self.token.encode(), nonce.encode(), hashlib.sha256).hexdigest()
@@ -1748,6 +1807,16 @@ class SimAgent:
                 if not reply.get("ok"):
                     raise ProbeError(f"the input agent answered but refused the run's first command: {reply.get('error')}")
                 self.record["ready"] = reply
+                # An agent in the wrong mode is a failed start: a measured run must never be able to
+                # read the app, and a rehearsal needs to.
+                if self.lookups and reply.get("lookups") is not True:
+                    raise ProbeError("the input agent was started for a rehearsal but its first answer does not say "
+                                     f"that it serves lookups ('lookups': {json.dumps(reply.get('lookups'))}); "
+                                     "nothing was done")
+                if not self.lookups and reply.get("lookups") is not False:
+                    raise ProbeError("the input agent was started for a measured run but its first answer does not say "
+                                     f"that lookups are off ('lookups': {json.dumps(reply.get('lookups'))}); the app "
+                                     "was not launched")
                 return reply
             if time.monotonic() > deadline:
                 raise ProbeError(f"the input agent did not answer within {timeout_s} s; its log ({self.log_path}) "
@@ -1790,7 +1859,8 @@ class SimAgent:
                     pass        # failures ignored: the runner may not be there
 
         def tidy():
-            if info["exit"] == 0:
+            # keep_results False (a rehearsal that types): never kept, since they log every typed character
+            if info["exit"] == 0 or not self.keep_results:
                 for path in (self.derived, self.result_bundle):
                     shutil.rmtree(path, ignore_errors=True)
 
@@ -1842,12 +1912,21 @@ def agent_idle_s(scn: dict) -> int:
     waits = [scn.get("launch_settle_ms", 6000)]
     for s in scn["steps"]:
         waits += [s.get("ms", 0), s.get("settle_ms", default_settle_ms(s["do"]) if s["do"] != "rest" else 0)]
+        if s["do"] == "tap" and "find" in s and find_scroll(s) is not None:
+            # a run replays up to max swipes before the tap, each followed by its settle time
+            sc = find_scroll(s)
+            waits.append(sc["max"] * (sc["ms"] + sc["settle_ms"]))
     return int(max(waits) / 1000 + AGENT_IDLE_MARGIN_S)
 
 
-def run_once_sim(udid: str, scn: dict, out: Path) -> dict:
+def run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None) -> dict:
+    """One measured run. rehearsal ({"path", "data"}, checked by check_rehearsal) is required when the
+    scenario has a tap with 'find'."""
     validate_scenario(scn, SIM_PLATFORM)
+    if sim_find_steps(scn) and rehearsal is None:
+        raise ProbeError(no_rehearsal_message(scn, udid))
     refuse_used(out)
+    refuse_rehearsal_folder(out)
     out.mkdir(parents=True, exist_ok=True)
     previous = {}
 
@@ -1860,7 +1939,7 @@ def run_once_sim(udid: str, scn: dict, out: Path) -> dict:
         for sig in (signal.SIGTERM, signal.SIGHUP):
             previous[sig] = signal.signal(sig, on_signal)
     try:
-        return _run_once_sim(udid, scn, out)
+        return _run_once_sim(udid, scn, out, rehearsal)
     except BaseException as exc:
         write_failed(out, exc, scn.get("name"))
         raise
@@ -1878,7 +1957,7 @@ SIM_APP_STATES = {0: "unknown", 1: "not running", 2: "running in the background,
                   3: "running in the background", 4: "running in front"}
 
 
-def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
+def _run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None) -> dict:
     bundle = scn["package"]
     facts = sim_facts(udid, bundle)
     raw = out / "raw"
@@ -1895,8 +1974,12 @@ def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
         try:
             if sim_needs_agent(scn):
                 agent = SimAgent(udid, bundle, agent_idle_s(scn), raw)
-                agent.wait_ready(AGENT_START_TIMEOUT_S)
-            _sim_device_part(udid, scn, raw, bundle, agent)
+                ready = agent.wait_ready(AGENT_START_TIMEOUT_S)
+                if rehearsal is not None and ready.get("screen") != rehearsal["data"]["screen"]:
+                    raise ProbeError(f"the simulator's screen is {ready.get('screen')} points but the rehearsal "
+                                     f"{rehearsal['path']} found its positions on {rehearsal['data']['screen']}; "
+                                     "rehearse again on this simulator")
+            _sim_device_part(udid, scn, raw, bundle, agent, rehearsal)
         finally:
             if agent is not None:
                 with CleanupShield():
@@ -1922,10 +2005,9 @@ def _run_once_sim(udid: str, scn: dict, out: Path) -> dict:
         raise ProbeError(f"{out}: the capture was saved but its analysis failed: {exc}") from exc
 
 
-def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAgent | None = None) -> None:
-    """Launch the app and record every step: a rest waits its 'ms'; a tap or swipe is sent to the agent
-    and the step waits its 'settle_ms'. With the agent, every step ends with a ping for the app's state.
-    The app is left running afterwards."""
+def sim_launch(udid: str, scn: dict, raw: Path, bundle: str) -> tuple[int, float]:
+    """Terminate the app, launch it with the scenario's launch_env and return (its process id, the
+    wall-clock time of the launch). Saves raw/launch-env.json, raw/launch.txt, raw/launch-time.json."""
     xcrun("simctl", "terminate", udid, bundle, check=False)       # not running is not an error
     time.sleep(SIM_TERMINATE_WAIT_S)
     # launch_env reaches the app's process through simctl's SIMCTL_CHILD_ prefix, on this call only.
@@ -1941,12 +2023,38 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
     m = re.search(rf"^{re.escape(bundle)}:\s*(\d+)\s*$", launched.strip(), re.M)
     if not m:
         raise ProbeError(f"`xcrun simctl launch` printed no process id for {bundle}: {launched.strip()[:200]!r}")
-    pid = int(m.group(1))
+    return int(m.group(1)), launch_wall
+
+
+def replay_lookup(agent: SimAgent, rehearsal: dict, step: dict) -> dict:
+    """Before a tap with 'find' in a measured run, and before its recorder starts: the swipes the
+    rehearsal made to reach the element, each followed by its settle_ms, as Android's lookup and its
+    scrolling come before the step's window. Returns the step's 'resolved' record: where the tap goes
+    and every swipe with the agent's reply and round trip. A swipe the agent did not perform is
+    recorded, and the gate fails the step for it as for a tap it did not perform."""
+    done = rehearsal["data"]["steps"][step["id"]]
+    swipes = []
+    for sw in done["swipes"]:
+        reply, round_trip = agent.send({"cmd": "swipe", "from": sw["from"], "to": sw["to"], "ms": sw["ms"]})
+        swipes.append({**sw, "reply": reply, "round_trip_ms": round_trip})
+        time.sleep(sw["settle_ms"] / 1000)
+    return {"x": done["center"][0], "y": done["center"][1], "swipes": swipes, "rehearsal": rehearsal["path"],
+            "rehearsal_finished": rehearsal["data"]["finished"]}
+
+
+def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAgent | None = None,
+                     rehearsal: dict | None = None) -> None:
+    """Launch the app and record every step: a rest waits its 'ms'; a tap or swipe is sent to the agent
+    and the step waits its 'settle_ms'; a tap with 'find' goes to the position the rehearsal found, after
+    the rehearsal's swipes for it. With the agent, every step ends with a ping for the app's state. The
+    app is left running afterwards."""
+    pid, launch_wall = sim_launch(udid, scn, raw, bundle)
     time.sleep(scn.get("launch_settle_ms", 6000) / 1000)
     (raw / "pid-launch.txt").write_text(f"{pid}\n" if host_cputime(pid) else "")
     last_wall = None
     for step in scn["steps"]:
         sid = step["id"]
+        resolved = replay_lookup(agent, rehearsal, step) if "find" in step else None
         recorder = SimRecorder(udid, raw / f"rec-{sid}.mp4")
         before = after = ""
         t0 = t1 = w0 = w1 = rec_start = rec_end = None
@@ -1959,7 +2067,7 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
             if step["do"] == "rest":
                 time.sleep(step["ms"] / 1000)
             else:
-                command = sim_command(step)
+                command = sim_command(step, resolved)
                 reply, round_trip = agent.send(command)
                 time.sleep(step.get("settle_ms", default_settle_ms(step["do"])) / 1000)
             after, t1, w1 = host_cputime(pid), time.monotonic(), time.time()
@@ -1978,10 +2086,667 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
             "recorder_alive_at_end": recorder.alive_at_stop,
             **({} if agent is None else {"command": command, "reply": reply, "round_trip_ms": round_trip,
                                          "end_ping": ping,
-                                         "app_state": ping.get("app_state") if ping and ping.get("ok") else None})},
+                                         "app_state": ping.get("app_state") if ping and ping.get("ok") else None}),
+            **({} if resolved is None else {"resolved": resolved})},
             indent=1))
         last_wall = w1
     read_log_store(udid, scn, raw, pid, launch_wall, last_wall)
+
+
+# --------------------------------------------------------------------------------------------
+# a rehearsal on the iOS Simulator: lookups and typing in an app process that is thrown away
+# --------------------------------------------------------------------------------------------
+#
+# Reading an app's accessibility tree, and a text field that has had focus, change the app for the
+# rest of its process's life (measured). So a measured run never reads the app or types: `ui-probe
+# rehearse` drives the scenario once in a process it then ends, looking elements up and typing there,
+# and the positions it found are replayed by coordinate in the fresh process the run measures.
+
+REHEARSAL_FILE = "rehearsal.json"
+# Written first into a rehearsal's folder, before anything else, so that gate, summary and compare
+# never take that folder (completed, failed or killed) for a run.
+REHEARSAL_MARKER = "rehearsal-started.json"
+REHEARSAL_GONE_WAIT_S = 5         # after the app is terminated, for its process to be gone
+REHEARSAL_MAX_AGE_S = 3600        # the default of `run --rehearsal-max-age-s`
+SIM_FIND_POLL_S = 0.3             # between two reads of the app's tree while a lookup waits
+SIM_FIND_COMMAND_TIMEOUT_S = 30   # one find or labels command (measured: 30 to 120 ms)
+SIM_TYPE_CHAR_S = 3.0             # one typed character, for the command's time limit (measured: about 1.5 s)
+SIM_TYPE_MARGIN_S = 30
+SIM_REDACTED = "<typed text>"
+# What a rehearsal records of the installed app, and how a message names each value.
+APP_IDENTITY = {"short_version": "CFBundleShortVersionString", "version": "CFBundleVersion",
+                "executable_sha256": "executable's sha256",
+                "bundle_sha256": "bundle digest (over every file's path and sha256)"}
+
+
+def bundle_digest(bundle_path: str) -> str:
+    """sha256 over the sorted list of every file in the bundle: its path relative to the bundle and its
+    sha256, or for a symbolic link its target text (never followed). Lines are 'path\\tsha256:<hex>' or
+    'path\\tlink:<target>'. OSError when any part cannot be read: the identity is then unknown."""
+    root = Path(bundle_path)
+    if not root.is_dir():
+        raise OSError(f"{root} is not a folder")
+    entries = []
+
+    def fail(exc):
+        raise exc
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail, followlinks=False):
+        here = Path(dirpath)
+        for name in list(dirnames):
+            if (here / name).is_symlink():
+                entries.append((str((here / name).relative_to(root)), "link:" + os.readlink(here / name)))
+                dirnames.remove(name)
+        for name in filenames:
+            path = here / name
+            rel = str(path.relative_to(root))
+            if path.is_symlink():
+                entries.append((rel, "link:" + os.readlink(path)))
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            entries.append((rel, "sha256:" + h.hexdigest()))
+    total = hashlib.sha256()
+    for rel, what in sorted(entries):
+        total.update(f"{rel}\t{what}\n".encode("utf-8", "surrogateescape"))
+    return total.hexdigest()
+
+
+def utc_stamp(when: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if when is None else when))
+
+
+def parse_utc_stamp(text) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def scenario_digest(scn: dict) -> str:
+    """sha256 of the scenario as loaded, as canonical JSON (sorted keys, compact separators)."""
+    return hashlib.sha256(json.dumps(scn, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def app_identity(bundle_path: str | None, reason: str | None = None) -> dict:
+    """The installed app as a rehearsal and a run compare it: CFBundleShortVersionString and
+    CFBundleVersion from the bundle's Info.plist and the sha256 of its executable (CFBundleExecutable).
+    A value that cannot be read is None, and 'unknown' says why."""
+    ident = {"bundle_path": bundle_path, "short_version": None, "version": None, "executable": None,
+             "executable_sha256": None, "bundle_sha256": None, "unknown": []}
+    if bundle_path is None:
+        ident["unknown"].append(reason or "the app's bundle was not found")
+        return ident
+    try:
+        ident["bundle_sha256"] = bundle_digest(bundle_path)
+    except OSError as exc:
+        ident["unknown"].append(f"the bundle cannot be read in full: {exc.strerror or exc}")
+    import plistlib
+    try:
+        with open(Path(bundle_path) / "Info.plist", "rb") as fh:
+            info = plistlib.load(fh)
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        ident["unknown"].append(f"{Path(bundle_path) / 'Info.plist'} cannot be read: {exc}")
+        return ident
+    if not isinstance(info, dict):
+        ident["unknown"].append("Info.plist does not hold a dictionary")
+        return ident
+    for key, name in (("short_version", "CFBundleShortVersionString"), ("version", "CFBundleVersion"),
+                      ("executable", "CFBundleExecutable")):
+        value = info.get(name)
+        if isinstance(value, str) and value:
+            ident[key] = value
+        else:
+            ident["unknown"].append(f"Info.plist has no {name}")
+    exe = ident["executable"]
+    if exe is not None:
+        if "/" in exe or exe in (".", ".."):
+            ident["unknown"].append(f"CFBundleExecutable {exe!r} is not a file name")
+        else:
+            h = hashlib.sha256()
+            try:
+                with open(Path(bundle_path) / exe, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(chunk)
+                ident["executable_sha256"] = h.hexdigest()
+            except OSError as exc:
+                ident["unknown"].append(f"the executable {exe} cannot be read: {exc.strerror or exc}")
+    return ident
+
+
+def sim_app_identity(udid: str, bundle: str) -> dict:
+    try:
+        return app_identity(xcrun("simctl", "get_app_container", udid, bundle).strip() or None,
+                            "`xcrun simctl get_app_container` printed no path")
+    except ProbeError as exc:
+        return app_identity(None, f"{bundle} is not installed on simulator {udid}: {exc}")
+
+
+def no_rehearsal_message(scn: dict, udid: str, scenario_path: str = "<scenario>") -> str:
+    sid = sim_find_steps(scn)[0]["id"]
+    return (f"step '{sid}': a tap with 'find' on the iOS Simulator goes to a position found by a rehearsal, since a "
+            f"measured run never reads the app: run `ui-probe rehearse --simulator {udid} --scenario {scenario_path} "
+            "--out <dir>` first and pass its rehearsal.json with --rehearsal")
+
+
+def describe_find_sim(find: dict) -> str:
+    key = "text" if "text" in find else "desc"
+    what = (f"the element with the label or value {json.dumps(find[key])}" if key == "text"
+            else f"the element with the label {json.dumps(find[key])}")
+    return what + (f" (match {find['nth']} in the order of the tree)" if "nth" in find else "")
+
+
+def type_timeout_s(text: str) -> float:
+    return SIM_TYPE_MARGIN_S + SIM_TYPE_CHAR_S * len(text)
+
+
+def rehearsal_idle_s(scn: dict) -> int:
+    """The agent's idle limit in a rehearsal: as in a run, and longer than the longest typing, since the
+    agent counts its idle time from the start of the command it last received."""
+    typing = [int(type_timeout_s(s["text"]) + AGENT_IDLE_MARGIN_S) for s in scn["steps"] if s["do"] == "text"]
+    # a lookup polls up to its timeout, which holds every swipe and its settle time, and a swipe begun
+    # just before the timeout runs on past it
+    lookups = []
+    for s in sim_find_steps(scn):
+        sc = find_scroll(s)
+        overrun = 0 if sc is None else sc["ms"] + sc["settle_ms"]
+        lookups.append(int((find_timeout_ms(scn, s) + overrun) / 1000 + AGENT_IDLE_MARGIN_S))
+    return max([agent_idle_s(scn)] + typing + lookups)
+
+
+def redact(value, secrets_: list[str]):
+    """value with every string that holds a text the scenario types replaced by SIM_REDACTED."""
+    if isinstance(value, str):
+        return SIM_REDACTED if any(t and t in value for t in secrets_) else value
+    if isinstance(value, list):
+        return [redact(v, secrets_) for v in value]
+    if isinstance(value, dict):
+        return {k: redact(v, secrets_) for k, v in value.items()}
+    return value
+
+
+def _fraction_pair(v) -> bool:
+    return (isinstance(v, list) and len(v) == 2
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) and 0 <= x <= 1 for x in v))
+
+
+def sim_lookup(agent: SimAgent, scn: dict, step: dict, out: Path, clock=time.monotonic, sleep=time.sleep) -> dict:
+    """Find a tap's element through the agent, by the rule an Android lookup follows (find_el in the
+    device script): read the app's tree until the element is there, on the screen and still. A match
+    counts when part of it is on the display ('on_screen') and XCTest's hit test says a tap would reach
+    it ('hittable'); 'under' is only a hint for the message and decides nothing. Without
+    'nth' exactly one match may count; with it, at least nth, and the nth in the order of the tree is
+    taken. It is found when it has the same frame in two reads in a row. A read with no acceptable match
+    is 'not yet': wait SIM_FIND_POLL_S and read again, up to the timeout (find_timeout_ms); a match first
+    seen at the timeout gets one more read to hold still. With find.scroll, a read that shows no
+    acceptable match is followed by a swipe and its settle time while fewer than max swipes were made.
+    On a timeout the status is unstable (a match moved), not_visible (matches were there but none
+    counted: off the screen, or on it where a tap would not reach them) or not_found; lookup-failed.txt
+    is written and LookupFailed
+    raised. A find reply that is not ok, or a swipe the agent did not perform, fails at once."""
+    sid, find = step["id"], step["find"]
+    key = "text" if "text" in find else "desc"
+    nth = find.get("nth", 0)
+    timeout = find_timeout_ms(scn, step)
+    scroll = find_scroll(step)
+    t0 = clock()
+    reads = 0
+    swipes: list[dict] = []
+    pb = None
+    grace = False
+    while True:
+        reads += 1
+        reply, _ = agent.send({"cmd": "find", key: find[key]}, timeout=SIM_FIND_COMMAND_TIMEOUT_S)
+        if not reply.get("ok"):
+            raise ProbeError(f"step '{sid}': the agent did not perform the lookup of {describe_find_sim(find)}: "
+                             f"{reply.get('error') or 'no reply'}; the rehearsal stopped there")
+        matches = reply.get("matches")
+        found = reply.get("found")
+        if not isinstance(matches, list) or not all(isinstance(m, dict) for m in matches) or not isinstance(found, int):
+            raise ProbeError(f"step '{sid}': the agent's answer to a lookup is malformed (no 'found' count or no "
+                             "'matches' list); the rehearsal stopped there")
+        counted = [m for m in matches if m.get("on_screen") is True and m.get("hittable") is True]
+        vn = len(counted)
+        # Only the first matches are listed: without nth, "exactly one" cannot be told when more exist.
+        truncated = found > len(matches)
+        # The match named when too few count: one on the display that a tap would not reach says more
+        # than one off the screen, so it is named first.
+        rest = [m for m in matches if not any(m is c for c in counted)]
+        off = next((m for m in rest if m.get("on_screen") is True), None) or (rest[0] if rest else None)
+        chosen = None
+        if (nth == 0 and vn == 1 and not truncated) or (nth > 0 and vn >= nth):
+            chosen = counted[max(nth, 1) - 1]
+        b = chosen.get("frame") if chosen is not None else None
+        # matches that do not count matter only when too few count (not when several do)
+        if chosen is not None or (nth == 0 and vn > 0):
+            off = None
+        elapsed_ms = round((clock() - t0) * 1000)
+        if b is not None and b == pb:
+            centre = chosen.get("center")
+            if not _fraction_pair(centre):
+                raise ProbeError(f"step '{sid}': the agent gave the match a centre that is not two fractions of the "
+                                 f"display ({centre!r}); the rehearsal stopped there")
+            return {"status": "found", "match": {k: chosen.get(k) for k in ("label", "type", "frame", "visible")
+                                                 if k in chosen},
+                    "center": centre, "swipes": swipes, "reads": reads, "matches": found, "visible": vn,
+                    "lookup_ms": elapsed_ms}
+        if elapsed_ms >= timeout:
+            if b is not None and not grace:
+                grace = True
+                pb = b
+                continue
+            status = "unstable" if b is not None else ("not_visible" if off is not None else "not_found")
+            raise sim_lookup_failure(agent, scn, step, out, {
+                "status": status, "reads": reads, "swipes": swipes, "elapsed_ms": elapsed_ms, "found": found,
+                "visible": vn, "truncated": truncated, "matches": matches, "off": off, "last_frame": b,
+                "previous_frame": pb, "screen": reply.get("screen")})
+        pb = b
+        if b is None and scroll is not None and len(swipes) < scroll["max"]:
+            sw = {"from": scroll["from"], "to": scroll["to"], "ms": scroll["ms"], "settle_ms": scroll["settle_ms"]}
+            sw_reply, _ = agent.send({"cmd": "swipe", "from": sw["from"], "to": sw["to"], "ms": sw["ms"]})
+            if not sw_reply.get("ok"):
+                raise ProbeError(f"step '{sid}': the agent did not perform swipe {len(swipes) + 1} of the lookup's "
+                                 f"'find.scroll': {sw_reply.get('error') or 'no reply'}; the rehearsal stopped there")
+            swipes.append(sw)
+            pb = None
+            sleep(sw["settle_ms"] / 1000)
+            continue
+        sleep(SIM_FIND_POLL_S)
+
+
+def sim_lookup_failure(agent: SimAgent, scn: dict, step: dict, out: Path, rec: dict) -> LookupFailed:
+    """Write lookup-failed.txt (what was looked for, the status, the matches of the last read and the
+    app's labelled elements) and return the error, built as lookup_failure builds Android's."""
+    sid, find = step["id"], step["find"]
+    typed = [s["text"] for s in scn["steps"] if s["do"] == "text"]
+    labels, _ = agent.send({"cmd": "labels"}, timeout=SIM_FIND_COMMAND_TIMEOUT_S)
+    labels = {k: v for k, v in labels.items() if k != "proof"}
+    want = "exactly one" if "nth" not in find else f"at least {find['nth']}"
+    status, off, scroll = rec["status"], rec["off"], find_scroll(step)
+    count_note = f"; only the first {len(rec['matches'])} are listed" if rec["truncated"] else ""
+    if status == "unstable":
+        seen = ("a match was there but did not hold still: two reads in a row never gave the same frame "
+                f"(frame {rec['previous_frame']} then {rec['last_frame']})")
+    elif status == "not_visible":
+        if off.get("on_screen") is True:
+            if off.get("moved"):
+                why = "the app's tree changed between the agent's read and its hit test, so it could not be asked"
+            elif off.get("not_asked"):
+                why = ("the hit test was not asked (more than ten matches on the display, or more than twenty "
+                       "elements carry the label)")
+            else:
+                why = "XCTest's hit test says a tap there would reach something else"
+                if off.get("under"):
+                    why += (f", probably {json.dumps(off['under'])} (a hint from the order of the app's tree, "
+                            "not a verdict)")
+            where_off = (f"on the screen (frame {off.get('frame')}) where a tap would not reach it: {why}")
+            hint = ("; add 'find.scroll' to bring it clear of what lies over it" if scroll is None else
+                    f"; {len(rec['swipes'])} swipes did not bring it where a tap reaches it")
+        else:
+            screen = rec.get("screen")
+            on = f"a {screen[0]:g} x {screen[1]:g} point screen" if _number_pair(screen) else "the screen"
+            where_off = f"off the screen (frame {off.get('frame')} on {on})"
+            hint = ("; add 'find.scroll' to swipe it into view" if scroll is None else
+                    f"; {len(rec['swipes'])} swipes did not bring it onto the screen")
+        seen = (f"{rec['found']} matched at the last read, {rec['visible']} of them on the screen where a tap reaches "
+                f"them ({want} needed){count_note}: the element is in the app's tree but {where_off}{hint}")
+    else:
+        seen = f"{rec['found']} matched at the last read ({want} needed){count_note}"
+        if rec["visible"] != rec["found"]:
+            seen += f", {rec['visible']} of them on the screen where a tap reaches them"
+    path = out / LOOKUP_FAILED
+    lines = [f"step: {sid}", f"looked for: {describe_find_sim(find)}", f"status: {status}",
+             f"reads: {rec['reads']}", f"swipes: {len(rec['swipes'])}", f"elapsed_ms: {rec['elapsed_ms']}",
+             f"timeout_ms: {find_timeout_ms(scn, step)}",
+             f"matches at the last read: {rec['found']} found, {len(rec['matches'])} listed, {rec['visible']} on the "
+             "screen where a tap reaches them (on_screen and hittable both true; 'under' is a hint only; 'moved': "
+             "the tree changed before the hit test; 'not_asked': the hit test was not asked; 'visible': the part "
+             "the tap point was moved into)"]
+    lines += ["  " + json.dumps(m) for m in redact(rec["matches"], typed)]
+    if typed and isinstance(labels.get("elements"), list):
+        # A field shows typed text reformatted, which no substring check can catch: no value at all.
+        labels = {**labels, "elements": [{k: v for k, v in e.items() if k != "value"} if isinstance(e, dict) else e
+                                         for e in labels["elements"]]}
+        lines += ["what the app's tree held (labels; no element value is written, since the scenario types text "
+                  "that a field may show reformatted):"]
+    else:
+        lines += ["what the app's tree held (labels):"]
+    lines += [json.dumps(redact(labels, typed), indent=1)]
+    try:
+        path.write_text("\n".join(lines) + "\n")
+        where = f"what the screen held is in {path}"
+    except OSError as exc:
+        where = f"{path} could not be written ({exc.strerror or exc})"
+    verb = {"unstable": "did not hold still",
+            "not_visible": ("could not be tapped" if off is not None and off.get("on_screen") is True
+                            else "was not on the screen")
+            }.get(status, "did not appear")
+    swiped = "" if scroll is None else f", {len(rec['swipes'])} swipes"
+    return LookupFailed(f"step '{sid}': {describe_find_sim(find)} {verb} within {find_timeout_ms(scn, step)} ms "
+                        f"({rec['reads']} reads{swiped}): {seen}; {where}. The rehearsal stopped there", sid)
+
+
+def _number_pair(v) -> bool:
+    return (isinstance(v, list) and len(v) == 2
+            and all(isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0 for x in v))
+
+
+def _agent_did(reply: dict, sid: str, what: str, typed: list[str]) -> None:
+    if not reply.get("ok"):
+        raise ProbeError(f"step '{sid}': the agent did not perform the {what}: "
+                         f"{redact(reply.get('error') or 'no reply', typed)}; the rehearsal stopped there")
+
+
+def rehearse_step(agent: SimAgent, scn: dict, step: dict, out: Path) -> tuple[dict, dict]:
+    """Drive one step in a rehearsal: (what rehearsal.json records for it, the line printed for it).
+    Nothing records the text a 'text' step types, only how many characters were typed."""
+    sid, do = step["id"], step["do"]
+    typed = [s["text"] for s in scn["steps"] if s["do"] == "text"]
+    if do == "rest":
+        # the full rest, as in a run: the screen a lookup reads must be the one the run will tap
+        waited = step["ms"]
+        time.sleep(waited / 1000)
+        return {"do": "rest", "waited_ms": waited}, {"waited_ms": waited}
+    settle = step.get("settle_ms", default_settle_ms(do)) / 1000
+    if do == "text":
+        reply, round_trip = agent.send({"cmd": "type", "text": step["text"]}, timeout=type_timeout_s(step["text"]))
+        _agent_did(reply, sid, "typing", typed)
+        if reply.get("typed") != len(step["text"]):
+            raise ProbeError(f"step '{sid}': the agent typed {reply.get('typed')} of {len(step['text'])} characters; "
+                             "the rehearsal stopped there")
+        time.sleep(settle)
+        return ({"do": "text", "typed": reply["typed"], "round_trip_ms": round_trip},
+                {"typed": reply["typed"]})
+    if do == "tap" and "find" in step:
+        found = sim_lookup(agent, scn, step, out)
+        reply, round_trip = agent.send({"cmd": "tap", "x": found["center"][0], "y": found["center"][1]})
+        _agent_did(reply, sid, "tap", typed)
+        time.sleep(settle)
+        return ({"do": "tap", "find": step["find"], **found, "tap_round_trip_ms": round_trip},
+                {"find": step["find"], "center": found["center"], "reads": found["reads"],
+                 "swipes": len(found["swipes"]), "lookup_ms": found["lookup_ms"]})
+    command = sim_command(step)
+    reply, round_trip = agent.send(command)
+    _agent_did(reply, sid, do, typed)
+    time.sleep(settle)
+    return {"do": do, "command": command, "round_trip_ms": round_trip}, {"ok": True}
+
+
+# XCTest's activity log names each typed character: "    t =    14.11s Type '5' into Any (First Match)".
+TYPED_LINE_RE = re.compile(r"""(\bType\s+)(['"\u2018\u201c])(.*?)(['"\u2019\u201d])""")
+AGENT_RESULTS_NOT_KEPT = ("the scenario types text, and the agent's result bundle and derived data log every typed "
+                          "character, so they were removed whatever the test run's status")
+
+
+def scrub_agent_log(path: Path) -> int:
+    """Rewrite the agent's log with the quoted text of every "Type '...'" line removed (the rest of the
+    line kept). Returns the number of lines changed. A log that cannot be rewritten is deleted, so the
+    text is never kept."""
+    try:
+        text = path.read_text(errors="replace")
+    except FileNotFoundError:
+        return 0
+    changed = 0
+
+    def strip(m):
+        nonlocal changed
+        changed += 1
+        return f"{m.group(1)}{m.group(2)}{SIM_REDACTED}{m.group(4)}"
+    lines = [TYPED_LINE_RE.sub(strip, line) for line in text.splitlines(keepends=True)]
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("".join(lines))
+        tmp.replace(path)
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        print(f"ui-probe: {path} could not be rewritten without the typed text ({exc.strerror or exc}); it was removed",
+              file=sys.stderr)
+    return changed
+
+
+def end_rehearsed_app(udid: str, bundle: str, pid: int | None) -> str | None:
+    """Terminate the app and wait for the launched process to be gone. None when it is gone (or never
+    started), else why the rehearsal fails: a run would measure the rehearsed process. Never raises
+    ProbeError: a failure to ask is itself the answer."""
+    try:
+        xcrun("simctl", "terminate", udid, bundle, check=False)
+        if pid is None or sim_app_gone(pid, REHEARSAL_GONE_WAIT_S):
+            return None
+        what = f"was still running {REHEARSAL_GONE_WAIT_S} s after it was terminated"
+    except ProbeError as exc:
+        what = f"could not be terminated or checked ({exc})"
+    return (f"the rehearsed app's process {pid} {what}, and a run would measure it: end it (`xcrun simctl terminate "
+            f"{udid} {bundle}`) and rehearse again")
+
+
+def sim_app_gone(pid: int, wait_s: float) -> bool:
+    """Whether the process is gone, waiting up to wait_s for it to go."""
+    deadline = time.monotonic() + wait_s
+    while host_cputime(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
+
+
+def rehearse(udid: str, scn: dict, out: Path, emit=None) -> dict:
+    """Drive the scenario once in an app process that is then ended (see the section's comment).
+    Writes out/rehearsal.json on success, out/failed.json otherwise; out/raw keeps the agent's log,
+    agent.json and launch.txt. emit(line) is called with one dict per step."""
+    validate_scenario(scn, SIM_PLATFORM, "rehearse")
+    refuse_used(out)
+    refuse_rehearsal_folder(out)
+    below = runs_below(out)
+    if below:
+        raise ProbeError(f"{out} holds runs ({', '.join(below[:5])}{', ...' if len(below) > 5 else ''}); a rehearsal "
+                         "needs a folder of its own")
+    # A simulator that is not booted, or an app that is not installed, is a refusal: nothing is left.
+    facts = sim_facts(udid, scn["package"])
+    out.mkdir(parents=True, exist_ok=True)
+    (out / REHEARSAL_MARKER).write_text(json.dumps({"tool": {"name": "ui-probe", "version": VERSION},
+                                                    "scenario": scn.get("name"), "started": utc_stamp()}, indent=1))
+    previous = {}
+
+    def on_signal(signum, frame):
+        for sig in previous:            # one is enough: let the clean-up finish
+            signal.signal(sig, signal.SIG_IGN)
+        raise Terminated(signum)
+
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            previous[sig] = signal.signal(sig, on_signal)
+    typing = any(s["do"] == "text" for s in scn["steps"])
+    try:
+        return _rehearse(udid, scn, out, emit or (lambda line: None), facts)
+    except BaseException as exc:
+        write_failed(out, exc, scn.get("name"),
+                     {"agent_results": {"kept": False, "why": AGENT_RESULTS_NOT_KEPT}} if typing else None)
+        raise
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def in_front(agent: SimAgent, where: str, sid: str | None = None) -> int:
+    """Ping the agent and require the app in front (state 4), in the words of the run's foreground
+    check; returns the state. The error carries the step (sid) for failed.json."""
+    reply, _ = agent.send({"cmd": "ping"}, timeout=30)
+    state = reply.get("app_state") if reply.get("ok") else None
+    if state is None:
+        exc = ProbeError(f"the agent did not report which app was in front {where}: "
+                         f"{reply.get('error') or 'no reply'}; the rehearsal stopped there")
+    elif state != SIM_APP_IN_FRONT:
+        exc = ProbeError(f"the app was not in front {where} (its state: {SIM_APP_STATES.get(state, state)}); the "
+                         "rehearsal stopped there")
+    else:
+        return state
+    exc.step = sid
+    raise exc
+
+
+def _rehearse(udid: str, scn: dict, out: Path, emit, facts: dict) -> dict:
+    bundle = scn["package"]
+    identity = app_identity(facts.get("app_container") or None)
+    raw = out / "raw"
+    raw.mkdir()
+    started = utc_stamp()
+    done: dict = {}
+    agent = pid = screen = None
+    typing = any(s["do"] == "text" for s in scn["steps"])
+    try:
+        failed = None
+        try:
+            # The app is launched before the agent starts: the agent's first read of the app (the
+            # ping reads its state) ties its later tree reads to the process that was running then,
+            # and a lookup after a relaunch then waits on the process that is gone. The agent's start
+            # overlaps the launch's settle time, which is counted from the launch.
+            pid, launch_wall = sim_launch(udid, scn, raw, bundle)
+            agent = SimAgent(udid, bundle, rehearsal_idle_s(scn), raw, lookups=True, keep_results=not typing)
+            ready = agent.wait_ready(AGENT_START_TIMEOUT_S)
+            screen = ready.get("screen")
+            if not _number_pair(screen):
+                raise ProbeError(f"the input agent's first answer gives no screen size ({screen!r})")
+            left = scn.get("launch_settle_ms", 6000) / 1000 - (time.time() - launch_wall)
+            if left > 0:
+                time.sleep(left)
+            in_front(agent, "after the launch")
+            for step in scn["steps"]:
+                done[step["id"]], line = rehearse_step(agent, scn, step, out)
+                done[step["id"]]["app_state"] = in_front(agent, f"at the end of '{step['id']}'", step["id"])
+                emit({"step": step["id"], "do": step["do"], **line})
+        except BaseException as exc:
+            failed = exc
+            raise
+        finally:
+            # The rehearsed process must not be the one a run measures.
+            with CleanupShield():
+                problem = end_rehearsed_app(udid, bundle, pid)
+            if problem is not None:
+                if failed is None:
+                    raise ProbeError(problem)
+                print(f"ui-probe: also: {problem}", file=sys.stderr)
+    finally:
+        if agent is not None:
+            with CleanupShield():
+                agent.stop()
+                if typing:
+                    scrub_agent_log(raw / "agent.log")
+    record = {
+        "tool": {"name": "ui-probe", "version": VERSION}, "platform": SIM_PLATFORM,
+        "scenario": scn["name"], "scenario_digest": scenario_digest(scn), "udid": udid, "device": facts,
+        "screen": screen, "app": identity, "started": started, "finished": utc_stamp(),
+        "app_ended": {"pid": pid, "gone": True}, "steps": done,
+        **({"agent_results": {"kept": False, "why": AGENT_RESULTS_NOT_KEPT},
+            "agent_log": f"raw/agent.log, with the quoted text of every 'Type' line replaced by {SIM_REDACTED}"}
+           if typing else {}),
+    }
+    tmp = out / (REHEARSAL_FILE + ".tmp")
+    tmp.write_text(json.dumps(record, indent=1))
+    tmp.replace(out / REHEARSAL_FILE)
+    return record
+
+
+def refuse_rehearsal_folder(out: Path) -> None:
+    """Refuse a folder that holds a rehearsal, or lies inside one (a folder above it holds the marker):
+    gate, summary and compare never read inside a rehearsal folder, so a run there would vanish."""
+    held = [name for name in (REHEARSAL_MARKER, REHEARSAL_FILE) if (out / name).exists()]
+    if held:
+        raise ProbeError(f"{out} holds a rehearsal or what is left of one ({', '.join(held)}); a run and a rehearsal "
+                         "each need a folder of their own")
+    above = next((a for a in Path(out).absolute().parents if (a / REHEARSAL_MARKER).exists()), None)
+    if above is not None:
+        raise ProbeError(f"{out} lies inside the rehearsal folder {above} ({REHEARSAL_MARKER}); a run or a rehearsal "
+                         "there would never be read by gate, summary or compare: choose a folder outside it")
+
+
+def runs_below(out: Path) -> list[str]:
+    """The folders at any depth under out that hold a run marker (RUN_MARKERS), relative to out."""
+    if not out.is_dir():
+        return []
+    held = set()
+    for name in RUN_MARKERS:
+        for hit in out.rglob(name):
+            if hit.parent != out:
+                held.add(str(hit.parent.relative_to(out)))
+    return sorted(held)
+
+
+def rehearsal_folders(dirs: list[str]) -> list[tuple[Path, str | None]]:
+    """Every folder under dirs that `ui-probe rehearse` wrote into (it holds REHEARSAL_MARKER), with None
+    when the rehearsal completed, else why it did not."""
+    out = []
+    for d in dirs:
+        root = Path(d)
+        for marker in sorted(root.glob(f"**/{REHEARSAL_MARKER}")):
+            folder = marker.parent
+            if (folder / REHEARSAL_FILE).exists():
+                out.append((folder, None))
+            else:
+                saved = failed_record(folder)
+                out.append((folder, saved or f"it did not finish (no {REHEARSAL_FILE} and no {FAILED_RUN})"))
+    return out
+
+
+def load_rehearsal(path: str) -> dict:
+    return {"path": str(path), "data": read_json(Path(path))}
+
+
+def _replayable(done) -> bool:
+    """A rehearsal's record of a tap with 'find' that a run can replay: a centre and valid swipes."""
+    if not isinstance(done, dict) or done.get("do") != "tap" or not _fraction_pair(done.get("center")):
+        return False
+    swipes = done.get("swipes")
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(swipes, list) and all(
+        isinstance(sw, dict) and _fraction_pair(sw.get("from")) and _fraction_pair(sw.get("to"))
+        and num(sw.get("ms")) and 0 < sw["ms"] <= SIM_SWIPE_MS_MAX and num(sw.get("settle_ms")) and sw["settle_ms"] >= 0
+        for sw in swipes)
+
+
+def check_rehearsal(rehearsal: dict, scn: dict, udid: str, max_age_s: int, identity_now: dict, now: float) -> None:
+    """Refuse a rehearsal that does not describe what is about to be measured: another scenario (by
+    digest), another simulator, a tap with 'find' it holds no position for, an app that changed (or
+    whose identity cannot be read, then or now), or one that finished more than max_age_s ago."""
+    d, where = rehearsal["data"], rehearsal["path"]
+
+    def refuse(msg):
+        raise ProbeError(f"--rehearsal {where}: {msg}")
+
+    if not isinstance(d, dict) or (d.get("tool") or {}).get("name") != "ui-probe" or d.get("platform") != SIM_PLATFORM:
+        refuse(f"not a {REHEARSAL_FILE} written by `ui-probe rehearse`")
+    digest = scenario_digest(scn)
+    if d.get("scenario_digest") != digest:
+        refuse(f"it rehearsed another scenario, or this one before it changed (its scenario digest is "
+               f"{d.get('scenario_digest')}, this scenario's is {digest}); rehearse this scenario again")
+    if d.get("udid") != udid:
+        refuse(f"it was made on simulator {d.get('udid')}, not on {udid}; rehearse on this simulator")
+    steps = d.get("steps") if isinstance(d.get("steps"), dict) else {}
+    missing = [s["id"] for s in sim_find_steps(scn) if not _replayable(steps.get(s["id"]))]
+    if missing:
+        refuse(f"it holds no position for the tap{'s' if len(missing) > 1 else ''} with 'find' "
+               f"{', '.join(repr(m) for m in missing)}; rehearse this scenario again")
+    if not _number_pair(d.get("screen")):
+        refuse("it holds no screen size")
+    then = d.get("app") if isinstance(d.get("app"), dict) else {}
+    for key, name in APP_IDENTITY.items():
+        a, b = then.get(key), identity_now.get(key)
+        if a is None or b is None:
+            why = "; ".join((then.get("unknown") or []) if a is None else (identity_now.get("unknown") or []))
+            refuse(f"the app's {name} is unknown {'in the rehearsal' if a is None else 'now'}"
+                   + (f" ({why})" if why else "") + ", so whether the app changed since cannot be told")
+        if a != b:
+            refuse(f"the app changed since the rehearsal: its {name} was {a}, is {b}; rehearse again")
+    finished = parse_utc_stamp(d.get("finished"))
+    if finished is None:
+        refuse(f"its finish time {d.get('finished')!r} cannot be read")
+    age = now - finished
+    if age < 0:
+        refuse(f"it finished at {d.get('finished')}, after now; the host's clock has moved back")
+    if age > max_age_s:
+        refuse(f"it finished {int(age)} s ago ({d.get('finished')}), more than --rehearsal-max-age-s {max_age_s}; "
+               "rehearse again")
 
 
 # --------------------------------------------------------------------------------------------
@@ -2002,9 +2767,12 @@ SIM_LOG_FLUSH_WAIT_S = 1      # before the read, for the store to hold the last 
 SIM_LOG_TIMEOUT_S = 180
 # A rest's recorded frames are excused (a note, not a violation) when the app presented nothing by
 # any count, there are at most this many, and none changed any pixel by more than this many grey
-# levels at the analysis scale: the encoder refining a still picture after motion. Measured: such
-# frames changed at most 17 levels (17 rest windows); a 20 pt spinner and a caret changed 165 or more.
-SIM_REFINE_FRAMES_MAX = 2
+# levels at the analysis scale: the encoder refining a still picture after motion. Measured on 523
+# still rest windows of one app: 52 held such frames (32 one, 18 two, 2 three), each changing at
+# most 17 levels; a 20 pt spinner and a caret changed 165 or more. The count sits at twice the
+# largest measured (it was 2 until three frames failed two clean runs): anything an app or the
+# render server animates lasts longer than six frames.
+SIM_REFINE_FRAMES_MAX = 6
 SIM_REFINE_DELTA_MAX = 24
 # ... and changed at most this many pixels by ui_video.CHANGE_LEVEL (8) or more, none of them where the
 # previous picture was flat. Measured: 17 rest windows on five screens of one app changed 28 to 193
@@ -2177,8 +2945,11 @@ def store_counts(raw: Path, scn: dict, steps_out: list[dict], result: dict) -> N
             st["signposts"] = {name: (None if name in unmatched else n) for name, n in counted.items()}
 
 
-def sim_command(step: dict) -> dict:
-    """The agent command for an input step (the token is added when it is sent)."""
+def sim_command(step: dict, resolved: dict | None = None) -> dict:
+    """The agent command for an input step (the token is added when it is sent); a tap with 'find' goes
+    where the rehearsal found its element (resolved)."""
+    if step["do"] == "tap" and "find" in step:
+        return {"cmd": "tap", "x": resolved["x"], "y": resolved["y"]}
     if step["do"] == "tap":
         return {"cmd": "tap", "x": step["x"], "y": step["y"]}
     return {"cmd": "swipe", "from": step["from"], "to": step["to"], "ms": step.get("ms", 300)}
@@ -2267,7 +3038,8 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
             **({} if "app_state" not in data else {
                 "app_state": data.get("app_state"),
                 "agent": {"command": data.get("command"), "reply": data.get("reply"),
-                          "round_trip_ms": data.get("round_trip_ms"), "end_ping": data.get("end_ping")}})})
+                          "round_trip_ms": data.get("round_trip_ms"), "end_ping": data.get("end_ping")}}),
+            **({} if "resolved" not in data else {"resolved": data["resolved"]})})
         prev = pid_now if pid_now is not None else prev
     result = {
         "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": SIM_PLATFORM,
@@ -2315,6 +3087,11 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
     if r.get("launch_env_dropped"):
         notes.append(f"{', '.join(r['launch_env_dropped'])} in ui-probe's own environment were not passed to the app: "
                      "the scenario's launch_env is the only source")
+    resolved = [s["resolved"] for s in r.get("steps", []) if s.get("resolved")]
+    if resolved:
+        notes.append(f"{len(resolved)} tap{'s' if len(resolved) != 1 else ''} by 'find' went to positions found by the "
+                     f"rehearsal {resolved[0].get('rehearsal')} (finished {resolved[0].get('rehearsal_finished')}); the "
+                     "measured run looked nothing up")
     if uses_agent:
         stop = (r.get("agent") or {}).get("stop")
         if stop is None:
@@ -2353,6 +3130,12 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                 fail("foreground", sid, f"the app was not in front at the end of '{sid}' (its state: "
                      f"{SIM_APP_STATES.get(state, state)})", observed=state)
         if want in SIM_INPUT_KINDS:
+            replayed = (s.get("resolved") or {}).get("swipes") or []
+            for n, sw in enumerate(replayed, 1):
+                sw_reply = sw.get("reply") or {}
+                if not sw_reply.get("ok"):
+                    fail("input", sid, f"the agent did not perform swipe {n} of {len(replayed)} replayed from the "
+                         f"rehearsal before the tap: {sw_reply.get('error') or 'no reply'}")
             reply = (s.get("agent") or {}).get("reply") or {}
             if not reply.get("ok"):
                 fail("input", sid, f"the agent did not perform the {want}: {reply.get('error') or 'no reply'}")
@@ -2369,6 +3152,20 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                          "be incomplete", observed=s.get("recorder_exit"))
             expect = step.get("expect") or {}
             gate_signposts(fail, sid, s, expect, spec, store)
+            if want == "tap" and "find" in step:
+                # A replayed tap goes to a position, not to an element: one that changed nothing on the
+                # screen probably missed its target. An approved signature of '-' says nothing is expected.
+                got = None if rec is None or rec.get("error") else rec.get("signature")
+                if rec is None or rec.get("error"):
+                    fail("input", sid, "whether the replayed tap reached its target cannot be told: "
+                         + ("no recording was saved" if rec is None else f"the recording could not be used: {rec['error']}"))
+                elif got is None:
+                    notes.append(f"{sid}: the replayed tap's signature is unknown, so whether it changed anything on the "
+                                 "screen was not checked")
+                elif got == "-" and expect.get("signature") != "-":
+                    fail("input", sid, "the replayed tap changed nothing on the screen (signature '-'), so it probably "
+                         "missed its target; give the step expect.signature '-' if nothing is meant to change",
+                         observed=got)
             if "signature" in expect:
                 got = None if rec is None or rec.get("error") else rec.get("signature")
                 if got is None:
@@ -2456,9 +3253,17 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                 notes.append(f"{sid}: {total} frames recorded at rest ({classes}), above the limit of "
                              f"{opts['rest_frames_max']} that would otherwise apply; passed on the step's allowance of "
                              f"{frames_max} ({reason})")
-            if rec["identical"] > 0:
-                fail("rest-video", sid, f"{rec['identical']} frames were composed at rest that changed nothing on screen",
-                     observed=rec["identical"])
+            unchanged_max = allow.get("unchanged_frames_max", 0)
+            if rec["identical"] > unchanged_max:
+                fail("rest-video", sid, f"{rec['identical']} frames were composed at rest that changed nothing on screen"
+                     + (f", allowed {unchanged_max}{by('unchanged_frames_max')}" if "unchanged_frames_max" in allow else ""),
+                     observed=rec["identical"],
+                     **({"allowed": unchanged_max} if "unchanged_frames_max" in allow else {}),
+                     **extra("unchanged_frames_max"))
+            elif "unchanged_frames_max" in allow and rec["identical"] > 0:
+                notes.append(f"{sid}: {rec['identical']} recorded frames changed nothing on screen at rest, above the "
+                             f"limit of 0 that would otherwise apply; passed on the step's allowance of {unchanged_max} "
+                             f"({reason})")
             if changed > changed_max:
                 fail("rest-video", sid, f"the screen changed at rest: {changed} recorded frames changed pixels "
                      f"({rec['changed_app']} in the app's area, {rec['changed_app_noise']} by encoder noise only, "
@@ -2952,27 +3757,54 @@ def failed_scenario(run_dir: Path) -> str | None:
     return data.get("scenario") if isinstance(data, dict) and isinstance(data.get("scenario"), str) else None
 
 
-def find_runs(dirs: list[str]) -> list[tuple[Path, str | None, str | None]]:
+def find_runs(dirs: list[str], rehearsals: list | None = None) -> list[tuple[Path, str | None, str | None]]:
     """Every run folder under dirs with the reason it cannot be used and the check that reason
     belongs to, or (path, None, None). Captures are enumerated, not analyses: a capture whose
     analysis is missing or older than the capture is reported ('analysis'), never skipped. A folder
     a run started but did not complete (one with failed.json, device-script.sh or raw/ and neither
     capture.json nor run.json) is reported too ('run'), so a batch with a failed run never passes
-    on the runs that completed."""
+    on the runs that completed. A folder `ui-probe rehearse` wrote into is not a run and is passed
+    over, with what lies inside it; rehearsals, when given, receives (folder, why it did not
+    complete or None) for each."""
+    skipped = rehearsal_folders(dirs)
+    if rehearsals is not None:
+        rehearsals.extend(skipped)
     found, started = set(), set()
+    hits: list[tuple[Path, str]] = []
     for d in dirs:
         root = Path(d)
         if not root.exists():
             raise ProbeError(f"{d} does not exist")
         for name in ("capture.json", "run.json"):
+            hits += [(p.parent, name) for p in root.glob(f"**/{name}")]
             found.update(p.parent for p in root.glob(f"**/{name}"))
         for name in (FAILED_RUN, "device-script.sh"):
+            hits += [(p.parent, name) for p in root.glob(f"**/{name}")]
             started.update(p.parent for p in root.glob(f"**/{name}"))
+        hits += [(p.parent, "raw") for p in root.glob("**/raw") if p.is_dir()]
         started.update(p.parent for p in root.glob("**/raw") if p.is_dir())
+
+    def rehearsal_of(p: Path) -> Path | None:
+        return next((f for f, _ in skipped if p == f or f in p.parents), None)
+
+    # A rehearsal folder is passed over, but only its own raw/ and failed.json: any other run marker in
+    # it (a run written inside it) stops here, since skipping it would hide that run.
+    for parent, name in sorted(hits):
+        f = rehearsal_of(parent)
+        if f is None:
+            continue
+        own = (parent == f and name in ("raw", FAILED_RUN)) or parent == f / "raw" or (f / "raw") in parent.parents
+        if not own:
+            raise ProbeError(f"{parent} holds a run marker ({name}) inside the rehearsal folder {f}; a rehearsal folder "
+                             "is passed over, so that run would not be read: move it out of the rehearsal folder")
+    found = {p for p in found if rehearsal_of(p) is None}
+    started = {p for p in started if rehearsal_of(p) is None}
     incomplete = started - found
     if not found and not incomplete:
         raise ProbeError("no run found (no capture.json, run.json, failed.json, device-script.sh or raw/) under "
-                         + ", ".join(dirs))
+                         + ", ".join(dirs)
+                         + (f"; {len(skipped)} rehearsal folder{'s' if len(skipped) != 1 else ''} passed over"
+                            if skipped else ""))
     out = []
     for run_dir in sorted(found | incomplete):
         if run_dir in incomplete:
@@ -3212,7 +4044,7 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
         if s["kind"] == "rest":
             # A step's allowance replaces, for this step only, the limit the command line, the
             # scenario's gate block or the default would set. Recorded frames that changed nothing
-            # have no allowance: that check is what catches an invisible animation.
+            # are allowed only by unchanged_frames_max; that check is what catches an invisible animation.
             allow = (step or {}).get("allow") or {}
             reason = allow.get("reason")
 
@@ -3229,6 +4061,7 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
 
             frames_max, frames_otherwise, frames_allowed = step_limit("frames_max", opts["rest_frames_max"])
             changed_max, changed_otherwise, changed_allowed = step_limit("changed_frames_max", 0)
+            unchanged_max, unchanged_otherwise, unchanged_allowed = step_limit("unchanged_frames_max", 0)
             cpu_max, cpu_otherwise, cpu_allowed = step_limit("cpu_pct_max", opts["rest_cpu_pct_max"])
             allowance = lambda granted: {"limit_from": "allowance"} if granted else {}
             counted, source = frame_count(s)
@@ -3267,8 +4100,13 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 real = vid.get("app_changed_frames_real", vid["app_region_frames"])
                 quiet_identical = identical > 0 and presented_none
                 quiet_change = real > 0 and presented_none and not changed_allowed
-                if identical > 0 and not quiet_identical:
-                    findings.append((identical, 0, False, f"{identical} frames were composed at rest that changed nothing on screen"))
+                if identical > unchanged_max and not quiet_identical:
+                    findings.append((identical, unchanged_max, unchanged_allowed,
+                                     f"{identical} frames were composed at rest that changed nothing on screen"
+                                     + (f", allowed {unchanged_max}{by_allowance(True)}" if unchanged_allowed else "")))
+                elif unchanged_allowed and identical > unchanged_otherwise and not quiet_identical:
+                    within_allowance(identical, unchanged_otherwise, unchanged_max,
+                                     "recorded frames changed nothing on screen at rest")
                 if quiet_change and quiet_identical:
                     notes.append(f"{sid}: {identical} frames were composed at rest that changed nothing on screen and the "
                                  f"screen changed in {real} recorded frames in the app's area, but the app presented no "
@@ -3359,7 +4197,8 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
     if scenario is not None:
         validate_scenario(scenario, "any")      # strictly again for each run, once its platform is known
     out = {"tool": {"name": "ui-probe", "version": VERSION}, "runs": []}
-    for path, problem, check in find_runs(dirs):
+    rehearsals: list = []
+    for path, problem, check in find_runs(dirs, rehearsals):
         if problem:
             name = scenario["name"] if scenario else failed_scenario(path)
             out["runs"].append({"run": str(path), "scenario": name, "frame_sources": None, "limits": None, "allowances": None,
@@ -3393,6 +4232,10 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
                             "limits": opts, "allowances": allowances,
                             "allowances_from": "--scenario" if scenario is not None else "capture", **res})
     out["verdict"] = "FAIL" if any(x["verdict"] == "FAIL" for x in out["runs"]) else "PASS"
+    unfinished = [f"a rehearsal that did not complete was passed over (not a run): {folder}: {why}"
+                  for folder, why in rehearsals if why is not None]
+    if unfinished:
+        out["notes"] = unfinished
     return out
 
 
@@ -3631,10 +4474,20 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("run", help="run a scenario on a device and analyse it")
     target = r.add_mutually_exclusive_group(required=True)
     target.add_argument("--serial", help="an Android device or emulator")
-    target.add_argument("--simulator", metavar="UDID", help="a booted iOS Simulator (rest steps only)")
+    target.add_argument("--simulator", metavar="UDID", help="a booted iOS Simulator")
     r.add_argument("--scenario", required=True)
     r.add_argument("--out", required=True, help="a directory that does not yet hold runs")
     r.add_argument("--runs", type=int, default=1)
+    r.add_argument("--rehearsal", default=None, metavar="FILE",
+                   help="a simulator scenario with a tap by 'find': the rehearsal.json of `ui-probe rehearse`")
+    r.add_argument("--rehearsal-max-age-s", default=None, metavar="N",
+                   help=f"refuse a rehearsal that finished more than N seconds ago (default {REHEARSAL_MAX_AGE_S})")
+    h = sub.add_parser("rehearse", help="drive a simulator scenario once, with lookups and typing, in an app process "
+                                        "that is then ended; nothing is measured")
+    h.add_argument("--simulator", metavar="UDID", default=None, help="a booted iOS Simulator")
+    h.add_argument("--serial", default=None, help=argparse.SUPPRESS)       # refused with a message of its own
+    h.add_argument("--scenario", required=True)
+    h.add_argument("--out", required=True, help="a directory that holds no run and no rehearsal")
     r.add_argument("--trace", action="store_true", help="record the compositor's frame timeline")
     r.add_argument("--sections", action="store_true", help="also record trace sections (implies --trace)")
     r.add_argument("--no-video", action="store_true")
@@ -3700,12 +4553,48 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
 
+def rehearsal_for_run(args, scn: dict) -> dict | None:
+    """The checked rehearsal a simulator run replays its taps with 'find' from, or None when the scenario
+    has none. Every refusal comes before the first run starts."""
+    finds = sim_find_steps(scn)
+    if args.rehearsal_max_age_s is not None and args.rehearsal is None:
+        raise ProbeError("--rehearsal-max-age-s applies only with --rehearsal")
+    if args.rehearsal is None:
+        if finds:
+            raise ProbeError(no_rehearsal_message(scn, args.simulator, args.scenario))
+        return None
+    if not finds:
+        raise ProbeError("--rehearsal applies only to a scenario with a tap by 'find'; this one has none, so there is "
+                         "nothing to replay")
+    max_age = REHEARSAL_MAX_AGE_S
+    if args.rehearsal_max_age_s is not None:
+        text = str(args.rehearsal_max_age_s).strip()
+        if not re.fullmatch(r"[0-9]+", text) or int(text) < 1:
+            raise ProbeError(f"--rehearsal-max-age-s must be a whole number of seconds of at least 1, not {text!r}")
+        max_age = int(text)
+    rehearsal = load_rehearsal(args.rehearsal)
+    check_rehearsal(rehearsal, scn, args.simulator, max_age, sim_app_identity(args.simulator, scn["package"]),
+                    time.time())
+    return rehearsal
+
+
 def _dispatch(args) -> int:
-    if args.cmd == "run":
+    if args.cmd == "rehearse":
+        if args.serial is not None:
+            raise ProbeError("rehearse is for the iOS Simulator (--simulator); on Android a lookup happens inside the run, "
+                             "so there is nothing to rehearse")
+        if args.simulator is None or not args.simulator.strip():
+            raise ProbeError("rehearse needs --simulator with the udid of a booted iOS Simulator")
+        scn = load_scenario(args.scenario)
+        out = Path(args.out)
+        rehearse(args.simulator, scn, out, emit=lambda line: print(json.dumps(line), flush=True))
+        print(json.dumps({"rehearsal": str(out / REHEARSAL_FILE)}), flush=True)
+    elif args.cmd == "run":
         scn = load_scenario(args.scenario)
         for flag, value in (("--serial", args.serial), ("--simulator", args.simulator)):
             if value is not None and not value.strip():
                 raise ProbeError(f"{flag} needs a value; an empty one names no device")
+        rehearsal = None
         if args.simulator:
             unsupported = [flag for flag, on in (("--trace", args.trace), ("--sections", args.sections),
                                                  ("--no-video", args.no_video)) if on]
@@ -3713,13 +4602,18 @@ def _dispatch(args) -> int:
                 raise ProbeError(f"{', '.join(unsupported)} cannot be used with --simulator: there is no trace on the iOS "
                                  "Simulator, and the recording is its only witness of frames")
             validate_scenario(scn, SIM_PLATFORM)
+            rehearsal = rehearsal_for_run(args, scn)
         else:
+            if args.rehearsal is not None or args.rehearsal_max_age_s is not None:
+                raise ProbeError("--rehearsal and --rehearsal-max-age-s apply only with --simulator: on Android a "
+                                 "lookup happens inside the run")
             validate_scenario(scn)
         base = Path(args.out)
+        refuse_rehearsal_folder(base)
         for i in range(1, args.runs + 1):
             rid = f"run-{i:02d}"
             if args.simulator:
-                res = run_once_sim(args.simulator, scn, base / rid)
+                res = run_once_sim(args.simulator, scn, base / rid, rehearsal)
                 line = {"run": rid, "load": res["host"]["load1_before"]}
                 for st in res["steps"]:
                     if st["kind"] == "rest":
@@ -3776,6 +4670,8 @@ def _dispatch(args) -> int:
             for sid, allow in (run.get("allowances") or {}).items():
                 granted = ", ".join(f"{k} {allow[k]}" for k in ALLOW_LIMITS if k in allow)
                 print(f"  allowance: {sid}: {granted} ({allow['reason']}){source}")
+        for n in out.get("notes") or []:
+            print(f"note: {n}")
         print(f"gate: {out['verdict']}" + (" (advisory)" if args.advisory and out["verdict"] == "FAIL" else ""))
         return 1 if out["verdict"] == "FAIL" and not args.advisory else 0
     elif args.cmd == "compare":

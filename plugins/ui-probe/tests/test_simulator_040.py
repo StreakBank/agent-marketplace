@@ -50,9 +50,12 @@ if cmd == "list":
     print(read("devices.json", '{{"devices": {{}}}}')); sys.exit(0)
 if cmd == "get_app_container":
     if os.path.exists(os.path.join(S, "installed")):
-        print("/containers/app"); sys.exit(0)
+        print(read("container", "/containers/app").strip()); sys.exit(0)
     sys.stderr.write("No such app\\n"); sys.exit(2)
 if cmd == "terminate":
+    # an app terminated by the host: its process is gone for `ps` until the next launch (see PS)
+    if not a[-1].endswith(".xctrunner"):
+        open(os.path.join(S, "terminated"), "w").write(" ".join(a[2:]) + "\\n")
     sys.exit(3)
 if cmd == "spawn" and a[3:5] == ["log", "show"] and "--predicate" not in a:
     # the second read, of every process: events of other processes stamped now (after the last step)
@@ -125,6 +128,8 @@ if cmd == "status_bar":
     open(os.path.join(S, "statusbar-cleared"), "w").write("done")
     sys.exit(0)
 if cmd == "launch":
+    if os.path.exists(os.path.join(S, "terminated")):
+        os.remove(os.path.join(S, "terminated"))
     with open(os.path.join(S, "launch-order"), "a") as f:
         f.write("agent started before the launch\\n" if os.path.exists(os.path.join(S, "agent-pids")) else "no agent yet\\n")
     out = read("launch.out", f"{{a[3]}}: {PID}\\n")
@@ -160,7 +165,9 @@ sys.exit(65)
 
 XCODEBUILD = f"""#!{sys.executable} -B
 # xcodebuild: -version, build-for-testing (writes an .xctestrun) and test-without-building (a small
-# agent that speaks the input agent's protocol on the port the host passed)
+# agent that speaks the input agent's protocol on the port the host passed). With
+# TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS=1 it also serves find (its replies, one per command, from
+# finds.json in the state folder; the last is repeated), type and labels, as the agent does.
 import hashlib, hmac, json, os, select, signal, socket, subprocess, sys, time
 S = os.environ["SIMSTATE"]
 def read(name, default=""):
@@ -194,6 +201,12 @@ open(os.path.join(S, "agent-env.json"), "w").write(json.dumps({{"env": env, "arg
 port, token = int(env["TEST_RUNNER_UI_PROBE_AGENT_PORT"]), env["TEST_RUNNER_UI_PROBE_AGENT_TOKEN"]
 idle = float(env["TEST_RUNNER_UI_PROBE_AGENT_IDLE_S"])
 mode = read("agent.mode", "ok").strip()
+lookups = env.get("TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS") == "1"
+if read("lookups.mode").strip():            # an agent that reports the wrong mode
+    lookups_reported = read("lookups.mode").strip() == "on"
+else:
+    lookups_reported = lookups
+finds = json.loads(read("finds.json", "[]"))
 print("Testing started", flush=True)
 if mode == "exit":
     print("Testing failed: Unable to boot the test runner", flush=True); sys.exit(70)
@@ -231,7 +244,29 @@ while True:
         log("agent-cmds", json.dumps(cmd))
         c = obj.get("cmd")
         if c == "ping":
-            reply = {{"ok": True, "app_state": int(read("appstate", "4")), "screen": [393.0, 852.0]}}
+            reply = {{"ok": True, "app_state": int(read("appstate", "4")),
+                      "screen": json.loads(read("screen.json", "[393.0, 852.0]")), "lookups": lookups_reported}}
+        elif c in ("find", "type", "labels") and not lookups:
+            reply = {{"ok": False, "error": "'" + c + "' is refused: this agent was started for a measured run"}}
+        elif c == "find":
+            n = int(read("find.n", "0")); open(os.path.join(S, "find.n"), "w").write(str(n + 1))
+            reply = dict(finds[min(n, len(finds) - 1)]) if finds else {{"ok": True, "found": 0, "matches": []}}
+            reply.setdefault("ok", True); reply.setdefault("screen", [393.0, 852.0])
+        elif c == "type":
+            if read("type.mode").strip() == "short":         # a character lost
+                reply = {{"ok": True, "typed": len(obj["text"]) - 1}}
+            elif read("type.mode").strip() == "nofocus":
+                reply = {{"ok": False, "error": "no element has keyboard focus (typed 0 of " + str(len(obj["text"]))
+                          + " characters); tap the field first"}}
+            else:
+                # XCTest's activity log names every typed character, as the real agent's log does
+                for ch in obj["text"]:
+                    print("    t =    14.11s Type '" + ch + "' into Any (First Match)", flush=True)
+                reply = {{"ok": True, "typed": len(obj["text"])}}
+        elif c == "labels":
+            reply = {{"ok": True, "truncated": False, "elements": json.loads(read("labels.json", "[]"))}}
+        elif c == "swipe" and mode == "refuse-swipe":
+            reply = {{"ok": False, "error": "swipe failed: the drag was not delivered"}}
         elif c == "tap" and mode == "refuse-tap":
             reply = {{"ok": False, "error": "tap failed: the touch was not delivered"}}
         elif c in ("tap", "swipe"):
@@ -262,7 +297,8 @@ lines = open(seq).read().splitlines() if os.path.exists(seq) else []
 n = int(open(os.path.join(S, "cpu.n")).read()) if os.path.exists(os.path.join(S, "cpu.n")) else 0
 open(os.path.join(S, "cpu.n"), "w").write(str(n + 1))
 value = lines[n] if n < len(lines) else (lines[-1] if lines else "0:00.00")
-if value == "GONE":
+# an app terminated by the host is gone, unless the state says it outlives that
+if value == "GONE" or (os.path.exists(os.path.join(S, "terminated")) and not os.path.exists(os.path.join(S, "undying"))):
     sys.exit(1)
 print("  " + value)
 """
@@ -388,12 +424,14 @@ class SimScenarioTest(unittest.TestCase):
                              "steps": [{"id": "r", "do": "rest", "ms": 5000,
                                         "allow": {"cpu_pct_max": 4, "frames_max": 12, "reason": "caret"}}]}, u.SIM_PLATFORM)
 
-    def test_keys_text_and_lookups_are_refused(self):
+    def test_keys_and_text_are_refused(self):
+        # 0.6.0: a tap with 'find' is accepted (it is replayed from a rehearsal); typing stays refused in a run
         self.reject({**SCN, "steps": [{"id": "k", "do": "key", "code": 4}]},
                     "step 'k': a 'key' step is refused on the iOS Simulator: a simulator has no keys to press")
-        for st in ({"id": "x", "do": "text", "text": "a"}, {"id": "f", "do": "tap", "find": {"text": "Go"}}):
-            self.reject({**SCN, "steps": [st]}, "a lookup or typing reads the app's accessibility tree, which changed "
-                                                "the app at rest when measured")
+        self.reject({**SCN, "steps": [{"id": "x", "do": "text", "text": "a"}]},
+                    "step 'x': a 'text' step is refused in a measured run on the iOS Simulator: a field that has had "
+                    "focus changes the app for the rest of its life")
+        u.validate_scenario({**SCN, "steps": [{"id": "f", "do": "tap", "find": {"text": "Go"}}]}, u.SIM_PLATFORM)
 
     def test_refused_keys(self):
         self.reject({**SCN, "activity": ".Main"}, "'activity': the iOS Simulator launches the app by its bundle identifier")
@@ -837,7 +875,7 @@ class SimGateTest(unittest.TestCase):
         res = self.gate(sim_run(frames=13, changed_app=13), scn)
         self.assertEqual(self.checks(res), ["rest-frames", "rest-video"])
         self.assertEqual({v["limit_from"] for v in res["violations"]}, {"allowance"})
-        # frames that changed nothing have no allowance
+        # frames that changed nothing: frames_max and changed_frames_max do not reach them
         res = self.gate(sim_run(frames=2, identical=2), scn)
         self.assertEqual(self.checks(res), ["rest-video"])
 

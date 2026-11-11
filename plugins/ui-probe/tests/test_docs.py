@@ -88,7 +88,8 @@ class ReadmeMatchesCodeTest(unittest.TestCase):
 
     def test_020_additions_documented(self):
         self.assertIn("## Screens that are never still", README)
-        self.assertIn("There is no allowance for recorded frames that changed nothing", README)
+        # 0.6.0: an allowance of their own, never reached by frames_max or changed_frames_max
+        self.assertIn("Recorded frames that changed nothing are allowed only by `unchanged_frames_max`", README)
         self.assertNotIn("identical_frames_max", " ".join(u.ALLOW_LIMITS))
         self.assertIn("a blinking caret drew 10 or 11 frames in a 5 s rest window (9 of 9 windows)", README)
         self.assertIn("produced 1 frame by the platform's count, 9 recorded frames that changed nothing and 9 CPU ticks",

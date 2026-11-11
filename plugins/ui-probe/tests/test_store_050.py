@@ -224,11 +224,23 @@ class StoreGateTest(unittest.TestCase):
         self.assertIn("ui-probe zoom <run-dir> <a> <b> --step rest-a", note)
         self.assertEqual(self.gate(sim_run(frames=1, identical=1, largest_change=0.0, changed_px=0, flat_px=0))["verdict"],
                          "PASS")
+        # three frames, as two clean runs recorded them (one changed, one noise, one identical): the
+        # frame that changed nothing is excused with the others, not held as composed for nothing
+        res = self.gate(sim_run(frames=3, changed_app=1, changed_app_noise=1, identical=1, largest_change=14.0,
+                                changed_px=66, flat_px=0))
+        self.assertEqual(res["verdict"], "PASS", res)
+        self.assertTrue(any(n.startswith("rest-a: 3 frames recorded at rest") for n in res["notes"]), res["notes"])
+        # the limit itself
+        top = u.SIM_REFINE_FRAMES_MAX
+        res = self.gate(sim_run(frames=top, changed_app_noise=top, largest_change=14.0, changed_px=38, flat_px=0))
+        self.assertEqual(res["verdict"], "PASS", res)
+        self.assertTrue(any(n.startswith(f"rest-a: {top} frames recorded at rest") for n in res["notes"]), res["notes"])
 
     def test_otherwise_the_frames_are_held(self):
         held = {"frames": 2, "changed_app_noise": 2, "largest_change": 14.0}
         for run, checks in ((sim_run(known=False, **held), ["rest-frames", "rest-video"]),
-                            (sim_run(frames=3, changed_app_noise=3, largest_change=14.0), ["rest-frames", "rest-video"]),
+                            (sim_run(frames=u.SIM_REFINE_FRAMES_MAX + 1, changed_app_noise=u.SIM_REFINE_FRAMES_MAX + 1,
+                                     largest_change=14.0), ["rest-frames", "rest-video"]),
                             (sim_run(frames=2, changed_app_noise=2, largest_change=24.5), ["rest-frames", "rest-video"]),
                             (sim_run(frames=2, changed_app_noise=2, largest_change=None), ["rest-frames", "rest-video"]),
                             (sim_run(updates=1, **held), ["rest-updates", "rest-frames", "rest-video"]),

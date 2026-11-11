@@ -23,10 +23,14 @@ results. This rule adds only what the plugin deliberately does not know.
 ## Device and reference profile
 
 - **Device:** `<avd or device name>` (<api, resolution, memory, cores, refresh rate>).
-- **iOS Simulator (rest steps only), if used:** `<simulator name and runtime>`, identified by name and
+- **iOS Simulator, if used:** `<simulator name and runtime>`, identified by name and
   resolved to its udid at run time; which scenarios run there (rests, taps and swipes) and with what
   limits; any `launch_env` the app needs there (no secrets: it is saved with each run).
   Identify it by name, never by serial.
+- **Rehearsals on the simulator, if used:** <which scenarios are rehearsed (`ui-probe rehearse`) before
+  they run, which scenario only types (a sign-in) and when it runs, where rehearsal folders are kept
+  (apart from the run folders the gate reads), the `--rehearsal-max-age-s` used, and how the
+  backend's content is held fixed between a rehearsal and its runs>.
 - **Reference profile:** <the settings every baseline assumes: network path, proxy or none,
   font scale, animation scales, compile state>.
 - **Other profiles run on the gate:** <low memory, slow network with its numbers, large font>.

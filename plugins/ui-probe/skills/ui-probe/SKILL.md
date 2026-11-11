@@ -1,6 +1,6 @@
 ---
 name: ui-probe
-description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rests, taps and swipes; needs no changes to the app.
+description: Check that a mobile app is smooth and efficient by watching it from outside while a scripted scenario runs. Use when asked whether a screen does work while idle (frames or CPU at rest), whether a tap flickers, flashes a skeleton or replays an animation, to see frame by frame what a step looked like, to gate a change on those counts, to compare two builds' timings honestly, or to run an app under a slow network. Android over adb, and the iOS Simulator for rests, taps and swipes (lookups and typing there in a rehearsal); needs no changes to the app.
 allowed-tools:
   - Bash
   - Read
@@ -70,13 +70,29 @@ element was in the tree but off the screen. A backend on the host behind `ui-pro
 `--map-host 10.0.2.2=127.0.0.1` on an emulator. A screen that is
 never still by design (a blinking caret) gets an `allow` on its rest step, with a `reason`, and
 every step that ends on it a fixed wait (`"until_quiet": false`), since such a screen never goes
-quiet; never an allowance for recorded frames that changed nothing (there is none). The README's "Screens that are never still" has the
+quiet. Recorded frames that changed nothing take `allow.unchanged_frames_max` only for a screen
+whose own caret composes them (measured on one framework's caret on the iOS Simulator); they are
+what an invisible animation leaves, so never allow them to hide one. The README's "Screens that are never still" has the
 measured numbers.
 
 On the iOS Simulator (`run --simulator <udid>`) a scenario holds rests of at least 1000 ms, taps
 (`x`, `y`) and swipes, the input sent through ui-probe's input agent (built once with `xcodebuild`,
-installed on the simulator for the run and removed after). There are no lookups and no typing
-there: an accessibility read can change the app it reads, so give positions as fractions. The run
+installed on the simulator for the run and removed after). A measured run never looks up and never
+types (an accessibility read, or a field that has had focus, changes the app for the rest of its
+life). A tap may still name its target with `find`: first run `ui-probe rehearse --simulator <udid>
+--scenario <file> --out <dir>`, which drives the scenario once in an app process it then ends,
+looking elements up and typing there, then `ui-probe run --simulator <udid> ... --rehearsal
+<dir>/rehearsal.json`, which replays the positions found. The run refuses a rehearsal of another
+scenario (its digest), simulator, or app (the two versions in `Info.plist`, the executable's sha256
+and a digest of every file in the bundle), or one older than `--rehearsal-max-age-s` (3600). Typing, such
+as a sign-in, goes in a scenario of its own that only `rehearse` drives. A rehearsal's folder is not
+a run: `gate` passes over it and notes one that did not complete; never put runs inside one. A lookup's match counts only
+when XCTest's hit test says a tap would reach it; a target near a bar is safest with a
+`find.scroll`. Give every replayed tap with a stable transition an `expect.signature`: without
+one the gate catches only a replayed tap that changed nothing, not one that landed on another
+control. A rehearsal waits every rest in full and requires the app in front after each step. A
+rehearsal that types keeps no typed character in its files. Positions hold only while
+the screen is the same in both passes: keep the backend's content fixed between them. The run
 freezes the status bar, and every frame recorded at rest after the first fails, whatever it
 changed: a screen that is never still by design needs `allow.frames_max` and
 `allow.changed_frames_max` on its rest. A tap or swipe may carry `expect.signature`. `launch_env`

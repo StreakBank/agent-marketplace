@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0 — 2026-11-11
+
+- ui-probe 0.6.0: a rehearsal on the iOS Simulator. `ui-probe rehearse` drives a scenario once in
+  an app process that is then ended; there the input agent may look elements up by their label and
+  type, which a measured run never does, because either changes the app for the rest of its
+  process's life. `ui-probe run --rehearsal` replays the positions found by coordinate in a fresh
+  process, the one measured, after checking that the rehearsal is of the same scenario, simulator
+  and app build, and recent enough. Lookups follow the Android rule. The excuse for the video
+  encoder's own frames in a still rest window covers up to 6 frames, where it covered 2 (two of
+  523 still windows of a clean build held three). See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.10.0 — 2026-11-11
 
 - ui-probe 0.5.0: scenarios with input on the iOS Simulator, and exact counts there. Taps and

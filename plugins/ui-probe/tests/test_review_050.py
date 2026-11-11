@@ -163,6 +163,7 @@ class RefinementGateTest(unittest.TestCase):
 
     def test_the_limits(self):
         self.assertEqual((u.SIM_REFINE_DELTA_MAX, u.SIM_REFINE_CHANGED_PX_MAX, u.SIM_REFINE_FLAT_PX_MAX), (24, 2000, 0))
+        self.assertEqual(u.SIM_REFINE_FRAMES_MAX, 6)
 
 
 class SignpostNameTest(unittest.TestCase):

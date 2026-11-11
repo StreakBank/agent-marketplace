@@ -171,8 +171,9 @@ change what is gated:
   leaves out). `until_quiet`, `meminfo` and `background` are `true` or `false`. `count_sections`
   is a list of names.
 - The `gate` block takes only `rest_frames_max` (an integer) and `rest_cpu_pct_max` (a number).
-- `allow` takes `frames_max` and `changed_frames_max` (integers), `cpu_pct_max` (a number) and
-  `reason` (required), and at least one of the three limits. `find` takes `text` or `desc` (a
+- `allow` takes `frames_max` and `changed_frames_max` (integers), `cpu_pct_max` (a number),
+  `unchanged_frames_max` (an integer of at least 1), `updates_max` (an integer; the iOS Simulator
+  only) and `reason` (required), and at least one of the limits. `find` takes `text` or `desc` (a
   non-empty string of at most 200 characters on one line, with no tab, no other control
   character, no surrogate and no character outside the Basic Multilingual Plane: the window-tree
   dump never writes those as they are, so they could never match; the error names the character),
@@ -206,10 +207,16 @@ tick short of the default limit. A rest on such a screen takes an allowance for 
   is in the recording. On a display 1080 px wide it did not (0 changed frames in 20 windows); on
   one 720 px wide the caret of a tall code field did, in 10 of 10 frames. Give such a rest
   `changed_frames_max` as well as `frames_max`, with the same number.
-- There is no allowance for recorded frames that changed nothing. A caret does not produce them;
-  an animation nobody can see does, and that check is what catches it. Such frames are excused
-  only when the app presented no frame by any count (see "The gate"), and that exemption cannot
-  hide such an animation: it draws and presents frames, so its counts are above zero, and both the
+- Recorded frames that changed nothing are allowed only by `unchanged_frames_max` (a whole number
+  of at least 1); without it none may be recorded at rest, and `frames_max` or
+  `changed_frames_max` does not reach them. An animation nobody can see produces such frames, and
+  that check is what catches it, so give the allowance only to a screen whose own caret composes
+  them. The caret above did not; one framework's caret on the iOS Simulator did: a focused text
+  field, six rest windows of 5 s, 30 drawables and 70 display updates every time, 30 to 32
+  recorded frames of which 11 to 14 changed the app's area and 15 to 19 changed nothing. Such
+  frames are also excused, without an allowance, when the app presented no frame by any count
+  (see "The gate"), and that exemption cannot hide such an animation: it draws and presents
+  frames, so its counts are above zero, and both the
   frame check and this one still fail it.
 - A violation on such a step says the limit came from the step's allowance. A step that passed
   only because of its allowance gets a note with the value observed, the allowance and the reason,
@@ -524,15 +531,17 @@ empty). A simulator gives no input from a command line (`simctl` has no tap) and
 quiet with; its exact counts of the app's frames come from its log store (see "The simulator's log
 store"). This version runs rests, and taps and swipes at
 fractions of the display through a small UI-test agent (`ios-agent/`, see "Input on the iOS
-Simulator"), driven from the host; there is no device script. There are no lookups and no typing
-on a simulator in this version. A simulator run reads its log store.
+Simulator"), driven from the host; there is no device script. A measured run never looks an
+element up and never types: a tap that names its target with `find` goes to a position found
+beforehand by `ui-probe rehearse`, and typing happens only there (see "A rehearsal on the iOS
+Simulator"). A simulator run reads its log store.
 
 **What it means for a scenario author: any frame at rest fails.** With the status bar frozen
 nothing but the app has a reason to make the display compose: a frame the app presented (its log
 store's count) or a frame recorded at rest fails the rest, with one exception, the encoder refining a
 still picture (below). A screen that is never still by design (a blinking caret) needs an allowance
-on its rest (`allow.frames_max`, `allow.changed_frames_max`, `allow.updates_max`); frames that
-changed nothing have none.
+on its rest (`allow.frames_max`, `allow.changed_frames_max`, `allow.updates_max`, and
+`allow.unchanged_frames_max` for a caret that composes frames that change nothing).
 
 - **The scenario.** `package` is the bundle identifier (letters, digits and `-` in dot-separated
   names). `activity`, `quiet` and `count_sections` must be absent and `until_quiet` false or
@@ -541,11 +550,16 @@ changed nothing have none.
   `swipe` with `from`, `to`, `ms` and `judge`; a tap or a swipe waits its `settle_ms` after the
   input (default 3000 for a tap, 2500 for a swipe, as on Android). In `expect`, a rest takes only
   `signposts_max` and a tap or a swipe only `signature` and `signposts_max`. A swipe lasts at most
-  60000 ms (what the agent accepts). Refused before anything runs, each with its own
-  message: `find` on a tap and a `text` step (a lookup or typing reads the app's accessibility
-  tree, which changed the app at rest when measured, so this version takes positions as
-  fractions) and a `key` step (a simulator has no keys to press: tap the screen's own control or
-  swipe from the edge). The launch waits `launch_settle_ms` (default 6000). `launch_env` (below)
+  60000 ms (what the agent accepts), and so does a step's `settle_ms` and a `find.scroll.settle_ms`
+  (each is a wait between two commands to the agent, which ends itself after an idle limit). A tap
+  may name its target with `find` (`text` or `desc`,
+  `nth`, `timeout_ms`, `scroll`) instead of `x` and `y`; such a run needs `--rehearsal` (see "A
+  rehearsal on the iOS Simulator"). Refused before anything runs, each with its own message:
+  `find.package` (it names an Android window), `find_settle_ms` (a measured run looks nothing up;
+  the swipes it replays wait their `find.scroll.settle_ms`), a `text` step in a measured run (a
+  field that has had focus changes the app for the rest of its life: put the typing in a scenario
+  of its own and drive it with `ui-probe rehearse`), and a `key` step (a simulator has no keys to
+  press: tap the screen's own control or swipe from the edge). The launch waits `launch_settle_ms` (default 6000). `launch_env` (below)
   is passed to the app. `allow` and the `gate` block work as described below. `--trace`,
   `--sections` and `--no-video` cannot be used with `--simulator`.
 - **The launch environment.** `launch_env` at the top of a scenario, an object of up to 20 names
@@ -598,15 +612,17 @@ changed nothing have none.
   `rest-frames`, source "log store"), and display updates against `rest_updates_max` in the `gate`
   block (default 0) or `allow.updates_max` (check `rest-updates`). The frames recorded at rest:
   every one after the first against `rest_frames_max` or `allow.frames_max`, those that changed
-  nothing with no allowance, those that changed any pixel against `allow.changed_frames_max`
+  nothing against `allow.unchanged_frames_max` (default none), those that changed any pixel against `allow.changed_frames_max`
   (default none), the violation naming the classes; except that they are a note, the encoder
   refining a still picture a few seconds after motion, when all of these hold: the counts are known
   and all 0 for the window and for the recording's own span (from `Recording started` to the
-  recorder's stop); at most 2 frames were recorded; no pixel changed by more than 24 levels on any
+  recorder's stop); at most 6 frames were recorded; no pixel changed by more than 24 levels on any
   colour channel at the analysis scale (270 pixels wide); no frame changed more than 2000 pixels by
-  8 levels or more; and none of those lies where the previous picture was flat. Measured on 17 rest
-  windows of one app: the encoder's refinement changed at most 17 levels in 28 to 193 pixels (more
-  on a screen with more text), all along edges already in the picture; a 1 pt grey hairline that
+  8 levels or more; and none of those lies where the previous picture was flat. Measured on 523
+  still rest windows of one app: 52 held such frames (32 one, 18 two, 2 three), and the encoder's
+  refinement changed at most 17 levels in 19 to 190 pixels (up to 193 in the 17 windows measured
+  for 0.5.0; more on a screen with more text), all along edges already in the picture; the frame limit is twice the
+  most measured, and was 2 until three frames failed two clean runs; a 1 pt grey hairline that
   grew changed 16 levels in 6 or 7 pixels, 4 or 5 of them on a flat area, so the flat-area count
   holds it where the size of the change could not, and the pixel limit, a factor of ten above the
   largest refinement measured, only bounds a wide subtle change; a 20 pt
@@ -616,7 +632,8 @@ changed nothing have none.
   stopped before its window ended (even with status 0) fails the recording check: its file ends
   early and would look clean. The checks a simulator cannot feed (waiting for quiet, frames at
   launch, which app is in front unless the run has input, `find`, trace sections) are not run, and every simulator run
-  says so in a note rather than passing them by silence.
+  says so in a note rather than passing them by silence. (`find` is among them because a measured
+  run looks nothing up: a tap with `find` goes where the rehearsal found its element.)
 - **Measured by hand** (a debug build of an app that draws its own surface, iOS 26.1, its launch
   screen). A clean build used 0.00 to 0.03 s of CPU per 5 s window and its recording held one
   frame, the first; a build that redraws an element behind zero alpha every frame used 1.45 to
@@ -639,7 +656,7 @@ changed nothing have none.
   `sim_drawables`, `sim_commits`, `sim_updates` and `sim_signposts.<name>`,
   since they mean something else than Android's (CPU in seconds, not ticks; every frame of a
   per-step recording).
-- **Not measured.** Lookups and typing; quiet; trace sections; memory; which app is in front in a
+- **Not measured.** Lookups and typing (they happen in a rehearsal, which measures nothing); quiet; trace sections; memory; which app is in front in a
   run without input; and timings as a phone's (the host's processor and graphics run
   the simulator). `ui-probe doctor --simulator <udid>` checks `xcrun simctl`, that the simulator
   exists and is booted, and `ffmpeg` and `ffprobe`.
@@ -738,15 +755,25 @@ commands on a loopback socket.
   raw/agent-derived-data -resultBundlePath raw/agent.xcresult` starts it (both folders are removed
   after a test run that ended with status 0 and kept otherwise), in a process
   group of its own, with a free loopback port, a random token, the app's bundle identifier and an
-  idle limit (the scenario's longest wait plus 120 s) passed as `TEST_RUNNER_UI_PROBE_AGENT_*`
+  idle limit (the scenario's longest wait plus 120 s; a tap with `find.scroll` counts every swipe it
+  may replay with its settle time, and in a rehearsal each lookup's whole timeout) passed as `TEST_RUNNER_UI_PROBE_AGENT_*`
   variables, which `xcodebuild` hands to the test without the prefix. The run waits for its first
   answer (120 s); an `xcodebuild` that exits first fails the run with the tail of its log
   (`raw/agent.log`). This installs the agent's runner app (`dev.uiprobe.agent.uitests.xctrunner`)
   on the simulator for the run's duration.
-- **What it does.** `ping` (the app's state and the display's size in points), `tap` (`x`, `y`),
-  `swipe` (`from`, `to`, `ms`) and `quit`, one JSON object per connection. Taps and drags go
-  through the system app at fractions of the display. The agent reads nothing of the app under
-  test but its state. Every command carries the run's token and a fresh random nonce; anything
+- **What it does.** `ping` (the app's state, the display's size in points and whether it serves
+  lookups), `tap` (`x`, `y`), `swipe` (`from`, `to`, `ms`) and `quit`, one JSON object per
+  connection. Taps and drags go through the system app at fractions of the display. Started for a
+  measured run, the agent reads nothing of the app under test but its state and refuses `find`,
+  `type` and `labels`. Started for a rehearsal (`TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS=1`, set by
+  `ui-probe rehearse` only, and removed from what a measured run's agent inherits), it also serves
+  `find` (every element whose accessibility label is the text, or with `text` whose value is, in
+  the order of the app's tree, the first 50 with their frame, the point to tap, whether part of
+  them is on the display, and XCTest's hit test for the first ten on the display), `type` (into the
+  element with keyboard focus, one character at a time) and `labels` (the app's labelled
+  elements with the visible part of their frame and their depth; with `"all": true` every
+  element, up to 3000). The host checks the mode at the first `ping`: an agent in the other mode is a failed
+  start. Every command carries the run's token and a fresh random nonce; anything
   without the token is answered with an error and does nothing. Every reply carries the
   HMAC-SHA256 of the nonce keyed with the token, which the host checks: a reply without it (the
   first `ping` included) did not come from the agent, and the command fails. A request must arrive
@@ -775,21 +802,144 @@ commands on a loopback socket.
   app (failures ignored); the derived data and result bundle removed if the test run ended with
   status 0; then the status bar cleared. `raw/agent.json` keeps the port, the first answer and how the
   agent ended.
-- **Why no lookups and no typing.** An accessibility read of an app can change the app it reads.
-  Measured on one app: after one lookup of a label in it (or typing through one of its
-  elements), it used 0.8% to 1.6% of a core at rest for the rest of its process's life, also after
-  the agent had quit, and once presented a frame at rest; with the agent idle and reading only
-  the app's state, the app at rest was unchanged. To measure this for another app: a rest, one
-  lookup, the same rest again, each recorded with CPU. Typing through the system app is refused by
-  the test framework, and the keyboard's keys are not in the system app's tree, so this version
-  has no lookups and no typing on a simulator: tap positions as fractions instead.
+- **Why a measured run never looks up or types.** An accessibility read of an app can change the
+  app it reads. Measured on one app: after one lookup of a label in it (or typing through one of
+  its elements), it used 0.8% to 1.6% of a core at rest for the rest of its process's life, also
+  after the agent had quit, and once presented a frame at rest; with the agent idle and reading
+  only the app's state, the app at rest was unchanged. To measure this for another app: a rest,
+  one lookup, the same rest again, each recorded with CPU. So lookups and typing happen in a
+  rehearsal, in an app process that is then ended (next section).
+
+## A rehearsal on the iOS Simulator
+
+`ui-probe rehearse --simulator <udid> --scenario <file> --out <dir>` drives a scenario once in an
+app process that is thrown away; there, the agent may look elements up and type. Nothing is
+recorded, measured or gated. `ui-probe run --simulator <udid> --scenario <file> --out <dir>
+--rehearsal <dir>/rehearsal.json` then replays the positions it found, by coordinate, in a fresh
+process, which is the one measured. A scenario with a tap by `find` cannot run on a simulator
+without `--rehearsal`, and the refusal says what to run first.
+
+- **The scenario.** One file serves both commands. `rehearse` checks it as `run` does (`expect`,
+  `allow` and rest lengths are checked and then ignored), except that a `text` step is allowed.
+  A scenario with no `find` and no `text` can be rehearsed: it just drives the app. Typing, such as
+  a sign-in, goes in a scenario of its own that only `rehearse` drives, before the measured
+  scenarios; a run never types.
+- **What `rehearse` does.** It refuses `--serial` (on Android a lookup happens inside the run), an
+  `--out` that holds a run at any depth or a rehearsal, or lies inside another rehearsal's folder,
+  a simulator that is not booted and an app that is not installed; every refusal comes before
+  `<dir>` exists, and leaves nothing.
+  It launches the app as a run does (terminated, `xcrun simctl launch` with `launch_env`), then
+  starts the agent for a rehearsal and checks that its first `ping` says so, and waits what is left
+  of `launch_settle_ms` counted from the launch, then requires the app in front (a `ping`, state 4);
+  no status-bar override, no recording, no read of the log store. The app comes first because the agent's first read of the app ties its later
+  reads of the app's tree to the process running then, so a lookup after a relaunch would wait on
+  a process that is gone; a measured run, which never reads the tree, keeps starting the agent
+  first. Then, in order: a tap with `find`
+  is looked up (below), tapped at the centre found and given its `settle_ms`; a tap by position
+  and a swipe are sent and given their `settle_ms`; a `text` step is typed into the element with
+  keyboard focus (about 1.5 s a character) and given its `settle_ms`; a rest waits its full `ms`.
+  So a rehearsal waits what a run waits between two inputs, apart from the recorder's own time, and
+  its lookups read the screen the run will tap. Every step ends with a `ping`: the app must be in
+  front (state 4), else the rehearsal stops naming the step and the state, in the words of the
+  run's foreground check. A command the agent did not perform, or a reply not proven to come from
+  it, stops the rehearsal and names the step. Then, however it ended, the app is terminated and the launched
+  process must be gone within 5 s (else the rehearsal fails: a run would measure the rehearsed
+  process), and the agent is stopped as after a run. It prints one JSON line per step and a last
+  line naming `rehearsal.json`, and exits 0, or 2 on a failure (`failed.json` then, as for a run).
+- **A lookup** follows the Android rule. The agent's `find` reads the app's tree once. A match
+  counts when part of it is on the display (`on_screen`) and XCTest's own hit test says a tap would
+  reach it (`hittable`); the agent asks the hit test for the first ten matches on the display.
+  The verdict knows what is drawn over what: measured on two screens of an app that draws itself
+  (20 elements), it was right for a bar at the top over scrolled content, a floating bar at the
+  bottom over a list, elements scrolled out of view and every plainly visible element. It was
+  wrong once: a button cut by the lower edge of the area it scrolls in, with nothing drawn over the
+  cut part, because the hit test tries the middle of the whole frame. The point the tap goes to
+  (`center`) deals with that case: it is the middle of the part on the display, and when that point
+  is cut off by an element the match lies inside (scrolled content keeps its whole frame; the
+  scrolling element's frame cuts it), the middle of the part left (`visible`). `under`, the label
+  of an element later in the tree over the tap's point, is a hint for a message and decides
+  nothing; `moved` (the tree changed between the agent's read and its hit test) and `not_asked`
+  (more than ten matches on the display, or more than twenty elements with the label) come with
+  `hittable` false. What verifies a replayed tap in the measured run is an approved
+  `expect.signature` on the step: without one, the gate catches only a replayed tap that changed
+  nothing on the screen (check `input`, below); a tap that lands on another control and changes the
+  screen is not caught. Give every replayed tap whose transition is stable an `expect.signature`,
+  and a target near a bar a `find.scroll`, so that it ends up clear of it. Without `nth` exactly one match may count; with `nth`, at least that many, and the nth
+  in the order of the tree is taken. It is found when it has the same frame in two reads in a row.
+  Reads are about 300 ms apart until `find.timeout_ms` (the default as on Android); a match first
+  seen at the timeout gets one more read. With `find.scroll`, a read with no match that counts is
+  followed by the swipe and its `settle_ms`, at most `max` times. The statuses are Android's:
+  `found`, `not_found`, `not_visible` (matches there, none counted: off the screen, or on it where
+  a tap would not reach them, with `under` named as a probable cause and `moved` and `not_asked`
+  told apart) and `unstable` (a match that moved). A failed lookup writes `<dir>/lookup-failed.txt`
+  (what was looked for, the status, the matches of the last read and the agent's `labels`, so the
+  author can see what the screen held) and stops with a message built as Android's. Only the first
+  50 matches are listed, so without `nth` a read that found more cannot show exactly one.
+- **`rehearsal.json`** holds the tool and version, `"platform": "ios-simulator"`, the scenario's
+  name and digest (sha256 of its canonical JSON: sorted keys, compact separators), the udid and the
+  simulator's facts, the screen size in points from the first `ping`, the app's identity (the
+  installed bundle's `CFBundleShortVersionString` and `CFBundleVersion` from its `Info.plist`, the
+  sha256 of its executable, and a digest of the whole bundle: sha256 over the sorted list of every
+  file's path relative to the bundle and its sha256, a symbolic link by its target text, never
+  followed; a value that cannot be read, a bundle not read in full included, is recorded as
+  unknown), `started` and
+  `finished` (UTC), and per step what was done: for a lookup the `find` as written, the match used
+  (label, type, frame, and `visible` when the tap point was moved into a part of it), its `center`
+  as fractions of the display, the swipes made to reach it, the reads, the matches and the time it
+  took; for a `text` step the number of characters typed, never the text; for every step the
+  app's state at its end (`app_state`). `<dir>/raw/` keeps the
+  agent's log, `agent.json` and `launch.txt`. When the scenario types, `lookup-failed.txt` holds no
+  element value at all (a field shows typed text reformatted, which no search for the text would
+  catch; labels and frames stay), and any other string holding the typed text is written as
+  `<typed text>`.
+- **What `run --rehearsal` checks** before the first run starts, each refusal saying why: the
+  rehearsal's scenario digest is this scenario's; its udid is this simulator; it holds a position
+  for every tap with `find`; the app's identity is unchanged, each of its four values compared and
+  the one that differs named (a framework or a resource that changed changes the bundle digest; an
+  identity that cannot be read, then or now, fails the check); it finished at most `--rehearsal-max-age-s` seconds ago (default
+  3600, a whole number of at least 1). `--rehearsal` with `--serial`, or on a scenario with no tap
+  by `find`, is refused. At the agent's first `ping` the screen size must equal the rehearsal's,
+  else the run fails. `--runs N` uses the same rehearsal for every run.
+- **The replay.** Before a tap with `find` starts its recorder, the run sends the rehearsal's
+  swipes for that step, each followed by its `settle_ms` (as on Android, where the lookup and its
+  scrolling come before the step's window); then the step is a tap at the rehearsed centre.
+  `raw/step-<step>.json` and `run.json` record it as `resolved`: `x`, `y`, the swipes with the
+  agent's replies and round trips, the rehearsal file and its finish time. A replayed swipe the
+  agent did not perform fails the step (check `input`), as a tap it did not perform does. A
+  replayed tap whose recording shows no visual change (signature `-`) fails as `input` too (it
+  changed nothing on the screen, so it probably missed its target), unless the step's
+  `expect.signature` is `-`; a recording that could not be used fails as `recording` and, for a
+  replayed tap, as `input` (whether it reached its target cannot be told); a signature that is
+  unknown for a usable recording is a note. The gate
+  adds one note per run that used a rehearsal (how many taps, the rehearsal's finish time).
+- **Limits.** A position is only as good as the screen being the same in both passes: the
+  backend's content must not change between the two passes, and a step that changes server state
+  must be the last lookup of its scenario (after it, the screen a rehearsal saw is not the screen
+  the run will see). The rehearsal's app process is ended, but what the app stored (a signed-in
+  session, a preference) stays for the measured run, which is how a sign-in rehearsed in a scenario
+  of its own carries over.
+- **Typed text in kept files.** The test framework logs one line per typed character in
+  `raw/agent.log` (`Type '5' into Any (First Match)`). When the scenario has a `text` step, the log
+  is rewritten after the agent has stopped with the quoted text of every such line replaced by
+  `<typed text>` (the rest of the line kept), and the agent's result bundle and derived data, which
+  hold the same lines, are removed whatever the test run's status; `rehearsal.json` or
+  `failed.json` says so (`agent_results`).
+- **A rehearsal folder is not a run.** `rehearse` writes `rehearsal-started.json` into `<dir>`
+  before anything else, so that a rehearsal that failed or was killed is recognised too. `gate`,
+  `summary` and `compare` pass over a folder holding it, with its own `raw/` and `failed.json`, when
+  they look for runs; any other run marker inside it (a run written there by hand) stops them with
+  an error naming the folder, so no run is ever skipped in silence. `gate` prints one note for each
+  rehearsal folder whose rehearsal did not complete, naming why. `run --out` refuses a folder that
+  holds a rehearsal (its marker or `rehearsal.json`) or lies inside one, and `rehearse --out` one
+  that holds a run at any depth or a rehearsal, or lies inside another rehearsal.
 
 ## Known limits
 
 - **Android, and the iOS Simulator for rests, taps and swipes.** Nothing here drives a physical
   iPhone. On a simulator the app's frame counts come from its log store, known only when the run
-  read the store to the end; there is no quiet detection, and input is by position only: no lookups by text and no typing (an accessibility read can change the app it
-  reads).
+  read the store to the end; there is no quiet detection, and a measured run's input is by
+  position only: lookups and typing happen in a rehearsal (an accessibility read can change the
+  app it reads), whose positions hold only while the screen is the same in both passes.
 - **Per-frame timings assume the device has not slept since boot.** Frame rows use the monotonic
   clock and step marks the boot clock; they agree only then. The run is flagged when they do not
   line up. Counts are unaffected; the recording then no longer decides a rest window.
