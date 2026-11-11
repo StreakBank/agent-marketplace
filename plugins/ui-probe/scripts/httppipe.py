@@ -279,11 +279,28 @@ def front_command(pid) -> str | None:
     scripts), else None."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
+    command = process_command(pid)
+    if command is None or not any(name in command for name in FRONT_COMMANDS):
+        return None
+    return command
+
+
+def process_command(pid: int) -> str | None:
+    """The command line of pid, its arguments joined by spaces (Linux: /proc, which a container without
+    `ps` still has; elsewhere `ps -o command=`), or None when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raw = None
+    if raw is not None:
+        words = [w.decode("utf-8", "replace") for w in raw.split(b"\0") if w]
+        return " ".join(words) if words else None
     try:
         out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    if out.returncode != 0 or not any(name in out.stdout for name in FRONT_COMMANDS):
+    if out.returncode != 0 or not out.stdout.strip():
         return None
     return out.stdout.strip()
 

@@ -1,5 +1,22 @@
 # Changelog — ui-probe
 
+## 0.7.1 — 2026-11-11
+
+- A request log replaced during a run is told by its first bytes as well as by its inode and device.
+  A file system may give a new file the number of one just removed: on Linux (GitHub's runner) a log
+  removed and written again read as the same file, cut, where macOS gives another number. The run
+  keeps the log's first 4096 bytes at the start (in memory; nothing new is written) and compares
+  them with the same bytes of the file that has the name at the end, read from one open file. A
+  different file is called replaced; only the same file grown shorter is called cut (a file shorter
+  than the bytes kept is cut when what it still has is their start, replaced otherwise). Either way
+  the run's counts are unknown, as before.
+- A front's command line, for the check that no other front writes the same log, is read from
+  `/proc/<pid>/cmdline` where there is one and from `ps -o command=` elsewhere: a Linux container
+  without `ps` checked nothing.
+- Tests: the replaced-or-cut test means the same on every file system (an in-place rewrite stands
+  for a reused inode number, `os.replace` of a file made beside the log for a new one); the test of
+  a folder that cannot be written is skipped when the suite runs as root, as many containers do.
+
 ## 0.7.0 — 2026-11-11
 
 Requests counted from outside the app, per step, by the front the app's traffic passes through. A

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1 — 2026-11-11
+
+- ui-probe 0.7.1: a request log replaced during a run is told by its first bytes as well as its
+  inode (Linux reuses inode numbers; 0.7.0's CI run failed on it), and the front's owner check reads
+  `/proc` before `ps`. See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.12.0 — 2026-11-11
 
 - ui-probe 0.7.0: requests counted from outside the app. The plugin's fronts (`tls-front` for the iOS

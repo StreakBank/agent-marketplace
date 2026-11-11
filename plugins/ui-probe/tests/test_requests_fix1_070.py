@@ -292,6 +292,8 @@ class NoRecordTest(ta.Base):
         self.assertIn("cannot be read", cap.analyze()["requests"]["reason"])
 
     def test_a_record_that_cannot_be_written_fails_the_run(self):
+        if os.geteuid() == 0:
+            self.skipTest("a read-only folder is writable anyway (running as root, as in many containers)")
         raw = Path(self.root) / "ro"
         raw.mkdir()
         log = Path(self.root) / "f.jsonl"

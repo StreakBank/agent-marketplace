@@ -862,7 +862,12 @@ during the run (what the app sent on that connection was not read); any connecti
 (from its `upgrade` or `unparsed` line until its `closed` line) at any time during the run, one that
 became opaque before the run and was still open included; no request at all lies between the
 launch and the end of the last step (a request in the margins proves nothing: the app's traffic is
-probably not going through the front); the log was cut or replaced, or holds a line since the
+probably not going through the front); the log was cut or replaced (the run keeps the log's inode
+and device and its first 4096 bytes at the start, kept in memory and never written, and at the end
+reads the file that has the log's name: another inode or device, or first bytes that differ, is a
+replacement, also where the file system gave the new file the old one's number; a file shorter than
+at the start whose bytes are the start of those kept is cut, so a different file is called replaced
+and only the same file grown shorter is called cut), or holds a line since the
 front's `listening` line that is not the front's JSON; a run was given a log but kept no record of
 it; or, on Android, the clock could not be mapped (below). That last proof (one request in the run)
 is necessary, not sufficient: the front cannot tell two clients apart, so nothing else may use it

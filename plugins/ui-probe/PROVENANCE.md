@@ -410,6 +410,34 @@ Not validated live: a physical device; a count refused because the clock could n
 the tests only); `http-front` or `tls-front` in front of anything but a development backend on the
 same machine.
 
+### Validation, 0.7.1
+
+**What failed.** 0.7.0's CI run (agent-marketplace `be4546d`, GitHub's ubuntu runner, Python
+3.12.16, `python -B -m unittest discover -s plugins/ui-probe/tests`): 781 ran, 1 failed, 2 skipped.
+`test_requests_070.SegmentTest.test_a_replaced_or_cut_log` removed the log and wrote a new one, and
+expected "replaced during the run"; it got "the request log was cut during the run". The run told a
+replaced log by its inode and device alone, and Linux gave the new file the inode number of the one
+just removed, where macOS (APFS) gives another; the new file was shorter, so it read as the same
+file cut. The counts were refused either way; but a replacement longer than the old offset with the
+old number would have been read on as the same file. On macOS the test passed.
+
+**The Linux run is the lead's.** The rows of the table ran on macOS only. Before the push the lead
+ran the suite in a Linux container the way CI does (2026-11-11: `python:3.12-slim`, Linux 6.10,
+Python 3.12.16, `procps` and `openssl` installed, the CI's `requirements-ci.txt`, a user that is not
+root, `python -B -m unittest discover -s plugins/ui-probe/tests`). On the released 0.7.0 tree that
+run gave exactly what CI gave: 781 ran, 1 failed (the same test), 2 skipped. On this tree: 796 ran,
+none failed, 2 skipped. Run as root, the 0.7.0 tree failed one test more, the one this version
+skips as root.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-11 | Unit tests | macOS (Python 3.12), `python3 -B -m unittest discover -s plugins/ui-probe/tests -q` | 796 tests pass (the run printed `Ran 796 tests` and `OK`; none skipped on this Mac); none touches a device, a simulator or the network beyond 127.0.0.1 |
+| 2026-11-11 | A replaced log, on every file system | `test_requests_070.SegmentTest`: the log rewritten in place with other bytes (its inode certainly the same: a reused number on any file system); removed and written again with other bytes (its number reused or not); replaced by `os.replace` with a file made beside it holding the same first bytes and more (another number for certain); cut with its first bytes kept, and to nothing; cut and rewritten with other bytes; grown; a log over 4096 bytes whose 4096th byte changed; removed | replaced (by its bytes), replaced, replaced (by its inode), cut, cut, replaced (by its bytes), read on, replaced, could not be read; nothing of the bytes kept is in `raw/requests.jsonl` or `raw/requests-meta.json` |
+| 2026-11-11 | A front's command line | `test_portable_071`: `/proc/<pid>/cmdline` answered (with `ps` made to fail), absent with `ps` answering, both failing, an empty cmdline, another program; this process on this host | `/proc` first, `ps` where there is none, None where neither reads; the owner check sees a front on a host without `ps` |
+| 2026-11-11 | The other tests of 0.7.0, read for what they assume of the host | the eight 0.7.0 test files: inode numbers, file modes on creation, signal delivery order, `ps` output, `/tmp` paths, timestamp resolution, the user running them | inode numbers: only the replaced-or-cut test (rewritten). File modes: every 0600 asserted is set by `fchmod`, whatever the umask (left). The user: the folder-that-cannot-be-written test assumed it does not run as root, which a Linux container often does (skipped as root, as the rehearsal's like test already was). Signal order: the fronts set their handlers before the `listening` line the tests wait for, and the tests set SIGHUP's disposition themselves (left). `ps`: no test parses it, but the owner check read `ps -o command=`, which a slim container lacks (now `/proc` first). `lsof`: read only where there is no `/proc` (left). `/tmp`: only device paths (`/data/local/tmp`) in strings; host files are in temporary folders (left). Timestamps: no 0.7.0 test reads a file's time; two bounds on elapsed time (1.5 s and 1.0 s) depend on load, not the system (left). Ports: bound to 0 and released before use, a race on any system (left) |
+| 2026-11-11 | Runs of earlier versions | the gate of 0.7.0 as released (`be4546d`) against this version's, `gate --json`, on the saved folders under the lead's run trees | text output, exit status and JSON (the tool's version aside) equal in all 668 folders |
+| 2026-11-11 | That the tests can fail | 15 mutants, one exact replacement each in a copy of the plugin, then `test_requests_070.SegmentTest` or `test_portable_071`: the number of bytes kept, the bytes kept, the bytes compared, the inode and device compared, a shorter file compared with the start of what was kept, cut decided before the bytes, a file not grown read on, the problem used, the bytes never written; `/proc` read first, `ps` where there is none, an empty cmdline, the arguments split at NUL, the owner check using it, `ps` failing | all 15 red. On the first pass 13: a log that had not grown at all was untested (a mutant calling it cut survived), and `ps` exiting non-zero while printing something was untested; a test was added for each |
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

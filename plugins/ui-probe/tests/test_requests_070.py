@@ -587,18 +587,93 @@ class SegmentTest(Segment):
         u.save_requests(self.raw, self.log, start, (100.0, 110.0), {}, None)
         self.assertEqual([e["path"] for e in self.kept()], ["/during"])
 
-    def test_a_replaced_or_cut_log(self):
+    # 0.7.1: these mean the same on every file system. A file system may give a new file the number of
+    # one just removed (Linux did on GitHub's runner, where the replaced log read as cut): a replacement
+    # is told by the file's first bytes as well as by its inode and device.
+
+    def reason_after(self, start):
+        u.save_requests(self.raw, self.log, start, (0, 9), {}, None)
+        return self.meta()["reason"]
+
+    def test_a_log_rewritten_in_place_with_other_content_is_replaced(self):
+        # the same inode for certain: what a reused inode number looks like on any file system
         start = u.log_position(self.log)
-        self.log.write_text("")                         # cut (same file, shorter)
-        u.save_requests(self.raw, self.log, start, (0, 9), {}, None)
-        self.assertIn("cut during the run", self.meta()["reason"])
+        before = os.stat(self.log).st_ino
+        other = line(1.0, "listening", port=9, to_port=9, pid=1) * 8
+        self.assertGreaterEqual(len(other), start["size"])
+        with open(self.log, "r+") as fh:
+            fh.write(other)
+        self.assertEqual(os.stat(self.log).st_ino, before)
+        self.assertEqual(self.reason_after(start), "the request log was replaced during the run (its first bytes are "
+                                                   "not those it had at the start)")
+
+    def test_a_new_file_with_other_content_is_replaced_whatever_its_inode(self):
+        start = u.log_position(self.log)
         self.log.unlink()
-        self.log.write_text(line(1.0, "listening") * 5)
-        u.save_requests(self.raw, self.log, start, (0, 9), {}, None)
-        self.assertIn("replaced during the run", self.meta()["reason"])
+        self.log.write_text(line(1.0, "listening") * 5)        # its number may or may not be the old one
+        self.assertIn("the request log was replaced during the run", self.reason_after(start))
+
+    def test_a_new_file_with_the_same_first_bytes_is_replaced_by_its_inode(self):
+        start = u.log_position(self.log)
+        twin = self.root / "twin.jsonl"
+        twin.write_bytes(self.log.read_bytes() + request_line(101.0, "/after").encode())
+        os.replace(twin, self.log)                              # created while the old one existed: another inode
+        self.assertEqual(self.reason_after(start), "the request log was replaced during the run (another file has its "
+                                                   "name now)")
+
+    def test_the_same_file_cut_is_cut(self):
+        start = u.log_position(self.log)
+        kept = self.log.read_bytes()[:20]
+        with open(self.log, "r+b") as fh:                       # shorter, its bytes the start of what it had
+            fh.truncate(20)
+        self.assertEqual(self.log.read_bytes(), kept)
+        self.assertEqual(self.reason_after(start), "the request log was cut during the run (it is shorter than at the start)")
+        with open(self.log, "r+b") as fh:
+            fh.truncate(0)
+        self.assertEqual(self.reason_after(start), "the request log was cut during the run (it is shorter than at the start)")
+
+    def test_the_same_file_cut_and_rewritten_is_replaced(self):
+        start = u.log_position(self.log)
+        with open(self.log, "r+b") as fh:                       # shorter, and other bytes
+            fh.truncate(0)
+            fh.write(b'{"t": 5.0, "event": "x"}\n')
+        self.assertLess(os.stat(self.log).st_size, start["size"])
+        self.assertEqual(self.reason_after(start), "the request log was replaced during the run (its first bytes are "
+                                                   "not those it had at the start)")
+
+    def test_the_same_file_grown_is_read_on(self):
+        start = u.log_position(self.log)
+        self.append(request_line(101.0, "/during"))
+        u.save_requests(self.raw, self.log, start, (100.0, 110.0), {}, None)
+        self.assertIsNone(self.meta()["reason"])
+        self.assertEqual([e["path"] for e in self.kept()], ["/during"])
+
+    def test_the_same_file_unchanged_is_read_on(self):
+        start = u.log_position(self.log)
+        self.assertIsNone(self.reason_after(start))
+
+    def test_a_long_log_is_told_by_its_first_4096_bytes(self):
+        self.append(request_line(50.0, "/" + "a" * 100) * 60)
+        start = u.log_position(self.log)
+        self.assertEqual((len(start["head"]), u.LOG_HEAD_BYTES), (4096, 4096))
+        data = bytearray(self.log.read_bytes())
+        data[4095:4096] = b"#"                                  # the last byte kept differs
+        self.log.write_bytes(bytes(data))
+        self.assertIn("its first bytes are not those it had at the start", self.reason_after(start))
+
+    def test_an_unlinked_log_could_not_be_read(self):
+        start = u.log_position(self.log)
         self.log.unlink()
-        u.save_requests(self.raw, self.log, start, (0, 9), {}, None)
-        self.assertIn("could not be read at the end of the run", self.meta()["reason"])
+        self.assertIn("could not be read at the end of the run", self.reason_after(start))
+
+    def test_the_bytes_kept_are_never_written(self):
+        start = u.log_position(self.log)
+        self.append(request_line(101.0, "/during"))
+        u.save_requests(self.raw, self.log, start, (100.0, 110.0), {}, None)
+        head = start["head"].decode()
+        for f in self.raw.iterdir():
+            self.assertNotIn(head[:40], f.read_text(), f.name)
+        self.assertNotIn("head", self.meta())
 
 
 BEFORE, AFTER = probe_group(4990.0, 100.0), probe_group(5010.0, 120.0)
@@ -1093,9 +1168,7 @@ class DocsTest(unittest.TestCase):
         self.assertIn("`limits` now holds `rest_requests_max`", " ".join((root / "CHANGELOG.md").read_text().split()))
         self.assertIn("### Validation, 0.7.0", (root / "PROVENANCE.md").read_text())
         self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
-        self.assertEqual(u.VERSION, "0.7.0")
-        market = json.loads((root.parent.parent / ".claude-plugin" / "marketplace.json").read_text())
-        self.assertEqual(market["metadata"]["version"], "0.12.0")
+        # 0.7.1: the version moved on (test_portable_071 pins it); the manifests still name the code's version
         self.assertIn("## 0.12.0", (root.parent.parent / "CHANGELOG.md").read_text())
 
     def test_installed_and_reachable(self):

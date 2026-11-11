@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -3960,16 +3960,41 @@ def _json_lines(text: str):
             yield None
 
 
+# How much of the log's start a run keeps (in memory, never written) to tell, at its end, that the file
+# with the log's name is still the same file. A file system may give a new file the number of one just
+# removed (Linux does, measured on GitHub's runner): the inode and device alone cannot tell.
+LOG_HEAD_BYTES = 4096
+
+
 def log_position(path: Path) -> dict:
-    """Where the log ends now, which file it is, and whether the front that writes it is running."""
+    """Where the log ends now, which file it is (its inode and device, and its first LOG_HEAD_BYTES
+    bytes, kept in this process only), and whether the front that writes it is running."""
     try:
-        st = os.stat(path)
-        text = Path(path).read_text(errors="replace")
+        with open(path, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            data = fh.read()
     except OSError as exc:
         raise ProbeError(f"the request log {path} cannot be read: {exc.strerror or exc}") from exc
-    pid = front_pid(text)
-    return {"size": st.st_size, "inode": st.st_ino, "device": st.st_dev, "front_pid": pid,
-            "front_alive": process_running(pid)}
+    pid = front_pid(data[:st.st_size].decode("utf-8", "replace"))
+    return {"size": st.st_size, "inode": st.st_ino, "device": st.st_dev,
+            "head": data[:min(st.st_size, LOG_HEAD_BYTES)], "front_pid": pid, "front_alive": process_running(pid)}
+
+
+def log_identity_problem(start: dict, st: os.stat_result, data: bytes) -> str | None:
+    """Why the file that has the log's name now (its fstat and its bytes) is not the log a run began
+    with, grown or not: None when it is. Another file is called replaced (another inode or device, or
+    first bytes that differ from those kept at the start); the same file grown shorter is called cut
+    (a file shorter than the bytes kept is cut when what it still has is their start, replaced
+    otherwise)."""
+    if (st.st_ino, st.st_dev) != (start["inode"], start["device"]):
+        return "the request log was replaced during the run (another file has its name now)"
+    head = start["head"]
+    now = data[:min(len(head), st.st_size)]
+    if now != head[:len(now)]:
+        return "the request log was replaced during the run (its first bytes are not those it had at the start)"
+    if st.st_size < start["size"]:
+        return "the request log was cut during the run (it is shorter than at the start)"
+    return None
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -4010,15 +4035,14 @@ def save_requests(raw: Path, source: Path, start: dict, window: tuple, clock: di
         last = httppipe.last_listening(str(source)) or {}
         meta["front"]["port"] = last.get("port")
         meta["front"]["accepting_at_end"] = httppipe.port_accepts(last.get("port"))
-        st = os.stat(source)
+        with open(source, "rb") as fh:            # one open file for the checks and the reading
+            st = os.fstat(fh.fileno())
+            data = fh.read(st.st_size)
         meta["offset_end"] = st.st_size
-        if (st.st_ino, st.st_dev) != (start["inode"], start["device"]):
-            meta["reason"] = meta["reason"] or "the request log was replaced during the run (another file has its name now)"
-        elif st.st_size < start["size"]:
-            meta["reason"] = meta["reason"] or "the request log was cut during the run (it is shorter than at the start)"
+        problem = log_identity_problem(start, st, data)
+        if problem is not None:
+            meta["reason"] = meta["reason"] or problem
         else:
-            with open(source, "rb") as fh:
-                data = fh.read(st.st_size)
             pid_end = front_pid(data.decode("utf-8", "replace"))
             meta["front"].update(pid_at_end=pid_end, alive_at_end=process_running(pid_end))
             # Follow the connections from the last `listening` line before the start: the front process
