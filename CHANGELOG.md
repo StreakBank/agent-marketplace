@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 — 2026-11-10
+
+- ui-probe 0.3.0: the same scenario files under other device profiles, and two false alarms
+  removed. A lookup can scroll to its target (`find.scroll`), and a match counts only when it is
+  on the display, so one scenario serves a small screen and a large font. `proxy --map-host`
+  lets a slow-network profile reach a backend that the emulator names by an alias of the host.
+  And a recorded frame at rest is no longer held against the app when every exact count says the
+  app presented none: on a clean build the display composes a frame for a status-bar update in
+  about one rest window in six, and the recording check failed about one run in ten on it. See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.7.0 — 2026-11-10
 
 - ui-probe 0.2.0: flows that type into a form, and screens that are never still. A `text` step

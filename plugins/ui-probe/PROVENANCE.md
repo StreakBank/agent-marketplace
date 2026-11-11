@@ -122,6 +122,34 @@ windows; two tree reads producing 1 frame, 9 recorded frames that changed nothin
 ticks) were taken on an Android 14 device before this release; they are not repeated by the unit
 tests.
 
+### Validation, 0.3.0
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-10 | Unit tests | macOS (Python 3.12.8) | 422 tests pass: the 379 of 0.2.0 (the lookup harness, its fixtures and the README-example test adjusted for the new argument and record lines; one recording test given an app that draws, for the rule on what the recording shows while the app presented no frame) and 43 new |
+| 2026-11-10 | The lookup's shell code with `scroll` and the on-screen rule, and the display-size reading | The host's `sh` (bash 3.2 in POSIX mode), `dash` and `bash`, with stand-ins for the window-tree dump, `input` and `wm` | Matches off the screen, empty bounds, a centre past an edge, a partly clipped match, an override size, `nth` among matches on the screen, swipes until the element is on the screen, the swipe limit, no swipe after a failed read or while a match waits for its second read, pixels from the display size, an unknown display size, and `wm size` with and without an override behave as designed. The device's own shell, `uiautomator`, `input` and `wm` were not exercised by these tests |
+| 2026-11-10 | `proxy --map-host` | Servers on 127.0.0.1, every other connection refused by the test | A CONNECT target and a plain HTTP request named by the mapped host reach the server mapped to, the request passed on as sent; an unmapped target is connected as named; the log carries both |
+| 2026-11-10 | That the new tests can fail | 56 single mutations: each `find.scroll` check relaxed; no room for swipes in the default timeout; an explicit timeout overridden; no overrun in the worst case; the scroll not passed or in thousandths; the display not read, or its override ignored on the device or on the host; every match, or an empty one, counted as on the screen; `nth` counting matches off the screen; several on the screen called `not_visible`; `not_visible` never reported; a swipe after a failed read, while a match waits, or past `max`; no check for an unknown display size; a swipe's y from the width; the message's suggestion and swipe count removed; fractions of the physical screen; swipes left out of `run.json`; negative bounds not parsed or not selected; the version not bumped; and for `--map-host` the mapping not applied, case compared, `connected_to` not logged, and each argument check relaxed; and for the rule on a recorded change while the app presented no frame, the rule removed, either count not required, an unknown count taken as zero, the trace count ignored, the rule reaching a `changed_frames_max` allowance, and the note without the `zoom` command; then for its extension to frames that changed nothing, the extension removed or applied whatever the counts, the trace count ignored, an unknown count taken as zero, no note or two notes where both kinds occur, the note without the `zoom` command, and an allowance taking those frames out of the rule | Each one turns at least one test red |
+
+### Live validation, 0.3.0
+
+2026-11-10, on the emulator and against the app of the 0.2.0 validation, its backend seeded for
+the purpose.
+
+| What | Against | Result |
+|---|---|---|
+| `find.scroll` | a row below the fold of a pushed screen | found after 1 swipe (3 reads, 8.0 s); the swipe lies before the step's start mark; gate PASS. The same lookup without `scroll`: exit 2 with `not_found` (the list does not build rows it does not show, so `not_visible` was not produced on this app) |
+| the display's override size | `wm size 720x1280` at 320 dpi | `raw/display.txt` and `capture.json` carry 720 x 1280 beside the physical size; bounds, taps and swipes were in the override's coordinates (the flow reached its target after 2 swipes); gate PASS |
+| `proxy --map-host` | the app's backend, named by the emulator's alias of the host; 200 ms each way and 400 kbit/s | one scenario: 11 connections named by the alias, each logged with the loopback address it was connected to, and the app worked through it. A batch of 13 scenarios: 103 such connections, PASS |
+| a recording while the app presents no frame | 60 runs of a clean build saved under 0.2.0: 200 rest windows on still screens, in 37 of which the display composed a frame | 0.2.0's gate: 6 runs fail on one recorded change in the app's area. 0.3.0's gate on the same files: none fails, 6 notes. A window with two display frames 14 ms apart for a status-bar update: a note |
+| the same rule against faults | three faulty builds: an animation at zero alpha on some screens, one above every screen, an animation clock that draws nothing | all still FAIL. The first two on frames, on recorded frames that changed nothing and on CPU in every rest window (their counts are in the hundreds); the third on CPU and on `sections_max` |
+| `expect` with `signature` and `sections_max` | baselines taken from the 60 runs, a sixth run, and two faulty builds | the sixth run passes 12 of 12 gated scenarios once a baseline that was never exact is withdrawn (its counts had agreed in five runs while its signature had not). A flash of the whole screen after every touch: 5 steps fail on their signature (`T` became `T E`, `TD` became `TD E`), each with exactly two more composition passes. An animation clock that draws nothing: 300 frame callbacks in a 5 s rest against an approved 0 |
+| a consuming project's profiles, 13 scenarios each | a font scale of 1.3; a display of 720 x 1600 at 320 dpi; every connection through the proxy above; 2 cores and less memory | Font scale 1.3: PASS, 13 of 13, one lookup scrolled once. 720 x 1600: 12 of 13; the thirteenth failed only because a caret counted as a visible change, and passes once its rest allows that. The proxy: PASS, 13 of 13. 2 cores and about 2.5 GB (what the emulator gives for `-memory 2048`): PASS, 13 of 13. Before that, on a display 640 dp tall, a lookup that no swipe could satisfy stopped the batch at a form whose layout had lost a row while the keyboard was up: a finding about the app, which is what a failed lookup under a profile is for |
+
+Not validated on a device: `not_visible` (a match in the tree but off the screen); `nth` with
+`scroll`; `find.package` naming another package; an Android version other than 14; a physical
+device.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

@@ -27,6 +27,9 @@ results. This rule adds only what the plugin deliberately does not know.
 - **Reference profile:** <the settings every baseline assumes: network path, proxy or none,
   font scale, animation scales, compile state>.
 - **Other profiles run on the gate:** <low memory, slow network with its numbers, large font>.
+- **How each profile is imposed and undone:** <e.g. `wm size` override for a small screen, font scale,
+  `ui-probe proxy` with `--map-host` for a backend the emulator reaches as 10.0.2.2>, and which scenarios
+  carry `find.scroll` for targets that move below the fold.
 - **Content:** <how the data a scenario sees is pinned: seed, account, fixture backend>.
 
 ## Gate policy

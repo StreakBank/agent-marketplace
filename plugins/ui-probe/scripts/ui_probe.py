@@ -42,7 +42,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -70,7 +70,14 @@ QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
 # A rest step's allowance: limits that replace the gate's for that step. There is deliberately no
 # limit for recorded frames that changed nothing: that check is what catches an invisible animation.
 ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max")
-FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package"}
+FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package", "scroll"}
+# find.scroll: swipes made while a read shows no acceptable match. max is required; from and to are
+# screen fractions like a swipe step's; the swipe must move at least SCROLL_MIN_TRAVEL of the screen
+# on one axis, since a swipe that barely moves is a tap.
+SCROLL_KEYS = {"from", "to", "max", "ms", "settle_ms"}
+SCROLL_DEFAULTS = {"ms": 600, "settle_ms": 800}
+SCROLL_MAX = 20
+SCROLL_MIN_TRAVEL = 0.1
 FIND_ATTRS = {"text": "text", "desc": "content-desc"}   # scenario key -> attribute of the window tree
 FIND_SETTLE_MS = 1000         # after a lookup, before the baseline reading: the lookup's own work settles
 FIND_READ_S = 2.5             # about how long one read of the window tree takes (measured: about 2 s)
@@ -99,8 +106,20 @@ def find_needle(find: dict) -> str:
     return f' {FIND_ATTRS[key]}="{xml_escape(find[key])}"'
 
 
+def find_scroll(step: dict) -> dict | None:
+    """The step's find.scroll with its defaults filled in, or None."""
+    sc = step["find"].get("scroll")
+    return None if sc is None else {**SCROLL_DEFAULTS, **sc}
+
+
 def find_timeout_ms(scn: dict, step: dict) -> int:
-    return int(step["find"].get("timeout_ms", quiet_settings(scn)[1]))
+    """find.timeout_ms, else the scenario's quiet.max_ms, plus, with scroll, room for every swipe:
+    the swipe, its settle time and one read of the window tree after it."""
+    if "timeout_ms" in step["find"]:
+        return int(step["find"]["timeout_ms"])
+    sc = find_scroll(step)
+    room = 0 if sc is None else sc["max"] * (sc["ms"] + sc["settle_ms"] + FIND_READ_S * 1000)
+    return int(quiet_settings(scn)[1] + room)
 
 
 def find_package(scn: dict, step: dict) -> str:
@@ -343,6 +362,27 @@ def validate_scenario(scn: dict) -> None:
                     need(isinstance(find["package"], str) and PACKAGE_RE.fullmatch(find["package"]),
                          f"step '{sid}': 'find.package' must be an application id: dot-separated names of letters, "
                          "digits and '_', such as com.example.app")
+                if "scroll" in find:
+                    sc = find["scroll"]
+                    need(isinstance(sc, dict), f"step '{sid}': 'find.scroll' must be an object")
+                    unknown = sorted(k for k in sc if k not in SCROLL_KEYS)
+                    need(not unknown, f"step '{sid}': unknown 'find.scroll' keys {unknown}; "
+                                      f"known: {', '.join(sorted(SCROLL_KEYS))}")
+                    for end in ("from", "to"):
+                        pt = sc.get(end)
+                        need(isinstance(pt, list) and len(pt) == 2 and unit(pt[0]) and unit(pt[1]),
+                             f"step '{sid}': 'find.scroll' needs '{end}' as [x, y] between 0 and 1")
+                    need(max(abs(sc["to"][0] - sc["from"][0]), abs(sc["to"][1] - sc["from"][1])) >= SCROLL_MIN_TRAVEL - 1e-9,
+                         f"step '{sid}': 'find.scroll' must move at least {SCROLL_MIN_TRAVEL} of the screen on one "
+                         "axis; a swipe that barely moves is a tap")
+                    need(isinstance(sc.get("max"), int) and not isinstance(sc.get("max"), bool)
+                         and 1 <= sc["max"] <= SCROLL_MAX,
+                         f"step '{sid}': 'find.scroll.max' must be an integer from 1 to {SCROLL_MAX}")
+                    if "ms" in sc:
+                        need(number(sc["ms"]) and sc["ms"] >= 1, f"step '{sid}': 'find.scroll.ms' must be a number >= 1")
+                    if "settle_ms" in sc:
+                        need(number(sc["settle_ms"]) and sc["settle_ms"] >= 0,
+                             f"step '{sid}': 'find.scroll.settle_ms' must be a number >= 0")
                 if "find_settle_ms" in step:
                     need(number(step["find_settle_ms"]) and step["find_settle_ms"] >= 0,
                          f"step '{sid}': 'find_settle_ms' must be a number >= 0")
@@ -403,8 +443,13 @@ def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
             total += step.get("ms", 0) / 1000 + step.get("settle_ms", default_settle_ms(step["do"])) / 1000
         if "find" in step:
             # The lookup: two reads when the element is there and still, reads until the timeout
-            # (and up to two more) when it is not; then the settle time and the baseline reading.
-            lookup = find_timeout_ms(scn, step) / 1000 + 2 * FIND_READ_S + 0.5 if worst_case else 2 * FIND_READ_S + 0.5
+            # (and up to two more) when it is not; then the settle time and the baseline reading. With
+            # find.scroll the default timeout holds every swipe (find_timeout_ms), and a swipe begun
+            # just before the timeout runs on past it. The expected case counts no swipe.
+            sc = find_scroll(step)
+            overrun = 0 if sc is None else (sc["ms"] + sc["settle_ms"]) / 1000
+            lookup = (find_timeout_ms(scn, step) / 1000 + overrun + 2 * FIND_READ_S + 0.5 if worst_case
+                      else 2 * FIND_READ_S + 0.5)
             total += lookup + step.get("find_settle_ms", FIND_SETTLE_MS) / 1000 + 0.6
         total += 0.6  # snapshot cost allowance
     return int(total + 6)
@@ -418,7 +463,12 @@ def device_facts(serial: str, package: str) -> dict:
     def prop(name):
         return sh(serial, f"getprop {name}").strip()
 
-    size = re.search(r"(\d+)x(\d+)", sh(serial, "wm size"))
+    wm_size = sh(serial, "wm size")
+    physical = re.search(r"Physical size: (\d+)x(\d+)", wm_size) or re.search(r"(\d+)x(\d+)", wm_size)
+    override = re.search(r"Override size: (\d+)x(\d+)", wm_size)
+    # Taps, swipes and the window tree all use the size the display presents: the override when a
+    # smaller screen is emulated with `wm size`, else the physical size.
+    size = override or physical
     if not size:
         raise ProbeError("could not read the display size (wm size)")
     density = re.search(r"(\d+)", sh(serial, "wm density"))
@@ -457,6 +507,8 @@ def device_facts(serial: str, package: str) -> dict:
         "fingerprint": prop("ro.build.fingerprint"), "abi": prop("ro.product.cpu.abi"),
         "low_ram": prop("ro.config.low_ram"),
         "width": int(size.group(1)), "height": int(size.group(2)),
+        "physical_size": [int(physical.group(1)), int(physical.group(2))] if physical else None,
+        "override_size": [int(override.group(1)), int(override.group(2))] if override else None,
         "density": int(density.group(1)) if density else None,
         "mem_total_kb": int(memtotal.group(1)) if memtotal else None,
         "cpus": int(cpus) if cpus.isdigit() else None,
@@ -490,7 +542,7 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
     L = ["#!/system/bin/sh", f"D={DEV_DIR}", f"PKG={q(pkg)}", "SR=",
          "rm -f $D/marks.txt $D/gfx-*.txt $D/sf-*.txt $D/cpu-*.txt $D/pid-*.txt $D/mem-*.txt $D/fg-*.txt $D/screen.mp4 "
          "$D/am-start.txt $D/sr-exit.txt $D/sr-alive.txt $D/sr.pid $D/script.pid "
-         f"$D/find-*.txt $D/ui-*.xml $D/ui.tmp $D/hits.tmp $D/cand.tmp $D/{LOOKUP_FAILED}",
+         f"$D/find-*.txt $D/ui-*.xml $D/ui.tmp $D/hits.tmp $D/cand.tmp $D/vis.tmp $D/display.txt $D/{LOOKUP_FAILED}",
          "echo $$ > $D/script.pid",
          "# However the script ends (its last line, an error, a signal, a lost adb session), leave the",
          "# device as it found it: compositor statistics off and the recorder stopped.",
@@ -535,55 +587,87 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
          "  dumpsys SurfaceFlinger --timestats -dump > $D/sf-$1.base.txt 2>&1",
          "  cpu $1.base \"$P\"",
          "}",
-         "# find_el <id> <needle> <nth, 0 for a unique match> <timeout ms> <package needle>: read the window",
-         "# tree until the element is there and still, then set FX FY to its centre. One node per line after",
-         "# splitting at '>'; the needle and the node's own package attribute are matched as fixed strings.",
-         "# A match counts only when two reads in a row give the same bounds. A read that fails (the screen",
-         "# still animating), a wrong number of matches or bounds that moved is 'not yet': wait 0.5 s and",
-         "# read again, up to the timeout; a match first seen at the timeout gets one more read to hold",
-         "# still. The last tree read is kept as ui-<id>.xml and the lookup's record as find-<id>.txt (on a",
-         "# timeout: not_found, or unstable when a match was there but moved). Returns 1 on a timeout.",
+         "# find_el <id> <needle> <nth, 0 for a unique match> <timeout ms> <package needle> <scroll>: read the",
+         "# window tree until the element is there, on the screen and still, then set FX FY to its centre.",
+         "# One node per line after splitting at '>'; the needle and the node's own package attribute are",
+         "# matched as fixed strings. A match counts only when its bounds are not empty and its centre lies",
+         "# on the display (DW x DH), and is accepted only when two reads in a row give the same bounds. A",
+         "# read that fails (the screen still animating), a wrong number of matches, a match off the screen",
+         "# or bounds that moved is 'not yet': wait 0.5 s and read again, up to the timeout; a match first",
+         "# seen at the timeout gets one more read to hold still. <scroll> is 'max x1 y1 x2 y2 ms settle_s'",
+         "# (coordinates in ten-thousandths of the display, max 0 for none): while a read shows no",
+         "# acceptable match and fewer than max swipes were made, swipe, wait settle_s and read again. The",
+         "# last tree read is kept as ui-<id>.xml and the lookup's record as find-<id>.txt (on a timeout:",
+         "# not_found, not_visible when matches were there but off the screen, or unstable when a match",
+         "# moved). Returns 1 on a timeout, or at once when the display size is unknown.",
          "find_el() {",
          "  fid=$1; needle=$2; nth=$3; tmo=$4; pkn=$5",
-         "  t0=$(now_cs); reads=0; n=unread; b=; pb=; grace=",
+         "  set -- $6",
+         "  smax=$1; sx1=$2; sy1=$3; sx2=$4; sy2=$5; sms=$6; sst=$7",
+         "  t0=$(now_cs); reads=0; swipes=0; n=unread; vn=0; b=; pb=; grace=",
+         "  if [ -z \"$DW\" ] || [ -z \"$DH\" ]; then",
+         "    { echo \"status no_display_size\"; echo \"reads 0\"; echo \"swipes 0\"; echo \"elapsed_ms 0\"; } > $D/find-$fid.txt",
+         "    return 1",
+         "  fi",
          "  while :; do",
-         "    reads=$((reads + 1)); b=",
-         "    rm -f $D/ui.tmp",
+         "    reads=$((reads + 1)); b=; vn=0; off=; ok=",
+         "    rm -f $D/ui.tmp $D/vis.tmp",
          "    uiautomator dump $D/ui.tmp >/dev/null 2>&1",
          "    if [ -s $D/ui.tmp ]; then",
+         "      ok=1",
          "      mv $D/ui.tmp $D/ui-$fid.xml",
          "      tr '>' '\\n' < $D/ui-$fid.xml | grep -F -- \"$needle\" > $D/cand.tmp",
          "      grep -F -- \"$pkn\" $D/cand.tmp > $D/hits.tmp",
          "      n=$(wc -l < $D/hits.tmp | tr -dc '0-9')",
+         "      : > $D/vis.tmp",
+         "      while IFS= read -r line; do",
+         "        set -- $(printf '%s\\n' \"$line\" | sed -nE 's/.*bounds=\"\\[(-?[0-9]+),(-?[0-9]+)\\]\\[(-?[0-9]+),(-?[0-9]+)\\]\".*/\\1 \\2 \\3 \\4/p')",
+         "        if [ $# -ne 4 ]; then continue; fi",
+         "        cx=$(( ($1 + $3) / 2 )); cy=$(( ($2 + $4) / 2 ))",
+         "        if [ $3 -gt $1 ] && [ $4 -gt $2 ] && [ $cx -ge 0 ] && [ $cx -lt $DW ] && [ $cy -ge 0 ] && [ $cy -lt $DH ]; then",
+         "          vn=$((vn + 1)); printf '%s\\n' \"$line\" >> $D/vis.tmp",
+         "        elif [ -z \"$off\" ]; then off=\"$1 $2 $3 $4\"; fi",
+         "      done < $D/hits.tmp",
          "      k=$nth; if [ \"$k\" -eq 0 ]; then k=1; fi",
-         "      if { [ \"$nth\" -eq 0 ] && [ \"$n\" -eq 1 ]; } || { [ \"$nth\" -gt 0 ] && [ \"$n\" -ge \"$nth\" ]; }; then",
-         "        b=$(sed -n \"${k}p\" $D/hits.tmp | sed -nE 's/.*bounds=\"\\[([0-9]+),([0-9]+)\\]\\[([0-9]+),([0-9]+)\\]\".*/\\1 \\2 \\3 \\4/p')",
+         "      if { [ \"$nth\" -eq 0 ] && [ \"$vn\" -eq 1 ]; } || { [ \"$nth\" -gt 0 ] && [ \"$vn\" -ge \"$nth\" ]; }; then",
+         "        b=$(sed -n \"${k}p\" $D/vis.tmp | sed -nE 's/.*bounds=\"\\[(-?[0-9]+),(-?[0-9]+)\\]\\[(-?[0-9]+),(-?[0-9]+)\\]\".*/\\1 \\2 \\3 \\4/p')",
          "      fi",
+         "      # matches off the screen count only when too few are on it (not when several are)",
+         "      if [ -n \"$b\" ] || { [ \"$nth\" -eq 0 ] && [ \"$vn\" -gt 0 ]; }; then off=; fi",
          "    else",
          "      n=unread",
          "    fi",
          "    t=$(now_cs); ms=$(( (t - t0) * 10 ))",
          "    if [ -n \"$b\" ] && [ \"$b\" = \"$pb\" ]; then",
-         "      pk=$(sed -n \"${k}p\" $D/hits.tmp | sed -nE 's/.* package=\"([^\"]*)\".*/\\1/p')",
+         "      pk=$(sed -n \"${k}p\" $D/vis.tmp | sed -nE 's/.* package=\"([^\"]*)\".*/\\1/p')",
          "      set -- $b",
          "      FX=$(( ($1 + $3) / 2 )); FY=$(( ($2 + $4) / 2 ))",
-         "      { echo \"status found\"; echo \"matches $n\"; echo \"reads $reads\"; echo \"elapsed_ms $ms\"",
-         "        echo \"bounds $1 $2 $3 $4\"; echo \"centre $FX $FY\"; echo \"package $pk\"; } > $D/find-$fid.txt",
-         "      rm -f $D/hits.tmp $D/cand.tmp",
+         "      { echo \"status found\"; echo \"matches $n\"; echo \"visible $vn\"; echo \"reads $reads\"; echo \"swipes $swipes\"",
+         "        echo \"elapsed_ms $ms\"; echo \"bounds $1 $2 $3 $4\"; echo \"centre $FX $FY\"; echo \"package $pk\"",
+         "        echo \"display $DW $DH\"; } > $D/find-$fid.txt",
+         "      rm -f $D/hits.tmp $D/cand.tmp $D/vis.tmp",
          "      return 0",
          "    fi",
          "    if [ $ms -ge $tmo ]; then",
          "      if [ -n \"$b\" ] && [ -z \"$grace\" ]; then grace=1; pb=$b; continue; fi",
-         "      st=not_found; if [ -n \"$b\" ]; then st=unstable; fi",
-         "      { echo \"status $st\"; echo \"matches $n\"; echo \"reads $reads\"; echo \"elapsed_ms $ms\"",
+         "      st=not_found; if [ -n \"$b\" ]; then st=unstable; elif [ -n \"$off\" ]; then st=not_visible; fi",
+         "      { echo \"status $st\"; echo \"matches $n\"; echo \"visible $vn\"; echo \"reads $reads\"; echo \"swipes $swipes\"",
+         "        echo \"elapsed_ms $ms\"; echo \"display $DW $DH\"",
          "        if [ -n \"$b\" ]; then echo \"last_bounds $b\"; echo \"previous_bounds $pb\"; fi",
+         "        if [ -n \"$off\" ]; then echo \"offscreen_bounds $off\"; fi",
          "        if [ -s $D/cand.tmp ]; then",
          "          echo \"other_packages $(grep -v -F -- \"$pkn\" $D/cand.tmp | sed -nE 's/.* package=\"([^\"]*)\".*/\\1/p' | tr '\\n' ' ')\"",
          "        fi; } > $D/find-$fid.txt",
-         "      rm -f $D/hits.tmp $D/cand.tmp $D/ui.tmp",
+         "      rm -f $D/hits.tmp $D/cand.tmp $D/ui.tmp $D/vis.tmp",
          "      return 1",
          "    fi",
          "    pb=$b",
+         "    if [ -n \"$ok\" ] && [ -z \"$b\" ] && [ $swipes -lt $smax ]; then",
+         "      input swipe $(( (DW * sx1 + 5000) / 10000 )) $(( (DH * sy1 + 5000) / 10000 )) $(( (DW * sx2 + 5000) / 10000 )) $(( (DH * sy2 + 5000) / 10000 )) $sms",
+         "      swipes=$((swipes + 1)); pb=",
+         "      sleep $sst",
+         "      continue",
+         "    fi",
          "    sleep 0.5",
          "  done",
          "}",
@@ -614,6 +698,15 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
          "}",
          "dumpsys SurfaceFlinger --timestats -enable -clear >/dev/null 2>&1",
          "am force-stop \"$PKG\"", "sleep 1", "mark T0"]
+    if any("find" in s for s in scn["steps"]):
+        # The display a lookup checks a match against: the override size when one is set (a smaller
+        # screen emulated with `wm size`), else the physical size. Read once, kept in display.txt.
+        L[L.index("dumpsys SurfaceFlinger --timestats -enable -clear >/dev/null 2>&1"):0] = [
+            "WMS=$(wm size 2>/dev/null)",
+            "DS=$(printf '%s\\n' \"$WMS\" | sed -nE 's/^Override size: ([0-9]+)x([0-9]+).*/\\1 \\2/p' | head -n 1)",
+            "if [ -z \"$DS\" ]; then DS=$(printf '%s\\n' \"$WMS\" | sed -nE 's/^Physical size: ([0-9]+)x([0-9]+).*/\\1 \\2/p' | head -n 1); fi",
+            "DW=; DH=; if [ -n \"$DS\" ]; then DW=${DS% *}; DH=${DS#* }; fi",
+            "echo \"$DS\" > $D/display.txt"]
     if video:
         L += [f"screenrecord --bit-rate 8000000 --time-limit {limit_s} $D/screen.mp4 &", "SR=$!",
               "echo $SR > $D/sr.pid", "sleep 1.5"]
@@ -637,8 +730,15 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
             # by time; the baseline after it keeps it out of the step's counts as well.
             nth = step["find"].get("nth", 0)
             pkn = q(' package="' + find_package(scn, step) + '"')
+            sc = find_scroll(step)
+            if sc is None:
+                scroll = "'0 0 0 0 0 0 0'"
+            else:
+                tenk = lambda v: str(int(round(v * 10000)))
+                scroll = q(" ".join([str(sc["max"]), *(tenk(v) for v in sc["from"] + sc["to"]), str(int(sc["ms"])),
+                                     str(sc["settle_ms"] / 1000)]))
             L += [f"mark {sid}.find_start",
-                  f"if ! find_el {sid} {q(find_needle(step['find']))} {nth} {find_timeout_ms(scn, step)} {pkn}; then "
+                  f"if ! find_el {sid} {q(find_needle(step['find']))} {nth} {find_timeout_ms(scn, step)} {pkn} {scroll}; then "
                   f"mark {sid}.find_failed; echo {sid} > $D/{LOOKUP_FAILED}; exit 3; fi",
                   f"mark {sid}.found",
                   f"sleep {step.get('find_settle_ms', FIND_SETTLE_MS) / 1000}",
@@ -923,22 +1023,25 @@ def pull_raw(serial: str, out: Path, listing: list[str]) -> Path:
 
 
 def parse_find(text: str | None) -> dict | None:
-    """The record find_el() writes: status (found, not_found or unstable), matches in the wanted
-    package (a number, or None when the last read of the window tree failed), reads, elapsed_ms;
-    when found, bounds and centre in pixels and the matched node's package; on a timeout, the last
-    two bounds of a match that moved and the packages of matching elements in other packages."""
+    """The record find_el() writes: status (found, not_found, not_visible, unstable or
+    no_display_size), matches in the wanted package and how many of them were on the screen (a
+    number, or None when the last read of the window tree failed), reads, swipes, elapsed_ms and
+    the display size the matches were checked against; when found, bounds and centre in pixels and
+    the matched node's package; on a timeout, the last two bounds of a match that moved, the bounds
+    of a match that was off the screen and the packages of matching elements in other packages."""
     if text is None:
         return None
     out = {}
+    integer = re.compile(r"-?\d+")
     for line in text.splitlines():
         key, _, rest = line.partition(" ")
         vals = rest.split()
         if key in ("status", "package"):
             out[key] = rest.strip() or None
-        elif key in ("matches", "reads", "elapsed_ms"):
+        elif key in ("matches", "visible", "reads", "swipes", "elapsed_ms"):
             out[key] = int(vals[0]) if vals and vals[0].isdigit() else None
-        elif key in ("bounds", "centre", "last_bounds", "previous_bounds"):
-            out[key] = [int(v) for v in vals] if vals and all(v.isdigit() for v in vals) else None
+        elif key in ("bounds", "centre", "last_bounds", "previous_bounds", "offscreen_bounds", "display"):
+            out[key] = [int(v) for v in vals] if vals and all(integer.fullmatch(v) for v in vals) else None
         elif key == "other_packages":
             out[key] = list(dict.fromkeys(vals))
     return out
@@ -982,13 +1085,30 @@ def lookup_failure(serial: str, scn: dict, out: Path, check: bool = True) -> Loo
     timeout = find_timeout_ms(scn, step)
     pkg = find_package(scn, step)
     want = "exactly one" if "nth" not in step["find"] else f"at least {step['find']['nth']}"
-    if rec.get("status") == "unstable":
+    status = rec.get("status")
+    scroll = find_scroll(step)
+    swipes = rec.get("swipes")
+    if status == "no_display_size":
+        return LookupFailed(f"step '{sid}': the display size could not be read on the device (`wm size`), so whether "
+                            f"{describe_find(step['find'])} is on the screen cannot be told; the lookup did not start. "
+                            "The device script stopped there and restored the device; no capture was saved", sid)
+    if status == "unstable":
         moved = ""
         if rec.get("previous_bounds") and rec.get("last_bounds"):
             moved = f" (bounds {rec['previous_bounds']} then {rec['last_bounds']})"
         seen = f"a match was there but did not hold still: two reads in a row never gave the same bounds{moved}"
+    elif status == "not_visible":
+        display = rec.get("display")
+        on = f"a {display[0]} x {display[1]} display" if display and len(display) == 2 else "the display"
+        seen = (f"{rec.get('matches')} matched in {pkg} at the last read, {rec.get('visible')} of them on the screen "
+                f"({want} needed): the element is in the window tree but off the screen (bounds "
+                f"{rec.get('offscreen_bounds')} on {on})")
+        seen += ("; add 'find.scroll' to swipe it into view" if scroll is None else
+                 f"; {swipes if swipes is not None else 'an unknown number of'} swipes did not bring it onto the screen")
     elif rec.get("matches") is not None:
         seen = f"{rec['matches']} matched in {pkg} at the last read ({want} needed)"
+        if rec.get("visible") is not None and rec["visible"] != rec["matches"]:
+            seen += f", {rec['visible']} of them on the screen"
     else:
         seen = "the last read of the window tree failed"
     others = [p for p in rec.get("other_packages") or [] if p != pkg]
@@ -997,9 +1117,10 @@ def lookup_failure(serial: str, scn: dict, out: Path, check: bool = True) -> Loo
     tree = raw / f"ui-{sid}.xml"
     where = f"the last tree read is saved in {tree}" if tree.exists() else "no read of the window tree succeeded, so no tree was saved"
     reads = rec.get("reads")
-    verb = "did not hold still" if rec.get("status") == "unstable" else "did not appear"
+    verb = {"unstable": "did not hold still", "not_visible": "was not on the screen"}.get(status, "did not appear")
+    swiped = "" if scroll is None else f", {swipes if swipes is not None else 'an unknown number of'} swipes"
     return LookupFailed(f"step '{sid}': {describe_find(step['find'])} {verb} within {timeout} ms"
-                        f" ({reads if reads is not None else 'an unknown number of'} reads): {seen}; {where}."
+                        f" ({reads if reads is not None else 'an unknown number of'} reads{swiped}): {seen}; {where}."
                         " The device script stopped there and restored the device; no capture was saved", sid)
 
 
@@ -1136,7 +1257,8 @@ def find_record(text: str | None, step: dict, facts: dict, baseline: dict | None
     if rec is None:
         return None
     sid = step["id"]
-    centre, w, h = rec.get("centre"), facts.get("width"), facts.get("height")
+    display = rec.get("display") if rec.get("display") and len(rec["display"]) == 2 else None
+    centre, w, h = rec.get("centre"), *(display or (facts.get("width"), facts.get("height")))
     return {
         **{k: step["find"][k] for k in ("text", "desc", "nth") if k in step["find"]},
         "status": rec.get("status"),
@@ -1144,7 +1266,8 @@ def find_record(text: str | None, step: dict, facts: dict, baseline: dict | None
         "centre": [round(centre[0] / w, 4), round(centre[1] / h, 4)] if centre and len(centre) == 2 and w and h else None,
         "bounds_px": rec.get("bounds"),
         "package": rec.get("package"),
-        "matches": rec.get("matches"), "reads": rec.get("reads"), "lookup_ms": rec.get("elapsed_ms"),
+        "matches": rec.get("matches"), "visible": rec.get("visible"), "reads": rec.get("reads"),
+        "swipes": rec.get("swipes"), "display_px": display, "lookup_ms": rec.get("elapsed_ms"),
         "settle_ms": step.get("find_settle_ms", FIND_SETTLE_MS),
         # The uptime of the baseline's CPU reading: the step's counts start there.
         "baseline_s": baseline.get("uptime") if baseline else None,
@@ -1833,11 +1956,40 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 notes.append(f"{sid}: another app was in front, so the recording shows that app; it was not used for this step")
             elif vid is not None:
                 findings = []
-                if vid["identical_frames"] > 0:
-                    findings.append((vid["identical_frames"], 0, False,
-                                     f"{vid['identical_frames']} frames were composed at rest that changed nothing on screen"))
+                # What the recording shows at rest is the app's doing only if the app presented a
+                # frame. When every exact count of its frames is known and zero (the platform's and
+                # the compositor's per-layer count, and a trace's if one was recorded), the display
+                # composed for another layer (a status-bar change, say) and the recorder kept those
+                # frames, some changing nothing, some carrying re-encoding noise in the app's area.
+                # An animation nobody can see presents frames, so its counts are above zero and both
+                # recording checks still apply. A step with its own changed-frames allowance is judged
+                # against that allowance as before.
+                presented_none = (s.get("frames") == 0 and s.get("frames_layers") == 0
+                                  and not s.get("frames_compositor"))
+                identical = vid["identical_frames"]
                 real = vid.get("app_changed_frames_real", vid["app_region_frames"])
-                if real > changed_max:
+                quiet_identical = identical > 0 and presented_none
+                quiet_change = real > 0 and presented_none and not changed_allowed
+                if identical > 0 and not quiet_identical:
+                    findings.append((identical, 0, False, f"{identical} frames were composed at rest that changed nothing on screen"))
+                if quiet_change and quiet_identical:
+                    notes.append(f"{sid}: {identical} frames were composed at rest that changed nothing on screen and the "
+                                 f"screen changed in {real} recorded frames in the app's area, but the app presented no "
+                                 "frame by any count (platform 0, compositor per layer 0), so the display composed them "
+                                 "for a layer that is not the app's and the changes came from the recording's encoder; "
+                                 f"not a violation. Look at them on sheets/{sid}.png and with `ui-probe zoom <run-dir> <a> <b>`")
+                elif quiet_identical:
+                    notes.append(f"{sid}: {identical} frames were composed at rest that changed nothing on screen, but the "
+                                 "app presented no frame by any count (platform 0, compositor per layer 0), so the display "
+                                 "composed them for a layer that is not the app's (a status-bar change, say); not a "
+                                 f"violation. Look at them on sheets/{sid}.png and with `ui-probe zoom <run-dir> <a> <b>`")
+                if quiet_change:
+                    if not quiet_identical:      # otherwise the note above covers both
+                        notes.append(f"{sid}: the screen changed at rest in {real} recorded frames in the app's area, but "
+                                     "the app presented no frame by either count (platform 0, compositor per layer 0), so "
+                                     "the change came from the recording's encoder or from a layer that is not the app's; "
+                                     f"not a violation. Look at it on sheets/{sid}.png and with `ui-probe zoom <run-dir> <a> <b>`")
+                elif real > changed_max:
                     findings.append((real, changed_max, changed_allowed,
                                      f"the screen changed at rest: {real} frames in the app's area"
                                      + (f", allowed {changed_max}{by_allowance(True)}" if changed_allowed else "")))

@@ -63,7 +63,11 @@ wrong type stops the run before anything touches the device.
 Step kinds are `rest`, `tap`, `swipe`, `key` and `text` (types into the focused field). Prefer
 `"find": {"text": ...}` or `{"desc": ...}` on a tap to hard-coded coordinates: the target is
 looked up on the device before the step (an element of the app's own package whose bounds held
-still over two reads), and the lookup is charged to no step. A screen that is
+still over two reads, and on the screen), and the lookup is charged to no step. Under a smaller
+screen or a larger font a target can sit below the fold: give its `find` a `find.scroll` (a swipe,
+repeated up to `max` times) rather than new coordinates; a lookup that ends `not_visible` says the
+element was in the tree but off the screen. A backend on the host behind `ui-probe proxy` needs
+`--map-host 10.0.2.2=127.0.0.1` on an emulator. A screen that is
 never still by design (a blinking caret) gets an `allow` on its rest step, with a `reason`, and
 every step that ends on it a fixed wait (`"until_quiet": false`), since such a screen never goes
 quiet; never an allowance for recorded frames that changed nothing (there is none). The README's "Screens that are never still" has the
@@ -89,6 +93,7 @@ What the at-rest checks mean when they fail:
 |---|---|
 | frames at rest, with identical recorded frames | something animates where it cannot be seen (zero alpha, off screen, behind another layer) |
 | the app's area changed at rest | a visible animation or content that never settles |
+| a note that recorded frames changed nothing or changed the app's area while the app presented no frame | another layer (the status bar made the display compose) or encoder noise; not a violation, `zoom` to see it. With any count above 0 they stay violations |
 | CPU at rest without frames | background work on a timer or a busy loop |
 | never went quiet, "the app kept drawing" | loading that does not finish, or an animation with no end |
 | never went quiet, "the display kept changing while the app was idle" | something outside the app's own frame count: a system animation, the keyboard, another window, or a surface the app draws outside its views. Read the sheet before blaming the app |

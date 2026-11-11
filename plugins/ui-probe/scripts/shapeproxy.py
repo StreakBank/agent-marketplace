@@ -24,12 +24,22 @@ requests). While it runs, a tunnel an app keeps open has no line yet.
 
 It prints `listening on <address>:<port>` once the port is bound, and fails if the port is taken.
 
+`--map-host FROM=TO` (repeatable) connects a CONNECT target or a plain HTTP request whose host is
+FROM to TO instead, on the same port. An emulator names the host's loopback by an alias (10.0.2.2)
+that the host itself cannot connect to; mapping it to 127.0.0.1 lets a backend the app reaches by
+that alias be reached through the proxy too. The log line then carries both the target as named
+and the address connected to. Only the connection is redirected: the request is passed on as it
+was sent (a plain request keeps its Host header and absolute URI).
+
 usage: ui-probe proxy --port 8899 [--bind 127.0.0.1] [--delay-ms 200] [--kbit 400] [--log tunnels.jsonl]
+                      [--map-host FROM=TO ...]
 """
 from __future__ import annotations
 import argparse
 import asyncio
+import ipaddress
 import json
+import re
 import signal
 import socket
 import struct
@@ -40,6 +50,46 @@ QUEUE_CHUNKS = 256        # per direction: at most READ_SIZE * QUEUE_CHUNKS byte
 _FAILED = object()        # queued by a reader whose side failed: the writer aborts, it never half-closes
 BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 STOPPED = "open when the proxy stopped"
+HOST_LABEL = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)")
+
+
+def norm_host(value: str) -> str:
+    """A host as the mapping compares it: an IP address in its canonical form, a name in lower case."""
+    v = value.strip("[]")
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        return v.lower()
+
+
+def checked_host(value: str, side: str) -> str:
+    """One side of --map-host: a host name or an IP address (IPv6 with or without brackets), with no
+    port, scheme, path or space. Returns it normalised; raises ArgumentTypeError otherwise."""
+    bad = argparse.ArgumentTypeError(
+        f"--map-host {side} {value!r} must be a host name or an IP address, with no port, scheme or path")
+    v = value
+    if v.startswith("[") and v.endswith("]"):
+        try:
+            return str(ipaddress.IPv6Address(v[1:-1]))
+        except ValueError:
+            raise bad from None
+    try:
+        return str(ipaddress.ip_address(v))
+    except ValueError:
+        pass
+    labels = v.split(".")
+    if (not v or len(v) > 253 or not all(HOST_LABEL.fullmatch(label) for label in labels)
+            or all(label.isdigit() for label in labels)):      # all digits: a malformed address, not a name
+        raise bad
+    return v.lower()
+
+
+def map_host(text: str) -> tuple[str, str]:
+    """--map-host FROM=TO: both sides checked by checked_host."""
+    if text.count("=") != 1:
+        raise argparse.ArgumentTypeError(f"--map-host takes FROM=TO (one '='), not {text!r}")
+    src, dst = text.split("=")
+    return checked_host(src, "FROM"), checked_host(dst, "TO")
 
 
 class Aborted(Exception):
@@ -139,6 +189,7 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
     started = time.time()
     t0 = time.monotonic()
     target = "?"
+    connected_to = None
     error = None
     up, down = [0], [0]
     server_w = None
@@ -162,8 +213,10 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
             host, _, port = where.rpartition(":")
             host = host.strip("[]")
         target = f"{host}:{port}"
+        to = (getattr(args, "host_map", None) or {}).get(norm_host(host), host)
+        connected_to = f"{to}:{port}"
         try:
-            server_r, server_w = await asyncio.open_connection(host, int(port))
+            server_r, server_w = await asyncio.open_connection(to, int(port))
         except (OSError, ValueError) as exc:
             target = f"{target} ({type(exc).__name__})"
             error = "target unreachable"
@@ -214,7 +267,7 @@ async def handle(client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter,
             else:
                 await _close(server_w)
                 await _close(client_w)
-        log.write(json.dumps({"target": target, "start_epoch": round(started, 3),
+        log.write(json.dumps({"target": target, "connected_to": connected_to, "start_epoch": round(started, 3),
                               "duration_s": round(time.monotonic() - t0, 3),
                               "bytes_up": up[0], "bytes_down": down[0], "error": error}) + "\n")
         log.flush()
@@ -230,7 +283,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--delay-ms", type=float, default=0, help="added latency per direction")
     ap.add_argument("--kbit", type=float, default=0, help="rate limit per direction and connection, kbit/s; 0 = none")
     ap.add_argument("--log", default="tunnels.jsonl")
-    return ap.parse_args(argv)
+    ap.add_argument("--map-host", action="append", default=[], type=map_host, metavar="FROM=TO",
+                    help="connect a target named FROM to TO instead, same port (repeatable); for example "
+                         "10.0.2.2=127.0.0.1, the emulator's name for the host's loopback")
+    args = ap.parse_args(argv)
+    args.host_map = {}
+    for src, dst in args.map_host:
+        if src == dst:
+            ap.error(f"--map-host maps {src} to itself")
+        if src in args.host_map:
+            ap.error(f"--map-host maps {src} twice")
+        args.host_map[src] = dst
+    return args
 
 
 async def start(args: argparse.Namespace, log, active: set | None = None) -> asyncio.AbstractServer:

@@ -107,8 +107,21 @@ class ForegroundTest(Base):
         return cap.gate()
 
     def test_with_the_app_in_front_a_changing_screen_at_rest_fails(self):
+        # the app draws 30 frames during idle2: every count of its frames is above 0
+        files = healthy_files()
+        files["gfx-idle2.txt"] = gfx_text(GFX["idle2"] + 30)
+        files["sf-idle2.txt"] = sf_text(SF_TOTAL["idle2"] + 30, GFX["idle2"] + 30)
+        res = self.recorded(files)
+        self.assertEqual(checks(res), ["rest-frames", "rest-video", "rest-video"])
+
+    def test_what_the_recording_shows_while_the_app_presents_nothing_is_a_note(self):
+        """0.3.0: in these files both of the app's counts read 0 during idle2, so the 3 frames that
+        changed nothing and the 40 that changed the app's area were composed for another layer."""
         res = self.recorded(healthy_files())
-        self.assertEqual(checks(res), ["rest-video", "rest-video"])
+        self.assertEqual(res["verdict"], "PASS", res)
+        self.assertTrue(any(n.startswith("idle2: 3 frames were composed at rest that changed nothing on screen and the "
+                                         "screen changed in 40 recorded frames in the app's area, but the app presented "
+                                         "no frame by any count") for n in res["notes"]), res["notes"])
 
     def test_a_background_rest_is_not_judged_by_what_the_other_app_draws(self):
         """Seen on a device: behind the launcher the recording showed 49 changing frames, all the

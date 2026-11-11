@@ -126,11 +126,12 @@ with different files is not replaced without `--force`. The scripts can also be 
   screen is stable.
 - Fixed waits must add up to less than the recorder's 180 s limit. Split longer scenarios.
 
-Four more keys, one example each:
+More keys, one example each:
 
 ```json
 {"id": "type-code", "do": "text", "text": "000000"}
 {"id": "open", "do": "tap", "find": {"text": "Sign up"}}
+{"id": "open-below", "do": "tap", "find": {"text": "Settings", "scroll": {"from": [0.5, 0.8], "to": [0.5, 0.3], "max": 5}}}
 {"id": "open-slow", "do": "tap", "find": {"desc": "Phone number", "nth": 1, "timeout_ms": 15000}, "until_quiet": true, "quiet": {"max_ms": 30000}}
 {"id": "rest-field", "do": "rest", "ms": 5000, "allow": {"frames_max": 12, "reason": "the caret blinks twice a second"}}
 ```
@@ -143,10 +144,14 @@ Four more keys, one example each:
   exactly one of `text` (the element's text) or `desc` (its content description), matched exactly,
   on an element of the scenario's `package` (`package` in `find` names another one, for a system
   dialog say). Without `nth` the match must be unique; `nth` (from 1) picks among several in
-  document order. The lookup retries until the element is there and still, so it doubles as a
-  wait for the screen, up to `timeout_ms` (default: the scenario's `quiet.max_ms`).
-  `find_settle_ms` (default 1000) is the wait after it, before the counts of the step start. See
-  "Tap targets found on the device".
+  document order. Only an element on the screen counts. The lookup retries until the element is
+  there, on the screen and still, so it doubles as a wait for the screen, up to `timeout_ms`
+  (default: the scenario's `quiet.max_ms`, plus room for every swipe when `scroll` is given).
+  `find_settle_ms` (default 1000) is the wait after it, before the counts of the step start.
+- `scroll` in `find` swipes a target into view that a smaller screen or a larger font has pushed
+  below the fold: while a read shows no acceptable match, the script swipes from `from` to `to`
+  (screen fractions, as in a swipe step) over `ms` (default 600), waits `settle_ms` (default 800)
+  and reads again, at most `max` times (1 to 20). See "Tap targets found on the device".
 - `quiet` on a tap, swipe, key or text step replaces the scenario's `quiet` values for that step
   (a key it leaves out comes from the scenario). It applies only to a step that waits for quiet.
 - `allow` on a rest step raises its limits on purpose, with a reason. See "Screens that are never
@@ -167,12 +172,15 @@ change what is gated:
   non-empty string of at most 200 characters on one line, with no tab, no other control
   character, no surrogate and no character outside the Basic Multilingual Plane: the window-tree
   dump never writes those as they are, so they could never match; the error names the character),
-  `nth` (an integer of at least 1), `timeout_ms` (a number of at least 100) and `package` (an
-  application id).
+  `nth` (an integer of at least 1), `timeout_ms` (a number of at least 100), `package` (an
+  application id) and `scroll`. `scroll` takes `from` and `to` (required, `[x, y]` between 0 and
+  1, at least 0.1 apart on one axis, since a swipe that barely moves is a tap), `max` (required,
+  an integer from 1 to 20), `ms` (a number of at least 1) and `settle_ms` (a number of at least 0).
 - A key that is unknown, or that does not apply to the step's kind (`meminfo` on a tap,
   `settle_ms` on a rest, `allow` on a tap, `find` on a swipe, `quiet` on a step that does not wait
   for quiet), is an error. Keys whose name ends in `comment` are allowed in the scenario and in a
-  step; inside `quiet`, `gate`, `expect`, `allow` and `find` every key must be one of the listed.
+  step; inside `quiet`, `gate`, `expect`, `allow`, `find` and `scroll` every key must be one of the
+  listed.
 
 ## Screens that are never still
 
@@ -190,8 +198,15 @@ tick short of the default limit. A rest on such a screen takes an allowance for 
   step; `changed_frames_max` is how many recorded frames may change the app's area (otherwise
   none). A step's allowance wins over the command line and the scenario's `gate` block for that
   step, and applies to no other step.
+- Whether a caret's blink counts as a change in the app's area depends on how large the caret
+  is in the recording. On a display 1080 px wide it did not (0 changed frames in 20 windows); on
+  one 720 px wide the caret of a tall code field did, in 10 of 10 frames. Give such a rest
+  `changed_frames_max` as well as `frames_max`, with the same number.
 - There is no allowance for recorded frames that changed nothing. A caret does not produce them;
-  an animation nobody can see does, and that check is what catches it.
+  an animation nobody can see does, and that check is what catches it. Such frames are excused
+  only when the app presented no frame by any count (see "The gate"), and that exemption cannot
+  hide such an animation: it draws and presents frames, so its counts are above zero, and both the
+  frame check and this one still fail it.
 - A violation on such a step says the limit came from the step's allowance. A step that passed
   only because of its allowance gets a note with the value observed, the allowance and the reason,
   and `gate` lists every allowance in force under its run.
@@ -219,6 +234,23 @@ up to the timeout; a match first seen at the timeout gets one more read to hold 
 goes to the centre of the element's bounds, and `find-<step>.txt` and `run.json` record the
 package it was found in.
 
+A match counts only when it is on the screen: its bounds are not empty and its centre lies on the
+display. The display's size is read once when the device script starts (`wm size`): the override
+size when one is set, as when a smaller screen is emulated with `wm size <w>x<h>`, else the
+physical size; the host reads it the same way, so coordinate taps and swipes use it too. Without
+`nth` the match must be the only one on the screen; with it, `nth` counts the ones on the screen.
+A match that is in the tree but off the screen is "not yet". With `scroll`, every read that
+succeeds without an acceptable match triggers a swipe: a match off the screen, no match at all (a
+list often builds only the rows it shows), or several where one is needed. A swipe is never made
+after a read that failed, or while a match waits for its second read. The lookup ends `not_visible` when matches were in the tree but none (or too few) on the
+screen at the timeout; the message gives their bounds and the display size, and suggests `scroll`
+when the step has none. `find-<step>.txt` and `run.json` record the swipes made. The default
+timeout with `scroll` is `quiet.max_ms` plus, for each of the `max` swipes, its `ms`, its
+`settle_ms` and one read (about 2.5 s); the scenario's worst-case duration counts that, and one
+swipe that runs on past the timeout, while the fixed-wait estimate checked against the
+recorder's limit counts no swipe. Everything a lookup does, swipes included, happens before the
+step's start mark and its baseline, so it is charged to no step.
+
 A lookup is charged to no step. Reading the tree makes the app and the compositor work: two reads
 inside one rest window on a perfectly still screen produced 1 frame by the platform's count, 9
 recorded frames that changed nothing and 9 CPU ticks, where the windows before and after had 0. So
@@ -230,7 +262,8 @@ step. That is also why `find` is not offered on a rest: a lookup never falls ins
 A baseline that could not be read leaves the step's counts unknown; they are never taken from the
 previous step.
 
-When the element never appears, or never holds still (its status is then `unstable`), the script
+When the element never appears, is never on the screen (`not_visible`) or never holds still
+(`unstable`), the script
 stops there, restores the device as on every other error path (the recorder stopped, the
 compositor's statistics off), and the run exits 2 with a message that names the step, what was
 looked for, how many elements matched at the last read (and the packages of matching elements in
@@ -254,7 +287,9 @@ keeps `failed.json`, and `gate` fails the run (see "Runs that did not complete")
     pid-<step>.txt        the app's process id at the end of each step
     fg-<step>.txt         the resumed activity at the end of each step: which app was in front
     mem-<step>.txt        memory, for rest steps with "meminfo": true
-    find-<step>.txt       a tap with "find": the lookup's result, matches, reads, time, bounds, centre, package
+    display.txt           a scenario with "find": the display size lookups checked matches against
+    find-<step>.txt       a tap with "find": the lookup's result, matches and how many were on the screen,
+                          reads, swipes, time, bounds, centre, package, the display size
     ui-<step>.xml         a tap with "find": the last window tree read
     gfx-<step>.base.txt, sf-<step>.base.txt, cpu-<step>.base.txt, pid-<step>.base.txt
                           a tap with "find": the baseline the step's counts start from
@@ -312,7 +347,7 @@ exits 1 on a violation.
 | Check | Fails when |
 |---|---|
 | Frames at rest | the app drew more than `rest_frames_max` frames (default 0, or the step's `allow.frames_max`) in a rest step, or no count of its frames and no aligned recording exist |
-| Recording at rest | frames were composed that changed nothing on screen, or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes |
+| Recording at rest | frames were composed that changed nothing on screen, or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes. Both are notes, not violations, when the app presented no frame by any count (platform and per-layer both known and 0, a trace's 0 or absent); a step with `allow.changed_frames_max` keeps its allowance for changes in the app's area |
 | CPU at rest | the app used more than `rest_cpu_pct_max` percent of one core (default 2.0, or the step's `allow.cpu_pct_max`) |
 | Find | a tap with `find` holds no record of where its element was found, or the element was matched in another package than the one asked for |
 | Run | a run folder holds `failed.json`, `device-script.sh` or `raw/` but no capture: the run did not complete |
@@ -366,6 +401,21 @@ recorder's start mark), or when the platform's frame rows do not line up with th
 the recording's at-rest findings become notes, frame counts still gate, and an
 `expect.signature` fails with "the recording could not be aligned".
 
+What the recording shows during a rest is the app's doing only if the app presented a frame. The
+display composes a frame whenever anything on it changes (a status-bar icon, say), sometimes two
+in quick succession, and the recorder keeps them: one that changed nothing on screen, or one whose
+re-encoding noise along text edges puts a small patch in the app's area over the change threshold.
+So when the app presented no frame by any count (the platform's count and the compositor's
+per-layer count both known and 0, and a trace, if recorded, counted none either), recorded frames
+that changed nothing and a recorded change in the app's area are a note, not a violation: the
+display composed them for a layer that is not the app's, or the change came from the encoder. One
+note covers both when both occur, and it names the command to look at them
+(`ui-probe zoom <run-dir> <a> <b>`). If any count is unknown or above 0, both remain violations as
+before; an animation nobody can see presents frames, so its counts are above zero and it still
+fails both the frame check and the recording check. A step with `allow.changed_frames_max` is
+judged against that allowance for changes in the app's area as before; there is still no
+allowance key for frames that changed nothing.
+
 Limits come from the step's `allow`, then the command line, then the scenario's `gate` block,
 then the defaults. `--advisory` reports the same violations and exits 0. `gate --scenario <file>`
 gates with a revised copy of the run's own scenario (a limit, an allowance): it refuses (exit 2) a
@@ -418,6 +468,21 @@ adb -s <serial> shell settings put global http_proxy 127.0.0.1:8899
 or listen on an address the device can reach with `--bind <host-address>` (`--bind 0.0.0.0`
 listens on every interface, and anyone on that network can then use the proxy).
 
+A backend on the host, reached from an emulator, needs one more argument. The guest names the
+host's loopback by an alias, `10.0.2.2`, that the host itself cannot connect to: an app that talks
+to `10.0.2.2:8080` reaches the host directly, but once the system proxy is set the proxy (on the
+host) is asked to connect to `10.0.2.2` and fails. `--map-host 10.0.2.2=127.0.0.1` connects a
+CONNECT target or a plain HTTP request whose host is `10.0.2.2` to `127.0.0.1` instead, on the
+same port. It is repeatable (`--map-host FROM=TO` once per host); each side is a host name or an
+IP address with no port, scheme or path (an IPv6 address with or without brackets), names compare
+without regard to case, and a host mapped twice or to itself is refused. Only the connection is
+redirected: the request goes on as it was sent, so a plain request keeps its `Host` header and its
+absolute URI.
+
+```sh
+ui-probe proxy --port 8899 --delay-ms 200 --kbit 400 --map-host 10.0.2.2=127.0.0.1 --log tunnels.jsonl &
+```
+
 The proxy adds a fixed latency per direction and paces every chunk at the rate limit, per
 connection. It never decrypts: HTTPS passes as opaque tunnels, so certificate pinning in the app
 is unaffected. A receiver that reads slowly slows the sender too (at most about 1 MB is held per
@@ -426,8 +491,9 @@ either side resets the whole connection, so neither end mistakes a broken transf
 one. Plain HTTP carries one request per connection: the request is forwarded with
 `Connection: close`, and the connection ends with its response.
 
-The log gets one line per connection when the connection ends: target, duration, bytes each way
-and the error that ended it, if any. An app usually keeps one tunnel open for a whole run, so
+The log gets one line per connection when the connection ends: the target as the client named it,
+the address connected to (`connected_to`: the target itself unless `--map-host` changed it),
+duration, bytes each way and the error that ended it, if any. An app usually keeps one tunnel open for a whole run, so
 that line is not there while the run is in progress. Stop the proxy (an interrupt or a terminate
 signal is enough): it then logs every connection still open, marked "open when the proxy
 stopped", and the log is a complete count of the connections it carried.
@@ -464,7 +530,9 @@ produce packet loss.
 - **A lookup sees what the window tree exposes.** An element with no text and no content
   description cannot be found by `find`; a screen that animates for longer than the timeout
   fails every read. Each read takes about 2 s, and a match needs two reads that agree, so a lookup
-  overshoots its timeout by up to two reads.
+  overshoots its timeout by up to two reads (and, with `scroll`, by one swipe and its settle time).
+  "On the screen" means within the display: an element under the keyboard, the navigation bar or
+  another window counts as on the screen, and a tap there reaches whatever covers it.
 - **The detour threshold was calibrated on two cases in one app.** Treat `TD` against `T` as a
   signal to look at the sheet, and tune `DETOUR_RATIO` if your screens disagree.
 - **`--trace` stops every on-device trace owned by the shell user** when the scenario ends.

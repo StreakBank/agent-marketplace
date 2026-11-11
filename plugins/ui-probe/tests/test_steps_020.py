@@ -249,7 +249,7 @@ class DeviceScriptTest(unittest.TestCase):
     def test_lookup_precedes_the_start_mark_and_the_baseline_follows_it(self):
         lines = self.lines(scenario([{"id": "rest", "do": "rest", "ms": 2000},
                                      {"id": "open", "do": "tap", "find": {"text": 'Sign "up"'}}]))
-        call = (f"if ! find_el open ' text=\"Sign &quot;up&quot;\"' 0 15000 ' package=\"{PKG}\"'; then "
+        call = (f"if ! find_el open ' text=\"Sign &quot;up&quot;\"' 0 15000 ' package=\"{PKG}\"' '0 0 0 0 0 0 0'; then "
                 "mark open.find_failed; echo open > $D/lookup-failed.txt; exit 3; fi")
         seq = ["snap rest", "mark open.find_start", call, "mark open.found", "sleep 1.0", "base open",
                "mark open.start", "input tap $FX $FY", "mark open.injected"]
@@ -261,7 +261,8 @@ class DeviceScriptTest(unittest.TestCase):
         lines = self.lines(scenario([{"id": "focus", "do": "tap", "find_settle_ms": 2500,
                                       "find": {"desc": "Phone number", "nth": 2, "timeout_ms": 9000}}],
                                     quiet={"ms": 500, "max_ms": 12000}))
-        self.assertTrue(any(l.startswith(f"if ! find_el focus ' content-desc=\"Phone number\"' 2 9000 ' package=\"{PKG}\"'; then")
+        self.assertTrue(any(l.startswith(f"if ! find_el focus ' content-desc=\"Phone number\"' 2 9000 ' package=\"{PKG}\"' "
+                                         "'0 0 0 0 0 0 0'; then")
                             for l in lines))
         self.assertEqual(lines[lines.index("base focus") - 1], "sleep 2.5")
         # the timeout defaults to the scenario's quiet.max_ms
@@ -336,6 +337,12 @@ elif [ -f "$SEQ/dump-$n.xml" ]; then cp "$SEQ/dump-$n.xml" "$2"; elif [ -f "$SEQ
 echo "UI hierchary dumped to: $2"
 """
 
+INPUT_STUB = """#!/bin/sh
+# input <args>: record the call; a swipe takes the place of one read in the dump sequence only if
+# the test prepared it that way (the sequence counts reads, not swipes)
+echo "$*" >> "$SEQ/input.log"
+"""
+
 
 @unittest.skipUnless(shutil.which("sh"), "no sh")
 class LookupInTheShellTest(unittest.TestCase):
@@ -353,11 +360,14 @@ class LookupInTheShellTest(unittest.TestCase):
         (self.root / "bin").mkdir()
         (self.root / "bin" / "uiautomator").write_text(STUB)
         (self.root / "bin" / "uiautomator").chmod(0o755)
+        (self.root / "bin" / "input").write_text(INPUT_STUB)
+        (self.root / "bin" / "input").chmod(0o755)
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def look(self, shell, trees, find, nth=0, timeout_ms=1500, always=None, package=PKG):
+    def look(self, shell, trees, find, nth=0, timeout_ms=1500, always=None, package=PKG, scroll="0 0 0 0 0 0 0",
+             display="1080 2400"):
         d = self.root / shell
         if d.exists():
             shutil.rmtree(d)
@@ -371,13 +381,14 @@ class LookupInTheShellTest(unittest.TestCase):
                 (d / f"fail-{n}").write_text("")       # this read fails, whatever comes after
         if always is not None:
             (d / "always.xml").write_text(always)
+        dw, _, dh = display.partition(" ")
         script = "\n".join([
-            f"D={d}", f"export SEQ={d}", f"PATH={self.root / 'bin'}:$PATH",
+            f"D={d}", f"export SEQ={d}", f"PATH={self.root / 'bin'}:$PATH", f"DW={dw}", f"DH={dh}",
             "now_cs() { c=$(cat $D/clock); echo $((c + 50)) > $D/clock; echo $c; }",
             "sleep() { :; }",
             self.function,
-            f"if find_el o {u.q(u.find_needle(find))} {nth} {timeout_ms} {u.q(' package=' + chr(34) + package + chr(34))}; "
-            "then echo \"FX=$FX FY=$FY\"; else echo NOT_FOUND; fi"])
+            f"if find_el o {u.q(u.find_needle(find))} {nth} {timeout_ms} {u.q(' package=' + chr(34) + package + chr(34))} "
+            f"{u.q(scroll)}; then echo \"FX=$FX FY=$FY\"; else echo NOT_FOUND; fi"])
         proc = subprocess.run([shell, "-c", script], capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rec = u.parse_find((d / "find-o.txt").read_text())
@@ -392,8 +403,9 @@ class LookupInTheShellTest(unittest.TestCase):
                                                                                node("Sign up", bounds="[100,200][301,261]")))
             self.assertEqual(out, "FX=200 FY=230", shell)
             # two reads that agree: the clock moves half a second per reading
-            self.assertEqual(rec, {"status": "found", "matches": 1, "reads": 2, "elapsed_ms": 1000,
-                                   "bounds": [100, 200, 301, 261], "centre": [200, 230], "package": PKG}, shell)
+            self.assertEqual(rec, {"status": "found", "matches": 1, "visible": 1, "reads": 2, "swipes": 0, "elapsed_ms": 1000,
+                                   "bounds": [100, 200, 301, 261], "centre": [200, 230], "package": PKG,
+                                   "display": [1080, 2400]}, shell)
             self.assertTrue((d / "ui-o.xml").exists())
             self.assertFalse((d / "hits.tmp").exists())
 
@@ -507,7 +519,8 @@ class LookupInTheShellTest(unittest.TestCase):
 
 FIND_SCN = copy.deepcopy(ANALYSIS_SCN)
 FIND_SCN["steps"][1] = {"id": "open", "do": "tap", "find": {"text": "Sign up"}}
-FOUND = f"status found\nmatches 1\nreads 2\nelapsed_ms 4100\nbounds 100 200 300 260\ncentre 200 230\npackage {PKG}\n"
+FOUND = (f"status found\nmatches 1\nvisible 1\nreads 2\nswipes 0\nelapsed_ms 4100\nbounds 100 200 300 260\n"
+         f"centre 200 230\npackage {PKG}\ndisplay 1080 2400\n")
 
 
 def found_files():
@@ -544,7 +557,8 @@ class FoundStepAnalysisTest(Base):
         find = steps_by_id(cap.analyze())["open"]["find"]
         self.assertEqual(find, {"text": "Sign up", "status": "found", "centre_px": [200, 230],
                                 "centre": [round(200 / 1080, 4), round(230 / 2400, 4)], "bounds_px": [100, 200, 300, 260],
-                                "package": PKG, "matches": 1, "reads": 2, "lookup_ms": 4100, "settle_ms": 1000, "baseline_s": 112.9,
+                                "package": PKG, "matches": 1, "visible": 1, "reads": 2, "swipes": 0,
+                                "display_px": [1080, 2400], "lookup_ms": 4100, "settle_ms": 1000, "baseline_s": 112.9,
                                 "tree": "raw/ui-open.xml"})
 
     def test_a_missing_baseline_is_unknown_not_the_previous_step(self):
@@ -876,8 +890,8 @@ class FindValueAndPackageValidationTest(unittest.TestCase):
         lines = u.build_device_script(scenario([{"id": "o", "do": "tap", "find": {"text": "x"}},
                                                 {"id": "p", "do": "tap", "find": {"text": "y", "package": "com.other.dialog"}}]),
                                       1080, 2400, False, 60).splitlines()
-        self.assertTrue(any(l.startswith(f"if ! find_el o ' text=\"x\"' 0 15000 ' package=\"{PKG}\"'; then") for l in lines))
-        self.assertTrue(any(l.startswith("if ! find_el p ' text=\"y\"' 0 15000 ' package=\"com.other.dialog\"'; then")
+        self.assertTrue(any(l.startswith(f"if ! find_el o ' text=\"x\"' 0 15000 ' package=\"{PKG}\"' '0 ") for l in lines))
+        self.assertTrue(any(l.startswith("if ! find_el p ' text=\"y\"' 0 15000 ' package=\"com.other.dialog\"' '0 ")
                             for l in lines))
 
 
@@ -1088,9 +1102,9 @@ class GateScenarioOverrideTest(Base):
 class DocsAndDoctorTest(unittest.TestCase):
     def test_every_example_step_in_the_readme_validates(self):
         readme = (Path(u.HERE).parent / "README.md").read_text()
-        block = readme.split("Four more keys, one example each:", 1)[1].split("```json", 1)[1].split("```", 1)[0]
+        block = readme.split("More keys, one example each:", 1)[1].split("```json", 1)[1].split("```", 1)[0]
         steps = [json.loads(line) for line in block.strip().splitlines()]
-        self.assertEqual(len(steps), 4)
+        self.assertEqual(len(steps), 5)
         for st in steps:
             u.validate_scenario(scenario([st]))
 

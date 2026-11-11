@@ -1,5 +1,48 @@
 # Changelog — ui-probe
 
+## 0.3.0 — 2026-11-10
+
+For running the same scenarios under other device profiles: a small screen, a large font, a slow
+network.
+
+- `find.scroll` on a tap: while a read shows no acceptable match, the device script swipes
+  (`from`, `to` as screen fractions, `ms`, default 600), waits (`settle_ms`, default 800) and reads
+  again, at most `max` (1 to 20) times. The two-agreeing-reads rule still decides, and
+  `timeout_ms` still bounds the whole lookup; without one, the default timeout adds room for every
+  swipe (its time, its settle time and one read). The swipes happen before the step's start mark
+  and its baseline, so they are charged to no step, and `find-<step>.txt` and `run.json` record
+  how many were made. A swipe that would move less than 0.1 of the screen is refused: it would be
+  a tap.
+- A match must be on the screen: its bounds not empty and its centre on the display. The device
+  script reads the display size once (`wm size`, the override size when one is set). A match in
+  the tree but off the screen is "not yet", triggers a swipe with `scroll`, and otherwise ends the
+  lookup as `not_visible` with its bounds and a message that suggests `find.scroll`. Without `nth`
+  the match must be the only one on the screen; `nth` counts the ones on it. A display size the
+  script cannot read ends the lookup at once (`no_display_size`).
+- The host reads the display size the same way, so a coordinate tap or swipe under an emulated
+  smaller screen lands where the scenario says; `capture.json` keeps the physical and the
+  override size.
+- `ui-probe proxy --map-host FROM=TO` (repeatable) connects a CONNECT target or a plain HTTP
+  request whose host is FROM to TO, on the same port, for a backend an emulator names by the
+  host's loopback alias (`10.0.2.2`), which the host cannot connect to. Both sides are checked
+  (a host name or an IP address, no port); a host mapped twice or to itself is refused. Each log
+  line carries `connected_to` beside the target as named.
+- What the recording shows during a rest is no longer a violation when the app presented no
+  frame by any count (the platform's and the compositor's per-layer count both known and 0, a
+  trace's 0 or absent): recorded frames that changed nothing and a recorded change in the app's
+  area become a note (one for both) naming another layer or the encoder as the cause, with the
+  `zoom` command. Seen on a clean build, on still screens with every count of the app's frames at
+  0: a status-bar change made the display compose (once, two frames 14 ms apart), and the recorder
+  kept a frame that changed nothing, or one whose re-encoding noise along text edges crossed the
+  threshold in the app's area; one run in about ten failed on it. An unknown or non-zero count keeps both violations, so an animation
+  nobody can see, which presents frames, still fails; `allow.changed_frames_max` is judged as
+  before, and there is still no allowance for frames that changed nothing.
+- README, from device runs under other profiles: a caret can count as a visible change on a
+  smaller display, so its rest takes `changed_frames_max` beside `frames_max`; the composition
+  counts of a first open that waits on the network agreed five times and differed the sixth, so
+  a count is a baseline only for a step whose signature also agrees; and a flash inside a
+  transition that already has a detour is not told apart by the signature.
+
 ## 0.2.0 — 2026-11-10
 
 Four additions for flows that type into a form and screens that are never still.
