@@ -112,7 +112,15 @@ class ForegroundTest(Base):
         files["gfx-idle2.txt"] = gfx_text(GFX["idle2"] + 30)
         files["sf-idle2.txt"] = sf_text(SF_TOTAL["idle2"] + 30, GFX["idle2"] + 30)
         res = self.recorded(files)
-        self.assertEqual(checks(res), ["rest-frames", "rest-video", "rest-video"])
+        # 0.8.1: in these files the display composes 10 frames for other layers during idle2 (display 40, the
+        # app's layers 30), so its 3 frames that changed nothing are set aside with a note; the frames drawn and
+        # the 40 that changed the app's area still fail
+        self.assertEqual(checks(res), ["rest-frames", "rest-video"])
+        self.assertEqual([v["message"] for v in res["violations"] if v["check"] == "rest-video"],
+                         ["the screen changed at rest: 40 frames in the app's area"])
+        self.assertIn("idle2: 3 frames of 3 composed at rest that changed nothing on screen were set aside: the display "
+                      "composed 40 frames and the app's own layers 30, so 10 frames were composed for a layer that is not "
+                      "the app's", res["notes"])
 
     def test_what_the_recording_shows_while_the_app_presents_nothing_is_a_note(self):
         """0.3.0: in these files both of the app's counts read 0 during idle2, so the 3 frames that

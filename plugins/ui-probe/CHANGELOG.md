@@ -1,5 +1,20 @@
 # Changelog — ui-probe
 
+## 0.8.1 — 2026-11-12
+
+- Android: a recorded frame that changed nothing at rest is held against the app only as far as the
+  app's own layers can account for it. The app owns as many such frames as its layers latched
+  (`frames_layers`, L) beyond the recorded frames that changed its area (`app_region_frames`, A);
+  of the rest, up to the frames the display composed beyond the app's layers (`frames_display`, D,
+  minus L) are set aside: not held against `allow.unchanged_frames_max` or the default of none,
+  with a note for the step giving D and L. What is left fails as before, and the failure says how
+  many were set aside. Nothing is set aside when L, D or A is unknown. A rest where the app's own
+  redraws changed nothing (L 4, D 9, A 2, two such frames, the display's extra frames the status
+  bar's) still fails. On an Android 11 emulator two rests on
+  a focused field failed on one such frame each, with display 11 and layers 10; which layer asked
+  for the extra composition is not established. The changed-frames check, the case where the app
+  presented nothing, the iOS gate and the request counts are unchanged.
+
 ## 0.8.0 — 2026-11-11
 
 A step that opens a link in the running app, so that a screen reached only by a link can be

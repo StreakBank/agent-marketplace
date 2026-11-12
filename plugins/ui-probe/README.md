@@ -405,7 +405,7 @@ exits 1 on a violation.
 | Check | Fails when |
 |---|---|
 | Frames at rest | the app drew more than `rest_frames_max` frames (default 0, or the step's `allow.frames_max`) in a rest step, or no count of its frames and no aligned recording exist |
-| Recording at rest | frames were composed that changed nothing on screen, or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes. Both are notes, not violations, when the app presented no frame by any count (platform and per-layer both known and 0, a trace's 0 or absent); a step with `allow.changed_frames_max` keeps its allowance for changes in the app's area |
+| Recording at rest | frames were composed that changed nothing on screen (beyond those the display composed for another layer: `frames_display` above `frames_layers`, both known), or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes. Both are notes, not violations, when the app presented no frame by any count (platform and per-layer both known and 0, a trace's 0 or absent); a step with `allow.changed_frames_max` keeps its allowance for changes in the app's area |
 | CPU at rest | the app used more than `rest_cpu_pct_max` percent of one core (default 2.0, or the step's `allow.cpu_pct_max`) |
 | Find | a tap with `find` holds no record of where its element was found, or the element was matched in another package than the one asked for |
 | Run | a run folder holds `failed.json`, `device-script.sh` or `raw/` but no capture: the run did not complete |
@@ -475,6 +475,30 @@ before; an animation nobody can see presents frames, so its counts are above zer
 fails both the frame check and the recording check. A step with `allow.changed_frames_max` is
 judged against that allowance for changes in the app's area as before; there is still no
 allowance key for frames that changed nothing.
+
+On Android a recorded frame that changed nothing is held against the app only as far as the app's
+own layers can account for it. The compositor's statistics count the frames the app's own layers
+latched (`frames_layers`, L) and the frames the display composed (`frames_display`, D); the
+recording counts the frames that changed the app's area (`app_region_frames`, A: any change there,
+a caret's blink included) and those that changed nothing (I). Each of the app's latches that no
+recorded change in its area accounts for may have produced a frame that changed nothing, so the app
+owns up to `min(I, max(0, L - A))` of them. Only the rest can have been composed for a layer that is
+not the app's, and no more of them than the display composed beyond the app's layers: `min(I -
+owned, max(0, D - L))` are set aside, not held against `allow.unchanged_frames_max` or the default
+of none, and the gate says so in a note for the step with D and L. What is left is judged as
+before, and its failure says how many were set aside. If L, D or A is not a known count, nothing is
+set aside, and the changed-frames check does not use this. An animation nobody can see still fails:
+its frames are latched by the app's own layer and change nothing on screen, so they are the app's
+own whatever the display did. A frame the app drew that changed nothing (a redraw of the same
+picture) is the app's own too: a 150 s rest on Android 14 with L 4, D 9, A 2 and I 2 fails as
+before, its five extra composites being the status bar's, which the recorder kept as frames that
+changed only outside the app's area. Measured on an Android 11 emulator (2026-11-11): two rests on a focused field
+with the keyboard up recorded one frame that changed nothing while the display composed 11 frames
+and the app's layers latched 10 (the platform also counted 10); no other layer's count rose in the
+compositor's statistics over the rest, and every one of those compositions was a client
+composition. The same kind of rest with the keyboard hidden had 10 and 10. Which layer asked for
+the extra composition is not established. On Android 14 the three counts were equal in such rests
+and no such frame was recorded.
 
 Limits come from the step's `allow`, then the command line, then the scenario's `gate` block,
 then the defaults. `--advisory` reports the same violations and exits 0. `gate --scenario <file>`
@@ -1223,6 +1247,15 @@ without `--rehearsal`, and the refusal says what to run first.
   both.
 
 ## Known limits
+
+- **Frames that changed nothing are set aside by the compositor's counts (Android).** Only those
+  beyond the app's latches that no recorded change in its area accounts for, and no more than the
+  display composed beyond the app's layers (see "The gate"). What this can still hide: a frame the
+  app latched that changed nothing on screen, when in the same rest (1) the recording counted a
+  change in the app's area that none of the app's latches made (encoder noise, or another window
+  drawn over the app's area), and (2) the display composed a frame for another layer. Each frame so
+  hidden needs one of each. The frame check still counts the app's frames, and fails them unless the
+  step's `allow.frames_max` covers them.
 
 - **Android, and the iOS Simulator for rests, taps, swipes and links.** Nothing here drives a physical
   iPhone. On a simulator the app's frame counts come from its log store, known only when the run

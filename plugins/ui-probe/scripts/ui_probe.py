@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -4080,6 +4080,11 @@ CLOCK_NOTE_ABOVE_S = 0.1        # the gate says how far each rest's window was n
 NO_REQUEST_LOG = "not counted: the run was given no request log"
 
 
+def _count(value) -> bool:
+    """A known count: an int, not a bool (JSON's true is not a count)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def _plural(n: int, one: str, many: str | None = None) -> str:
     return f"{n} {one if n == 1 else (many or one + 's')}"
 
@@ -5094,13 +5099,33 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 real = vid.get("app_changed_frames_real", vid["app_region_frames"])
                 quiet_identical = identical > 0 and presented_none
                 quiet_change = real > 0 and presented_none and not changed_allowed
-                if identical > unchanged_max and not quiet_identical:
-                    findings.append((identical, unchanged_max, unchanged_allowed,
-                                     f"{identical} frames were composed at rest that changed nothing on screen"
+                # A recorded frame that changed nothing is held against the app only as far as the app's own
+                # layers can account for it. The app may own as many such frames as its layers latched beyond
+                # the recorded frames that changed its area (any change there, the caret's included); only the
+                # rest can have been composed for another layer, and no more of them than the display composed
+                # beyond the app's layers. Unknown counts set nothing aside.
+                display, layers = s.get("frames_display"), s.get("frames_layers")
+                area = vid.get("app_region_frames")
+                other_layer = 0
+                if not quiet_identical and _count(display) and _count(layers) and _count(area):
+                    app_may_own = min(identical, max(0, layers - area))
+                    other_layer = min(identical - app_may_own, max(0, display - layers))
+                held = identical - other_layer
+                set_aside = (f" ({other_layer} more set aside: the display composed {display} frames, the app's "
+                             f"layers {layers})" if other_layer else "")
+                if other_layer:
+                    was = lambda n: "was" if n == 1 else "were"
+                    notes.append(f"{sid}: {_plural(other_layer, 'frame')} of {identical} composed at rest that changed "
+                                 f"nothing on screen {was(other_layer)} set aside: the display composed {display} frames "
+                                 f"and the app's own layers {layers}, so {_plural(display - layers, 'frame')} "
+                                 f"{was(display - layers)} composed for a layer that is not the app's")
+                if held > unchanged_max and not quiet_identical:
+                    findings.append((held, unchanged_max, unchanged_allowed,
+                                     f"{held} frames were composed at rest that changed nothing on screen" + set_aside
                                      + (f", allowed {unchanged_max}{by_allowance(True)}" if unchanged_allowed else "")))
-                elif unchanged_allowed and identical > unchanged_otherwise and not quiet_identical:
-                    within_allowance(identical, unchanged_otherwise, unchanged_max,
-                                     "recorded frames changed nothing on screen at rest")
+                elif unchanged_allowed and held > unchanged_otherwise and not quiet_identical:
+                    within_allowance(held, unchanged_otherwise, unchanged_max,
+                                     "recorded frames changed nothing on screen at rest" + set_aside)
                 if quiet_change and quiet_identical:
                     notes.append(f"{sid}: {identical} frames were composed at rest that changed nothing on screen and the "
                                  f"screen changed in {real} recorded frames in the app's area, but the app presented no "

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.2 — 2026-11-12
+
+- ui-probe 0.8.1: on Android a recorded frame that changed nothing at rest is set aside when the
+  app's own latches are all accounted for by recorded changes in its area and the display composed
+  more frames than the app's layers latched (a frame composed for another layer, seen on an Android
+  11 emulator), with a note; what is left fails as before. See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.13.1 — 2026-11-12
 
 - task-board 0.1.3: a session whose task is Done (or released) can bind its next task after

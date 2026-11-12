@@ -526,6 +526,58 @@ Not validated: a physical device; the alert's labels in another language or on a
 version; an `https` link (a universal link) on the simulator; an app that opens a link in a scene
 of its own.
 
+### Validation, 0.8.1
+
+**The rows of the table are unit tests and the gate run again over captures already saved.** The
+live runs were the lead's, on 2026-11-12, on the emulators and the simulator of 0.7.0's live
+validation, against a debug build and a backend on the same machine:
+
+- **Android 11 (API 30).** The whole gate of the project under its older-device profile: 15 of 15
+  scenarios pass, where 0.8.0 had failed two caret rests in the run this version was made for. In
+  that run no rest recorded an identical frame, so the rule had nothing to do. Six more runs of
+  the scenario with the focused field then met the case once in twelve caret rests (frames 10,
+  the app's layers 10, the display 11, one identical frame): set aside with the note, and six of
+  six runs pass.
+- **Android 14 (API 34).** The whole gate, blocking: 15 of 15. A phase of eleven further
+  scenarios: all pass but two rests that the project holds at zero on a known defect of its app.
+  Nothing was set aside in either.
+- **iOS Simulator.** Seven scenarios in a rehearsal and a measured run: the simulator's gate is
+  untouched by this version, and it gave what 0.8.0 gave on five earlier seeds.
+
+The lead's suite runs on the final tree: Linux container 846 ran, none failed, 2 skipped. macOS:
+of two runs one passed all 846; the other had one error in a test of the TLS front that dates
+from 0.5.0 (`test_tlsfront_050`, a handshake that had not completed after 60 s while two other
+suites and an emulator batch shared the machine). That test alone then passed five times in five.
+Not established why the handshake stalled; this version does not touch the fronts.
+
+Why: on an Android 11 emulator (the lead's profile run of 2026-11-11), two rests on a focused field,
+whose caret blinks and whose allowance covers frames and changed frames but not unchanged ones,
+failed `rest-video` with one recorded frame that changed nothing. Both steps hold frames 10,
+frames_layers 10, frames_display 11, and the recording 10 frames that changed the app's area (the
+caret's blinks; none large enough to count as a real change) and 1 that changed nothing. Read from
+the saved captures: over each of those rests the compositor's statistics show the app's layer
+rising by 10 and no other layer's count rising (status bar, navigation bar, launcher, input method),
+while the display's total rose by 11; every composition was a client composition. The same kind of
+rest with the keyboard hidden had 10 and 10. Which layer asked for the extra composition is not
+established.
+
+The rule's first form (set aside up to frames_display - frames_layers) was tightened after the gate
+comparison showed it excusing the app's own frames: a 150 s rest on Android 14
+(`and-today-long-rest-20261112T001228Z`, rest-today-150s: L 4, D 9, A 2, I 2), where the lead lined
+up the recording by hand: the app drew two frames after each of two session re-syncs, the second of
+each changing nothing, and the display's five extra composites were the status bar's, kept by the
+recorder as frames that changed only outside the app's area. The app now owns as many unchanged
+frames as its latches beyond the recorded changes in its area, and only the rest, up to D - L, are
+set aside. A is `app_region_frames` (any change in the app's area), not `app_changed_frames_real`:
+with the real changes only, the Android 11 rests (A 0 by that count) would still fail.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-12 | Unit tests | macOS (Python 3.12), `python3 -B -m unittest discover -s plugins/ui-probe/tests -q` | 846 tests pass (the run printed `Ran 846 tests` and `OK`); none touches a device, a simulator or the network beyond 127.0.0.1. One earlier test changed its expectation: `test_presence_and_loss`'s app drawing at rest, whose files have the display composing 10 frames for other layers during the rest (D 40, L 30, A 40, I 3), now has its 3 unchanged frames set aside and still fails on the frames drawn and the 40 changed |
+| 2026-11-12 | The rule | `test_other_layer_081.py`, runs built in the test: the Android 11 rest (L 10, D 11, A 10, I 1); the long rest (L 4, D 9, A 2, I 2); two unchanged frames with one composite to spare; L 10 and A 9 with three unchanged frames and D 12; D 15 with two; an animation at zero alpha (A 0 with D 15, 10, and below L); L, D or A unknown, a boolean or a float, and an unknown A with more unchanged frames than latches; an `unchanged_frames_max` allowance with three, two and one unchanged frames, and the state5 rest (L 2, D 3, A 1, I 1); the app presenting nothing; the changed-frames check | passes with the note; fails as in 0.8.0 with no note; one set aside and one held; the app owns one, two set aside, one held; both set aside; fails as before with no note; nothing set aside; fails on two, passes on one with its note, passes with no allowance note, and the state5 rest passes on its allowance again; the earlier note alone; unchanged |
+| 2026-11-12 | Runs of earlier versions | the gate of 0.8.0 (`7b57cb1`) against this version's, `gate --json`, on every saved run folder under the lead's run trees (755 folders) | 751 the same (text, exit status and JSON, the tool's version aside); 4 differ, each by this rule alone. Two pass that failed: the Android 11 profile's `signed-in-create-group` (rest-name-field: L 10, D 11, A 10, I 1; 1 set aside) and `signed-out-sign-up-fields` (rest-phone-focused: the same counts). Two still fail: sb119 `dump-20261110T203745Z` (rest-with-dumps: L 1, D 10, A 0, I 9; 8 set aside, 1 held, still `rest-video` and `rest-frames`) and sb122 `film/phase1-signed-out/16-offline` (rest-recover: L 4, D 7, A 4 of which 3 real, I 1; 1 set aside; still `rest-frames` and `rest-video` for 3 changed frames). The first form's other differences (settings-v3, the compare head, the control run, the long rest, state5) are gone |
+| 2026-11-12 | That the tests can fail | 20 mutants, one exact replacement each in a copy of the plugin, then `test_other_layer_081`: set aside at all, the L - A bound, the bound being L - A, A unknown taken as 0, A the real changes only, the min with D - L, D - L as it is, D known, L known, a boolean and a float not counts, not on top of the case where the app presented nothing, the held number judged, reported and in the message, the failure saying how many were set aside, the allowance judging the held number, its note saying it, the note, the note's counts | all 20 red. On the first pass 19: an unknown A taken as 0 survived, since every unknown-A case had no more unchanged frames than latches; a case with more (the dump run's shape) was added. The first form's round: 16 of 16 red after one equivalent mutant was dropped and one test added |
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

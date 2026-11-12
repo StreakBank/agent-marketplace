@@ -534,8 +534,8 @@ class DocsTest(unittest.TestCase):
         self.assertIn("`url`", (root / "skills" / "ui-probe" / "SKILL.md").read_text())
         self.assertIn("## 0.8.0", (root / "CHANGELOG.md").read_text())
         self.assertIn("### Validation, 0.8.0", (root / "PROVENANCE.md").read_text())
-        self.assertEqual(u.VERSION, "0.8.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.8.0")
+        # 0.8.1: the version moved on (test_other_layer_081 pins it); the manifest still names the code's version
+        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
         # The marketplace version moves with every plugin's release, not only this one's, so
         # an exact pin here fails on another plugin's bump (task-board 0.1.3 took 0.13.1).
         # What this release owes is its own marketplace entry and a version no older than it.
