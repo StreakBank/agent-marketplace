@@ -24,6 +24,12 @@
 //   {"token": T, "cmd": "ping"}       -> {"ok": true, "app_state": N, "screen": [width, height], "lookups": B}
 //   {"token": T, "cmd": "tap", "x": 0.5, "y": 0.5}
 //   {"token": T, "cmd": "swipe", "from": [0.5, 0.8], "to": [0.5, 0.3], "ms": 300}
+//   {"token": T, "cmd": "alert", "button": S, "timeout_s": N}
+//       -> {"ok": true, "tapped": B}: waits up to N seconds (above 0, at most 30) for a button labelled S
+//          on an alert of the SYSTEM's own process (SpringBoard), taps it if one appears, and says whether
+//          it did. Only SpringBoard is queried, never the app under test, so it is allowed in a measured
+//          run: it confirms the system's "Open in ...?" alert after the host opened a link with
+//          `simctl openurl`, and cancels one left over from an earlier run.
 //   {"token": T, "cmd": "quit"}
 // and in a rehearsal only:
 //   {"token": T, "cmd": "find", "text": S}  or  {"token": T, "cmd": "find", "desc": S}
@@ -229,6 +235,8 @@ final class AgentUITests: XCTestCase {
             let velocity = XCUIGestureVelocity(rawValue: CGFloat(max(50, distance / max(0.05, ms / 1000))))
             a.press(forDuration: 0.05, thenDragTo: b, withVelocity: velocity, thenHoldForDuration: 0.05)
             return ["ok": true]
+        case "alert":
+            return try alert(obj, system: system)
         case "quit":
             running = false
             return ["ok": true]
@@ -243,9 +251,27 @@ final class AgentUITests: XCTestCase {
             default: return try labels(obj, app: app, system: system)
             }
         default:
-            throw AgentError(description: "unknown command '\(cmd)'; known: ping, tap, swipe, quit, and in a rehearsal "
-                             + "find, type, labels")
+            throw AgentError(description: "unknown command '\(cmd)'; known: ping, tap, swipe, alert, quit, and in a "
+                             + "rehearsal find, type, labels")
         }
+    }
+
+    /// Taps the button labelled `button` on an alert of the system's own process (SpringBoard) if one
+    /// appears within `timeout_s`. The query is of SpringBoard alone: the app under test is never read
+    /// (a read of its accessibility tree changes how it behaves at rest for the rest of its life).
+    private func alert(_ obj: [String: Any], system: XCUIApplication) throws -> [String: Any] {
+        guard let label = obj["button"] as? String, !label.isEmpty, label.count <= 100 else {
+            throw AgentError(description: "alert needs 'button', a string of 1 to 100 characters")
+        }
+        guard let timeout = number(obj["timeout_s"]), timeout > 0, timeout <= 30 else {
+            throw AgentError(description: "alert needs 'timeout_s' above 0 and at most 30")
+        }
+        let button = system.alerts.buttons.matching(NSPredicate(format: "label == %@", label)).firstMatch
+        guard button.waitForExistence(timeout: timeout) else {
+            return ["ok": true, "tapped": false]
+        }
+        button.tap()
+        return ["ok": true, "tapped": true]
     }
 
     // ---- a rehearsal only: reads of the app under test ----

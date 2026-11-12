@@ -8,6 +8,7 @@ sys.dont_write_bytecode = True
 
 import contextlib
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -190,6 +191,13 @@ class CacheKeyTest(unittest.TestCase):
         # rehearsal-only functions, nothing reads the app but its state; input goes through the system app.
         handle = code[code.index("private func handle("):code.index("private func rect(")]
         served = code[:code.index("private func rect(")]
+        # 0.8.0: the one query besides the app's state is of the SYSTEM's alerts (SpringBoard), never the app
+        alert = served[served.index("private func alert("):]
+        served = served[:served.index("private func alert(")]
+        self.assertTrue(alert.startswith("private func alert(_ obj: [String: Any], system: XCUIApplication)"), alert[:80])
+        self.assertEqual(re.findall(r"\bapp\b", alert), [])
+        self.assertIn("system.alerts.buttons.matching(", alert)
+        self.assertIn('case "alert":\n            return try alert(obj, system: system)', served)
         for banned in ("typeText", "descendants", "matching(", ".label", "staticTexts", "buttons", "snapshot()",
                        "app.frame", "app.tap", "app.coordinate"):
             self.assertNotIn(banned, served, banned)

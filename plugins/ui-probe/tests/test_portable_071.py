@@ -83,10 +83,8 @@ class DocsTest(unittest.TestCase):
             self.assertIn(phrase, readme, phrase)
         self.assertIn("## 0.7.1", (root / "CHANGELOG.md").read_text())
         self.assertIn("### Validation, 0.7.1", (root / "PROVENANCE.md").read_text())
-        self.assertEqual(u.VERSION, "0.7.1")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.7.1")
-        market = json.loads((root.parent.parent / ".claude-plugin" / "marketplace.json").read_text())
-        self.assertEqual(market["metadata"]["version"], "0.12.1")
+        # 0.8.0: the version moved on (test_url_080 pins it); the manifests still name the code's version
+        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
         self.assertIn("## 0.12.1", (root.parent.parent / "CHANGELOG.md").read_text())
 
 

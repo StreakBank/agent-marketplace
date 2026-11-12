@@ -54,12 +54,12 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
-STEP_KINDS = ("rest", "tap", "swipe", "key", "text")
-ACTION_KINDS = ("tap", "swipe", "key", "text")     # every kind but rest: an input, then a wait
+STEP_KINDS = ("rest", "tap", "swipe", "key", "text", "url")
+ACTION_KINDS = ("tap", "swipe", "key", "text", "url")     # every kind but rest: an input, then a wait
 RESERVED_IDS = ("launch", "T0", "END")
 FFMPEG_MIN = (5, 1)           # -fps_mode, used to extract recorded frames, arrived in FFmpeg 5.1
 
@@ -74,7 +74,7 @@ SIM_PLATFORM = "ios-simulator"
 LAUNCH_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 LAUNCH_ENV_MAX = 20
 LAUNCH_ENV_VALUE_MAX = 200
-TOP_KEYS = {"name", "package", "activity", "until_quiet", "quiet", "launch_settle_ms", "launch_env", "count_signposts", "steps",
+TOP_KEYS = {"name", "package", "activity", "launch_url", "until_quiet", "quiet", "launch_settle_ms", "launch_env", "count_signposts", "steps",
             "count_sections", "gate", "launch_requests_max"}
 STEP_KEYS = {
     "rest": {"ms", "meminfo", "background", "allow"},
@@ -82,6 +82,7 @@ STEP_KEYS = {
     "swipe": {"from", "to", "ms", "judge", "settle_ms", "until_quiet", "quiet"},
     "key": {"code", "settle_ms", "until_quiet", "quiet"},
     "text": {"text", "settle_ms", "until_quiet", "quiet"},
+    "url": {"url", "settle_ms", "until_quiet", "quiet"},
 }
 COMMON_STEP_KEYS = {"id", "do", "expect"}
 EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max", "requests_max"}
@@ -105,12 +106,38 @@ FIND_TIMEOUT_MIN_MS = 100
 LOOKUP_FAILED = "lookup-failed.txt"   # the step whose element never appeared; outside the find-*.txt names
 FAILED_RUN = "failed.json"            # written into a run folder when the run did not complete
 TEXT_MAX = 200
+# A link a 'url' step opens: a scheme, a colon, then at least one character, at most URL_MAX in all.
+# Every character is printable ASCII. Refused, though the argument is single-quoted on the device:
+# what a shell reads specially anywhere it can reach (a quote of any kind, the backslash, $ ; | < > ( )
+# { } * ! ~ ^ and the space), so that the link means the same in every shell it may pass through. `#`
+# is allowed (a fragment): the only place a shell reads it specially is at the start of a word, and the
+# link is always one quoted word that starts with its scheme.
+URL_MAX = 500
+URL_SCHEME_RE = re.compile(r"[a-z][a-z0-9+.-]*:.+", re.S)
+URL_REFUSED = set(" '\"`\\$;|<>(){}*!~^")
+def link_problem(value, key: str) -> str | None:
+    """What is wrong with a link a 'url' step or 'launch_url' opens (see URL_REFUSED), or None; the
+    message names the first refused character."""
+    if not isinstance(value, str) or not value:
+        return f"'{key}' must be a non-empty string"
+    if len(value) > URL_MAX:
+        return f"'{key}' is {len(value)} characters; at most {URL_MAX}"
+    bad = next((ch for ch in value if not 0x21 <= ord(ch) <= 0x7E or ch in URL_REFUSED), None)
+    if bad is not None:
+        return (f"'{key}' holds {bad!r} (U+{ord(bad):04X}): a link is printable ASCII without spaces, quotes, "
+                "backslashes or any of $ ; | < > ( ) { } * ! ~ ^")
+    if not URL_SCHEME_RE.fullmatch(value):
+        return (f"'{key}' must start with a scheme (a lower-case letter, then lower-case letters, digits, '+', '.' "
+                "or '-'), a colon, then the rest of the link, such as example://join/abc")
+    return None
+
+
 TEXT_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 @._+-")
 
 
 def default_settle_ms(do: str) -> int:
     """The fixed wait after an action that does not wait for quiet."""
-    return 3000 if do == "tap" else 2500
+    return 3000 if do in ("tap", "url") else 2500
 
 
 def xml_escape(value: str) -> str:
@@ -303,6 +330,11 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
     if "activity" in scn:
         need(isinstance(scn["activity"], str) and ACTIVITY_RE.fullmatch(scn["activity"]),
              "'activity' must be letters, digits, '_', '.' or '$'")
+    if "launch_url" in scn:
+        need("activity" not in scn, "'activity' and 'launch_url' cannot both be given: a start by link opens whatever "
+                                    "activity the app gives the link")
+        problem = link_problem(scn["launch_url"], "launch_url")
+        need(problem is None, problem)
     if "until_quiet" in scn:
         need(isinstance(scn["until_quiet"], bool), "'until_quiet' must be true or false")
     steps = scn.get("steps")
@@ -495,6 +527,9 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
             need(step.get("judge", "motion") in ("motion", "state"), f"step '{sid}': 'judge' is 'motion' or 'state'")
         elif do == "key":
             need(isinstance(step.get("code"), int) and not isinstance(step.get("code"), bool), f"step '{sid}': key needs an integer 'code'")
+        elif do == "url":
+            problem = link_problem(step.get("url"), "url")
+            need(problem is None, f"step '{sid}': {problem}")
         if "expect" in step:
             exp = step["expect"]
             need(isinstance(exp, dict), f"step '{sid}': 'expect' must be an object")
@@ -534,6 +569,8 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
 SIM_REST_MIN_MS = 1000
 SIM_REFUSED_TOP = {
     "activity": "the iOS Simulator launches the app by its bundle identifier ('package'); 'activity' does not apply",
+    "launch_url": "an app started by a link on the iOS Simulator cannot be given its launch environment; launch it "
+                  "and open the link in a 'url' step right after the launch",
     "quiet": "there is no quiet detection on the iOS Simulator; 'quiet' would be ignored",
     "count_sections": "trace sections are not recorded on the iOS Simulator",
 }
@@ -591,7 +628,7 @@ def validate_sim_rules(scn: dict, need, mode: str = "run") -> None:
                                      f"{SIM_NO_TYPING}")
         need(do != "key", f"step '{sid}': a 'key' step is refused on the iOS Simulator: a simulator has no keys to "
                           "press; tap the screen's own control or swipe from the edge")
-        need(do == "rest" or do in SIM_INPUT_KINDS or do == "text",
+        need(do == "rest" or do in SIM_INPUT_KINDS or do in ("text", "url"),
              f"step '{sid}': a '{do}' step is refused on the iOS Simulator")
         if do == "rest":
             for key, why in SIM_REFUSED_STEP.items():
@@ -621,7 +658,12 @@ def sim_find_steps(scn: dict) -> list[dict]:
 
 
 def sim_needs_agent(scn: dict) -> bool:
-    return any(s["do"] in SIM_INPUT_KINDS for s in scn["steps"])
+    """A tap or a swipe is the agent's; a link needs it too, to confirm the system's alert."""
+    return any(s["do"] in SIM_INPUT_KINDS or s["do"] == "url" for s in scn["steps"])
+
+
+def sim_has_url(scn: dict) -> bool:
+    return any(s["do"] == "url" for s in scn["steps"])
 
 
 def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
@@ -640,6 +682,8 @@ def scenario_duration_s(scn: dict, worst_case: bool = True) -> int:
             total += step.get("ms", 0) / 1000 + step.get("settle_ms", 300) / 1000 + quiet_cost(step)
         else:
             total += step.get("ms", 0) / 1000 + step.get("settle_ms", default_settle_ms(step["do"])) / 1000
+        if step["do"] == "url":
+            total += 2          # am start -W waits for the activity the link leads to
         if "find" in step:
             # The lookup: two reads when the element is there and still, reads until the timeout
             # (and up to two more) when it is not; then the settle time and the baseline reading. With
@@ -897,6 +941,11 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
          "}",
          "dumpsys SurfaceFlinger --timestats -enable -clear >/dev/null 2>&1",
          "am force-stop \"$PKG\"", "sleep 1", "mark T0"]
+    if any(s["do"] == "url" for s in scn["steps"]):
+        # what am printed for each link a 'url' step opened (only in a scenario that has one, so that
+        # the script of every other scenario stays as it was)
+        n = next(k for k, line in enumerate(L) if line.startswith("rm -f $D/marks.txt"))
+        L[n] += " $D/url-*.txt"
     if any("find" in s for s in scn["steps"]):
         # The display a lookup checks a match against: the override size when one is set (a smaller
         # screen emulated with `wm size`), else the physical size. Read once, kept in display.txt.
@@ -911,7 +960,11 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
               "echo $SR > $D/sr.pid", "sleep 1.5"]
     launch = scn.get("activity")
     L += ["mark launch.start"]
-    if launch:
+    if "launch_url" in scn:
+        # a start by link: the same am line as a 'url' step, to the scenario's package only; parsed as a
+        # launch (status, launch state, total time, an Error line fails it)
+        L += [f"am start -W -a android.intent.action.VIEW -d {q(scn['launch_url'])} -p \"$PKG\" > $D/am-start.txt 2>&1"]
+    elif launch:
         L += [f"am start -W -n {q(pkg + '/' + launch)} > $D/am-start.txt 2>&1"]
     else:
         L += ["monkey -p \"$PKG\" -c android.intent.category.LAUNCHER 1 > $D/am-start.txt 2>&1"]
@@ -958,6 +1011,12 @@ def build_device_script(scn: dict, width: int, height: int, video: bool, limit_s
             elif do == "text":
                 # `input text` spells a space as %s; the validated text holds no '%' of its own.
                 L.append(f"input text {q(step['text'].replace(' ', '%s'))}")
+            elif do == "url":
+                # The link goes to the app under test only (-p), so a link another app also claims never
+                # opens a chooser. -W waits until the activity reports; am's output and exit status are kept
+                # for the gate (a link nothing handled is an input that failed).
+                L.append(f"am start -W -a android.intent.action.VIEW -d {q(step['url'])} -p \"$PKG\" "
+                         f"> $D/url-{sid}.txt 2>&1; echo \"exit $?\" >> $D/url-{sid}.txt")
             else:
                 raise ProbeError(f"unknown step kind {do}")
             L.append(f"mark {sid}.injected")
@@ -1159,6 +1218,32 @@ def parse_launch_error(am: str | None) -> str | None:
         if s.startswith("Error") or "does not exist" in s or "Exception" in s or "monkey aborted" in s:
             return s
     return None
+
+
+def parse_url_open(text: str | None) -> dict:
+    """What `am start -W -a android.intent.action.VIEW -d <url> -p <package>` printed for a 'url' step, with
+    the exit status the device script appended: {'opened', 'exit', 'activity', 'error'}. The link was
+    opened only if am exited 0, printed no `Error` line and named the activity it reached."""
+    if text is None:
+        return {"opened": False, "exit": None, "activity": None,
+                "error": "the run holds no record of the link being opened (url-<step>.txt)"}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    exit_line = next((line for line in reversed(lines) if re.fullmatch(r"exit -?\d+", line)), None)
+    code = int(exit_line.split()[1]) if exit_line else None
+    said = [line for line in lines if line is not exit_line and not re.fullmatch(r"exit -?\d+", line)]
+    error = next((line for line in said if line.startswith("Error")), None)
+    activity = next((line.split(":", 1)[1].strip() for line in said if line.startswith("Activity:")), None)
+    if code is None:
+        why = "am's exit status was not recorded"
+    elif error:
+        why = error
+    elif code != 0:
+        why = f"am exited with status {code}: {' / '.join(said[-3:]) or 'it printed nothing'}"
+    elif not activity:
+        why = f"am named no activity: {' / '.join(said[-3:]) or 'it printed nothing'}"
+    else:
+        why = None
+    return {"opened": why is None, "exit": code, "activity": activity, "error": why}
 
 
 def parse_foreground(text: str) -> str | None:
@@ -2037,6 +2122,8 @@ def _run_once_sim(udid: str, scn: dict, out: Path, rehearsal: dict | None = None
                     raise ProbeError(f"the simulator's screen is {ready.get('screen')} points but the rehearsal "
                                      f"{rehearsal['path']} found its positions on {rehearsal['data']['screen']}; "
                                      "rehearse again on this simulator")
+                if sim_has_url(scn):
+                    sim_clear_stale_alert(agent, raw)
             _sim_device_part(udid, scn, raw, bundle, agent, rehearsal)
         finally:
             if agent is not None:
@@ -2087,6 +2174,42 @@ def sim_launch(udid: str, scn: dict, raw: Path, bundle: str) -> tuple[int, float
     return int(m.group(1)), launch_wall
 
 
+SIM_OPENURL_TIMEOUT_S = 60
+# After `simctl openurl` with a custom scheme the system asks "Open in <app>?" (Cancel, Open) and the app
+# gets nothing until Open is tapped (measured on an iOS 26.1 simulator, 2026-11-11). The alert is the
+# system's own: it outlives the app and sits above it after the next launch. The agent answers it by
+# querying SpringBoard alone, never the app under test.
+SIM_ALERT_OPEN = "Open"
+SIM_ALERT_CANCEL = "Cancel"
+SIM_ALERT_CONFIRM_TIMEOUT_S = 5     # no alert in this time is not a failure: a link may open directly
+SIM_ALERT_CLEAR_TIMEOUT_S = 1
+
+
+def sim_alert_command(button: str, timeout_s: float) -> dict:
+    return {"cmd": "alert", "button": button, "timeout_s": timeout_s}
+
+
+def sim_clear_stale_alert(agent: "SimAgent", raw: Path) -> dict:
+    """Before the first step of a scenario with a link: cancel a system alert a link left behind (an
+    earlier run that opened a link and stopped before confirming it). Saved as raw/stale-alert.json:
+    the command, the agent's reply, the round trip and whether an alert was cleared."""
+    command = sim_alert_command(SIM_ALERT_CANCEL, SIM_ALERT_CLEAR_TIMEOUT_S)
+    reply, round_trip = agent.send(command)
+    record = {"command": command, "reply": reply, "round_trip_ms": round_trip,
+              "cleared": bool(reply.get("ok") and reply.get("tapped"))}
+    (raw / "stale-alert.json").write_text(json.dumps(record, indent=1))
+    return record
+
+
+def sim_open_url(udid: str, url: str) -> dict:
+    """`xcrun simctl openurl <udid> <url>`: {'opened', 'exit', 'error'} (error: what simctl printed when
+    it failed). The link is one argument, never read by a shell."""
+    code, out, err = xcrun_result("simctl", "openurl", udid, url, timeout=SIM_OPENURL_TIMEOUT_S)
+    said = (err.strip() or out.strip())[-400:] or None
+    return {"opened": code == 0, "exit": code,
+            "error": None if code == 0 else (said or ("simctl did not finish" if code is None else "simctl said nothing"))}
+
+
 def replay_lookup(agent: SimAgent, rehearsal: dict, step: dict) -> dict:
     """Before a tap with 'find' in a measured run, and before its recorder starts: the swipes the
     rehearsal made to reach the element, each followed by its settle_ms, as Android's lookup and its
@@ -2119,7 +2242,7 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
         recorder = SimRecorder(udid, raw / f"rec-{sid}.mp4")
         before = after = ""
         t0 = t1 = w0 = w1 = rec_start = rec_end = None
-        command = reply = ping = None
+        command = reply = ping = url_open = None
         round_trip = None
         try:
             recorder.wait_started(SIM_RECORD_START_TIMEOUT_S)
@@ -2127,6 +2250,15 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
             before, t0, w0 = host_cputime(pid), time.monotonic(), time.time()
             if step["do"] == "rest":
                 time.sleep(step["ms"] / 1000)
+            elif step["do"] == "url":
+                # the simulator opens the link, as a tap on a link outside the app would; the system then
+                # asks whether to open it in the app, and the agent confirms that alert (SpringBoard only)
+                url_open = sim_open_url(udid, step["url"])
+                if url_open["opened"]:
+                    command = sim_alert_command(SIM_ALERT_OPEN, SIM_ALERT_CONFIRM_TIMEOUT_S)
+                    reply, round_trip = agent.send(command)
+                    url_open["alert_confirmed"] = bool(reply.get("ok") and reply.get("tapped"))
+                time.sleep(step.get("settle_ms", default_settle_ms(step["do"])) / 1000)
             else:
                 command = sim_command(step, resolved)
                 reply, round_trip = agent.send(command)
@@ -2148,7 +2280,8 @@ def _sim_device_part(udid: str, scn: dict, raw: Path, bundle: str, agent: SimAge
             **({} if agent is None else {"command": command, "reply": reply, "round_trip_ms": round_trip,
                                          "end_ping": ping,
                                          "app_state": ping.get("app_state") if ping and ping.get("ok") else None}),
-            **({} if resolved is None else {"resolved": resolved})},
+            **({} if resolved is None else {"resolved": resolved}),
+            **({} if url_open is None else {"url_open": url_open})},
             indent=1))
         last_wall = w1
     read_log_store(udid, scn, raw, pid, launch_wall, last_wall)
@@ -2500,7 +2633,7 @@ def _agent_did(reply: dict, sid: str, what: str, typed: list[str]) -> None:
                          f"{redact(reply.get('error') or 'no reply', typed)}; the rehearsal stopped there")
 
 
-def rehearse_step(agent: SimAgent, scn: dict, step: dict, out: Path) -> tuple[dict, dict]:
+def rehearse_step(agent: SimAgent, scn: dict, step: dict, out: Path, udid: str | None = None) -> tuple[dict, dict]:
     """Drive one step in a rehearsal: (what rehearsal.json records for it, the line printed for it).
     Nothing records the text a 'text' step types, only how many characters were typed."""
     sid, do = step["id"], step["do"]
@@ -2520,6 +2653,20 @@ def rehearse_step(agent: SimAgent, scn: dict, step: dict, out: Path) -> tuple[di
         time.sleep(settle)
         return ({"do": "text", "typed": reply["typed"], "round_trip_ms": round_trip},
                 {"typed": reply["typed"]})
+    if do == "url":
+        # the link is opened here too, and the system's alert confirmed, so that the steps after it are
+        # rehearsed on the screen it leads to; nothing of it is replayed (a run opens it again itself)
+        opened = sim_open_url(udid, step["url"])
+        if not opened["opened"]:
+            raise ProbeError(f"step '{sid}': the simulator did not open the link: {opened['error']}; the rehearsal "
+                             "stopped there")
+        reply, _ = agent.send(sim_alert_command(SIM_ALERT_OPEN, SIM_ALERT_CONFIRM_TIMEOUT_S))
+        if not reply.get("ok"):
+            raise ProbeError(f"step '{sid}': the agent could not look for the system's alert to confirm the link: "
+                             f"{reply.get('error') or 'no reply'}; the rehearsal stopped there")
+        time.sleep(settle)
+        confirmed = bool(reply.get("tapped"))
+        return {"do": "url", "opened": True, "alert_confirmed": confirmed}, {"opened": True, "alert_confirmed": confirmed}
     if do == "tap" and "find" in step:
         found = sim_lookup(agent, scn, step, out)
         reply, round_trip = agent.send({"cmd": "tap", "x": found["center"][0], "y": found["center"][1]})
@@ -2669,12 +2816,19 @@ def _rehearse(udid: str, scn: dict, out: Path, emit, facts: dict) -> dict:
             screen = ready.get("screen")
             if not _number_pair(screen):
                 raise ProbeError(f"the input agent's first answer gives no screen size ({screen!r})")
+            if sim_has_url(scn):
+                stale = sim_clear_stale_alert(agent, raw)
+                if not stale["reply"].get("ok"):
+                    raise ProbeError("the agent could not look for a system alert left by an earlier link: "
+                                     f"{stale['reply'].get('error') or 'no reply'}")
+                if stale["cleared"]:
+                    emit({"stale_alert": "cancelled a system alert left by an earlier link, before the first step"})
             left = scn.get("launch_settle_ms", 6000) / 1000 - (time.time() - launch_wall)
             if left > 0:
                 time.sleep(left)
             in_front(agent, "after the launch")
             for step in scn["steps"]:
-                done[step["id"]], line = rehearse_step(agent, scn, step, out)
+                done[step["id"]], line = rehearse_step(agent, scn, step, out, udid)
                 done[step["id"]]["app_state"] = in_front(agent, f"at the end of '{step['id']}'", step["id"])
                 emit({"step": step["id"], "do": step["do"], **line})
         except BaseException as exc:
@@ -2699,6 +2853,7 @@ def _rehearse(udid: str, scn: dict, out: Path, emit, facts: dict) -> dict:
         "scenario": scn["name"], "scenario_digest": scenario_digest(scn), "udid": udid, "device": facts,
         "screen": screen, "app": identity, "started": started, "finished": utc_stamp(),
         "app_ended": {"pid": pid, "gone": True}, "steps": done,
+        **({"stale_alert": json.loads(_read_raw(raw, "stale-alert.json"))} if _read_raw(raw, "stale-alert.json") else {}),
         **({"agent_results": {"kept": False, "why": AGENT_RESULTS_NOT_KEPT},
             "agent_log": f"raw/agent.log, with the quoted text of every 'Type' line replaced by {SIM_REDACTED}"}
            if typing else {}),
@@ -3100,7 +3255,8 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
                 "app_state": data.get("app_state"),
                 "agent": {"command": data.get("command"), "reply": data.get("reply"),
                           "round_trip_ms": data.get("round_trip_ms"), "end_ping": data.get("end_ping")}}),
-            **({} if "resolved" not in data else {"resolved": data["resolved"]})})
+            **({} if "resolved" not in data else {"resolved": data["resolved"]}),
+            **({} if "url_open" not in data else {"url_open": data["url_open"]})})
         prev = pid_now if pid_now is not None else prev
     result = {
         "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": SIM_PLATFORM,
@@ -3114,6 +3270,9 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
     request_counts(raw, steps_out, result, SIM_PLATFORM, scn, bool(cap.get("requests_log")))
     result["frame_sources"] = ["recording"] + (["log store"] if result["log_store"]["known"] else [])
     result["launch_env_dropped"] = cap.get("launch_env_dropped") or []
+    if sim_has_url(scn):
+        stale = _read_raw(raw, "stale-alert.json")
+        result["stale_alert"] = json.loads(stale) if stale else None
     if sim_needs_agent(scn):
         agent_text = _read_raw(raw, "agent.json")
         result["agent"] = json.loads(agent_text) if agent_text else None
@@ -3167,6 +3326,16 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
     launch = r.get("launch") or {}
     if launch.get("error"):
         fail("launch", "launch", f"the app did not start: {launch['error']}")
+    if sim_has_url(scn):
+        stale = r.get("stale_alert")
+        if stale is None:
+            fail("input", "launch", "the run holds no record of the check for a system alert left by an earlier link")
+        elif not (stale.get("reply") or {}).get("ok"):
+            fail("input", "launch", "the agent could not look for a system alert left by an earlier link, which would "
+                 f"take the run's taps: {(stale.get('reply') or {}).get('error') or 'no reply'}")
+        elif stale.get("cleared"):
+            notes.append("a system alert left by an earlier link (opened, never confirmed) was cancelled before the "
+                         "launch")
     records = {s["id"]: s for s in r.get("steps", [])}
     by_id = {s["id"]: s for s in scn["steps"]}
     for sid in ["launch"] + [s["id"] for s in scn["steps"]]:
@@ -3191,16 +3360,25 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
             elif state != SIM_APP_IN_FRONT:
                 fail("foreground", sid, f"the app was not in front at the end of '{sid}' (its state: "
                      f"{SIM_APP_STATES.get(state, state)})", observed=state)
-        if want in SIM_INPUT_KINDS:
+        if want in SIM_INPUT_KINDS or want == "url":
             replayed = (s.get("resolved") or {}).get("swipes") or []
             for n, sw in enumerate(replayed, 1):
                 sw_reply = sw.get("reply") or {}
                 if not sw_reply.get("ok"):
                     fail("input", sid, f"the agent did not perform swipe {n} of {len(replayed)} replayed from the "
                          f"rehearsal before the tap: {sw_reply.get('error') or 'no reply'}")
-            reply = (s.get("agent") or {}).get("reply") or {}
-            if not reply.get("ok"):
-                fail("input", sid, f"the agent did not perform the {want}: {reply.get('error') or 'no reply'}")
+            if want == "url":
+                opened = s.get("url_open") or {}
+                reply = (s.get("agent") or {}).get("reply") or {}
+                if not opened.get("opened"):
+                    fail("input", sid, f"the link was not opened: {opened.get('error') or 'the run holds no record of it'}")
+                elif not reply.get("ok"):
+                    fail("input", sid, "the agent could not look for the system's alert to confirm the link: "
+                         f"{reply.get('error') or 'no reply'}")
+            else:
+                reply = (s.get("agent") or {}).get("reply") or {}
+                if not reply.get("ok"):
+                    fail("input", sid, f"the agent did not perform the {want}: {reply.get('error') or 'no reply'}")
             rec = s.get("recording")
             if rec is None or rec.get("error"):
                 fail("recording", sid, "no recording was saved" if rec is None else
@@ -3381,7 +3559,9 @@ def sim_run_row(path: str, r: dict) -> dict:
         if s["kind"] == "launch":
             continue
         sid, rec = s["id"], s.get("recording") or {}
-        if s["kind"] in SIM_INPUT_KINDS:
+        if s["kind"] == "url":
+            row[f"{sid}.sim_alert_confirmed"] = (s.get("url_open") or {}).get("alert_confirmed")
+        if s["kind"] in SIM_INPUT_KINDS or s["kind"] == "url":
             agent = s.get("agent") or {}
             row[f"{sid}.sim_signature"] = s.get("signature")
             row[f"{sid}.sim_round_trip_ms"] = agent.get("round_trip_ms")
@@ -3633,6 +3813,8 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
             step_rec["meminfo"] = parse_meminfo(mem_text)
         if found:
             step_rec["find"] = find_record(_read_raw(raw, f"find-{sid}.txt"), step, facts, cpu_base.get(sid))
+        if kind == "url":
+            step_rec["url_open"] = parse_url_open(_read_raw(raw, f"url-{sid}.txt"))
         steps_out.append(step_rec)
 
     rows_total = sum(s["rows_in_window"] for s in steps_out)
@@ -4823,6 +5005,8 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
             elif rec.get("package") != find_package(scn, step):
                 fail("find", sid, f"{describe_find(step['find'])} was matched in package {rec.get('package')!r}, "
                      f"not in {find_package(scn, step)!r}: the step may have tapped another app")
+        if want_kind == "url" and not (s.get("url_open") or {}).get("opened"):
+            fail("input", sid, f"the link was not opened: {(s.get('url_open') or {}).get('error') or 'the run holds no record of it'}")
         if s.get("process_ambiguous"):
             fail("process", sid, f"more than one process carried the app's name at the end of '{sid}' (a restart in progress)")
         if s.get("process_restarted"):
@@ -5445,6 +5629,10 @@ def _dispatch(args) -> int:
                 for st in res["steps"]:
                     if st["kind"] == "rest":
                         line[st["id"]] = {"cpu_pct": st["cpu_pct"], "frames": (st.get("recording") or {}).get("frames")}
+                    elif st["kind"] == "url":
+                        opened = st.get("url_open") or {}
+                        line[st["id"]] = {"signature": st.get("signature"), "ok": opened.get("opened"),
+                                          "confirmed": opened.get("alert_confirmed")}
                     elif st["kind"] in SIM_INPUT_KINDS:
                         reply = (st.get("agent") or {}).get("reply") or {}
                         line[st["id"]] = {"signature": st.get("signature"), "ok": reply.get("ok")}

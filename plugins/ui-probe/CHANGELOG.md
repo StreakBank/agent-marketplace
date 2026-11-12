@@ -1,5 +1,59 @@
 # Changelog — ui-probe
 
+## 0.8.0 — 2026-11-11
+
+A step that opens a link in the running app, so that a screen reached only by a link can be
+measured, on Android and on the iOS Simulator; and, on Android, a start by link.
+
+- `{"id": "open-invite", "do": "url", "url": "example://join/ABC123"}` is an input step like a tap:
+  the same waits (`until_quiet`, `quiet`, `settle_ms`, default 3000), the same recording and
+  judging (a state change, classed like a tap), the same counts per step (frames, sections,
+  signposts, requests) and `expect`. It takes only `url` besides those; every key of another kind
+  (`x`, `y`, `find`, `find_settle_ms`, `code`, `text`, `from`, `to`, `ms`, `judge`, `meminfo`,
+  `background`, `allow`) is refused.
+- The link: a scheme (a lower-case letter, then lower-case letters, digits, `+`, `.` or `-`), a
+  colon and at least one more character; at most 500 characters, every one printable ASCII. The
+  error names the first refused character: a space, a quote of any kind, a backslash, or one of
+  `$ ; | < > ( ) { } * ! ~ ^`. `& ? = % / : @ , _` work, and so does `#` (a fragment): a shell
+  reads `#` specially only at the start of a word, and the link is one single-quoted word that
+  starts with its scheme.
+- Android: the device script runs `am start -W -a android.intent.action.VIEW -d '<url>' -p "$PKG"`
+  between the step's start and injected marks, the link single-quoted and sent to the scenario's
+  package only. What am printed and its exit status are kept in `raw/url-<step>.txt` and in the
+  step's `url_open` in `run.json`. A link am did not open (a non-zero exit, an `Error` line, or no
+  `Activity:` line) fails the step as `input`, with am's own words. The device script of a scenario
+  without a `url` step is unchanged byte for byte. The run's time limit allows am 2 s more per link.
+- iOS Simulator: the host runs `xcrun simctl openurl <udid> <url>` (one argument each, no shell).
+  The system then asks `Open in "<app>"?` and the app gets nothing until `Open` is tapped (iOS 26.1
+  simulator, 2026-11-11), so the input agent confirms it: a new agent command, `alert` (a button's
+  label and a timeout), waits for that button on an alert of the system's own process (SpringBoard)
+  and taps it, querying SpringBoard alone and never the app under test. The step sends it for `Open`
+  with 5 s; no alert in that time is not a failure, the agent failing is (`input`), as is a non-zero
+  exit of simctl (with what simctl printed). A scenario with a link therefore starts the agent, and
+  the ping at the end of the step checks that the app is in front. `raw/step-<step>.json` and
+  `run.json` keep `url_open` with `alert_confirmed`. The step is recorded, judged, signature-checked
+  and counted like a tap; `summary` has its `sim_signature`, `sim_alert_confirmed` and the agent's
+  timings, and the line `run` prints per run its signature, whether it opened and whether it was
+  confirmed.
+- The alert is the system's: it outlives the app and sits above it after the next launch. A run of a
+  scenario with a link asks the agent for `Cancel` (1 s) once the agent is up and before the launch
+  (a rehearsal: before its first step), keeps the answer in `raw/stale-alert.json` and `stale_alert`,
+  says in a note when it cancelled one, and fails the launch (`input`) when the agent could not look.
+  A run that opened a link and stopped before confirming it is cleared up this way by the next. A
+  scenario without a link sends nothing new to the agent.
+- `rehearse` accepts the step, opens the link and confirms its alert too, so the steps after it are
+  rehearsed on the screen it leads to; a link it could not open, or an agent that could not look
+  for the alert, stops the rehearsal. A run with `--rehearsal` does both again itself and needs
+  nothing of it from `rehearsal.json`; a scenario with links but no tap by `find` needs no
+  rehearsal, as before.
+- Android: a start by link. A top-level `launch_url` (the `url` step's rules) makes the launch run
+  `am start -W -a android.intent.action.VIEW -d '<launch_url>' -p "$PKG"` instead of starting the
+  launcher activity, read as a launch (status, launch state, total time; an `Error` line, as a link
+  nothing handles prints with exit 0, fails the launch). The launch's time, request window, budget
+  and first frames are counted as before. `activity` and `launch_url` together are refused; the iOS
+  Simulator refuses `launch_url` (an app started by a link cannot be given its launch environment
+  there: open the link in a `url` step right after the launch).
+
 ## 0.7.1 — 2026-11-11
 
 - A request log replaced during a run is told by its first bytes as well as by its inode and device.

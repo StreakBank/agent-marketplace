@@ -107,8 +107,8 @@ class ReadmeMatchesCodeTest(unittest.TestCase):
         self.assertIn("It takes the keys a `key` step takes and the same fixed wait (2500 ms)", README)
         self.assertEqual(u.FIND_SETTLE_MS, 1000)
         self.assertIn("`find_settle_ms` (default 1000)", README)
-        self.assertIn("`rest`, `tap`, `swipe`, `key` and `text`", SKILL)
-        self.assertEqual(u.STEP_KINDS, ("rest", "tap", "swipe", "key", "text"))
+        self.assertIn("`rest`, `tap`, `swipe`, `key`, `text` (types into the focused field) and `url` (opens a", " ".join(SKILL.split()))  # 0.8.0
+        self.assertEqual(u.STEP_KINDS, ("rest", "tap", "swipe", "key", "text", "url"))
 
     def test_exit_codes_documented(self):
         self.assertIn("| 1 | the gate found a violation (and only that) |", README)

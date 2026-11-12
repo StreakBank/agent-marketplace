@@ -19,6 +19,7 @@ results. This rule adds only what the plugin deliberately does not know.
 - **Build measured:** <which variant for counts; which for anything timed or for memory>.
 - **Scenarios live in:** `<directory>`. One file per <screen / tab / flow>.
 - **Runs are kept in:** `<directory outside version control>`.
+- **Links the scenarios open (`url` steps), if any:** <the app's scheme; which screen each link reaches and what it needs first (signed in, seeded data); made-up ids only>.
 
 ## Device and reference profile
 

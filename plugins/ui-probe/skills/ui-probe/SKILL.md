@@ -60,7 +60,10 @@ measures the app behind another one `"background": true`. Coordinates are fracti
 checked strictly: an unknown key, a key that does not apply to the step's kind or a value of the
 wrong type stops the run before anything touches the device.
 
-Step kinds are `rest`, `tap`, `swipe`, `key` and `text` (types into the focused field). Prefer
+Step kinds are `rest`, `tap`, `swipe`, `key`, `text` (types into the focused field) and `url` (opens a
+link in the app, as a tap on a link outside it: for a screen reached only by a link; Android and the
+iOS Simulator, where the input agent confirms the system's alert; no rehearsal needed; a link
+nothing opened fails the step as `input`; on Android `launch_url` starts the app by a link). Prefer
 `"find": {"text": ...}` or `{"desc": ...}` on a tap to hard-coded coordinates: the target is
 looked up on the device before the step (an element of the app's own package whose bounds held
 still over two reads, and on the screen), and the lookup is charged to no step. Under a smaller

@@ -438,6 +438,94 @@ skips as root.
 | 2026-11-11 | Runs of earlier versions | the gate of 0.7.0 as released (`be4546d`) against this version's, `gate --json`, on the saved folders under the lead's run trees | text output, exit status and JSON (the tool's version aside) equal in all 668 folders |
 | 2026-11-11 | That the tests can fail | 15 mutants, one exact replacement each in a copy of the plugin, then `test_requests_070.SegmentTest` or `test_portable_071`: the number of bytes kept, the bytes kept, the bytes compared, the inode and device compared, a shorter file compared with the start of what was kept, cut decided before the bytes, a file not grown read on, the problem used, the bytes never written; `/proc` read first, `ps` where there is none, an empty cmdline, the arguments split at NUL, the owner check using it, `ps` failing | all 15 red. On the first pass 13: a log that had not grown at all was untested (a mutant calling it cut survived), and `ps` exiting non-zero while printing something was untested; a test was added for each |
 
+### Validation, 0.8.0
+
+**The rows of the table are unit tests.** None of them touched an Android device, an emulator or
+a simulator: `am`, `adb`, `xcrun`, `xcodebuild` and the input agent were stand-ins, and the agent's
+Swift was only compiled (`xcodebuild build-for-testing` for `generic/platform=iOS Simulator`, into
+a scratch folder; no simulator booted, launched or read). What the devices gave is in "Live
+validation, 0.8.0" below.
+
+What the devices said by hand, the reason for the alert and for `launch_url` (the lead,
+2026-11-11, an API 34 emulator and an iOS 26.1 simulator):
+
+- Android, app running: `am start -W -a android.intent.action.VIEW -d '<link>' -p <package>`
+  printed `Status: ok`, `LaunchState: WARM`, `Activity: <package>/<activity>`, `TotalTime`,
+  `WaitTime`, `Complete` and exited 0.
+- Android, a link nothing handles: `Error: Activity not started, unable to resolve Intent {...}`,
+  exit 0. The `Error` line is what catches it, not the exit status.
+- Android, app force-stopped: the same command started it cold (`LaunchState: COLD`) and showed
+  the link's screen.
+- iOS Simulator: `xcrun simctl openurl <udid> <link with a custom scheme>` exited 0, and the system
+  showed an alert, `Open in "<app>"?`, buttons `Cancel` and `Open`; nothing reached the app until
+  Open was tapped. The alert stayed after the app was terminated and sat above the app after the
+  next launch.
+
+The command lines the code builds, to try by hand:
+
+- Android, a `url` step, one line of the device script (run by `sh` on the device, `$PKG` set to the
+  scenario's package, single-quoted): `am start -W -a android.intent.action.VIEW -d 'example://join/ABC123' -p "$PKG" > $D/url-open-invite.txt 2>&1; echo "exit $?" >> $D/url-open-invite.txt`.
+- Android, `launch_url`, the launch's line of the device script: `am start -W -a android.intent.action.VIEW -d 'example://join/ABC123' -p "$PKG" > $D/am-start.txt 2>&1`.
+  Either by hand from a host: `adb -s <serial> shell "am start -W -a android.intent.action.VIEW -d 'example://join/ABC123' -p <package>"`.
+- iOS Simulator, from the host, each word one argument with no shell: `xcrun simctl openurl <udid> example://join/ABC123`;
+  then the agent's command `{"token": T, "nonce": N, "cmd": "alert", "button": "Open", "timeout_s": 5}`, answered
+  `{"ok": true, "tapped": true}` (or `false` when no such button appeared), with `proof` and `elapsed_ms`. Before
+  the launch of a run with a link: the same command with `"button": "Cancel", "timeout_s": 1`.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-11 | Unit tests | macOS (Python 3.12), `python3 -B -m unittest discover -s plugins/ui-probe/tests -q` | 835 tests pass once moved onto 0.7.1 (the run printed `Ran 835 tests` and `OK`; 820 before the move); none touches a device, a simulator or the network beyond 127.0.0.1. The lead ran the same suite in a Linux container the way CI does (Python 3.12, a user that is not root): 835 ran, none failed, 2 skipped |
+| 2026-11-11 | Validation of the link | `test_url_080.py`: accepted forms on both platforms (a query, `%`, `@`, `,`, `_`, `#`, a scheme with `+ . -`, 500 characters), each of the 18 refused characters named (the space, the three quotes, the backslash and the 13 others), controls, DEL, non-ASCII, the first one named, the scheme, the length, a missing or non-string link, every key of another kind, the simulator's own refusals; the same rules for `launch_url` | as designed |
+| 2026-11-11 | The Android command lines | `build_device_script` for a scenario with a `url` step, for one with `launch_url`, and 0.6.0's two digest scenarios (neither) | the exact lines above; the step's between the start and injected marks with a tap's wait after it and `$D/url-*.txt` in the clean-up list; the launch's between `launch.start` and `launch.end` in place of the launcher's, every other line of the script the same; the digest scripts byte for byte the same |
+| 2026-11-11 | What am prints | `parse_url_open`, the launch's analysis and the gate on captures built in the test: am's success output, a link delivered to a running top-most activity, the lead's unresolved-link output exactly (exit 0), a non-zero exit, no `Activity:` line, no exit line, no file; a cold start by link | the step opened only for the success and the delivered link, each other fails `input` with am's words or the reason; the unresolved link fails the launch (`the app did not start: Error: Activity not started, ...`); the cold start by link reads as a launch (COLD, ok, its total time) with every step, first frames included, as for a start by the launcher |
+| 2026-11-11 | `launch_url`'s place | validation, the simulator's refusal, `request_windows` and `launch_requests_max` with and without it | `activity` with it refused; the simulator's reason; the same windows and budget |
+| 2026-11-11 | The simulator | the xcrun and agent stand-ins of 0.4.0 and 0.5.0, the agent's taught `alert` (Open tapped, none, the agent failing): a scenario of rests and a link; a link with taps and swipes; `simctl openurl` exiting 1; a stale alert there, none, and the agent failing to look; the stale record removed; the app not in front after the link; a scenario without a link | the exact line above; the agent started for a link; `Cancel` asked once it was up and before the launch, `Open` right after simctl inside the step, a ping at the end of every step; `url_open.alert_confirmed`, the summary row and the printed line; no alert passes, the agent failing fails `input` on the step, a failed simctl sends no `Open`; a stale alert cancelled and said in a note, the agent failing to look or no record fails `input` on the launch; the app not in front fails `foreground`; without a link no `alert` is sent and no record is kept |
+| 2026-11-11 | The agent's source | `test_input_050`: the served code outside the rehearsal-only functions | the only query besides the app's state is `system.alerts.buttons` in `alert`, which takes no app and is dispatched for `alert` |
+| 2026-11-11 | Rehearse and replay | the stand-ins of 0.6.0: a link before a tap by `find` and a swipe | the rehearsal asks `Cancel` before its first step, opens the link and confirms it before the lookup, and records both; a stale alert cancelled is said; no alert is recorded; a link it could not open, or an agent failing either look, stops it with no `rehearsal.json`; the run opens and confirms again and looks nothing up; a rehearsal without a link sends no `alert` |
+| 2026-11-11 | Judging, counts and request windows | `classify_burst` with kind `url`; `request_windows` with a `url` step in place of a tap; a request in the link's step against `expect.requests_max: 0` | judged as a tap (a state change), not as motion; the same windows as a tap; the request fails `requests` on the step |
+| 2026-11-12 | Runs of earlier versions | the gate of 0.7.1 as released (`ed6fb86`) against this version's, `gate --json`, on the saved folders under the lead's run trees (the live runs of 0.1.0 to 0.7.1) | text output, exit status and JSON (the tool's version aside) equal in all 669 folders compared; 8 folders written by this version itself, most of them holding a link, were left out. Before the move onto 0.7.1 the same held against 0.7.0 (`e8da0b0`) in all 593 folders there were then |
+| 2026-11-11 | That the tests can fail | 72 mutants, one exact replacement each in a copy of the plugin, then `test_url_080` (the agent's two through `test_input_050`): the 39 rules of the first round (the kind and its keys, the default wait, the length, the refused set, the printable range, the first refused character named, the scheme's four parts, a string, the clean-up list, `-p`, the quoting, the exit status kept, the time allowance, the analysis, am's failure readings and the delivered link, the Android gate, the simulator's validation, opening, exit, words, step JSON, analysis, gate checks, summary row, printed line, the rehearsal's opening, stop and record), 24 of the alert (the agent needed for a link, the step's `Open`, its label and timeout, `alert_confirmed`, the gate's agent check, the stale `Cancel` in a run and before the launch, its label, timeout and `cleared`, its note, failure and missing record, nothing new without a link, the stale record in the analysis, the rehearsal's confirming, stop, clearing, its failure, its line and its record, the summary row, the printed `confirmed`), 7 of `launch_url` (the key, `activity` with it, its link checked, the simulator's refusal, the launch line used, `-p`, the quoting) and 2 in the agent's Swift (the alert querying the app, `alert` not dispatched) | all 72 red. On the first pass 71: `alert` not dispatched survived, since the test checked the call and not the `case` that reaches it; the test now checks both, and the mutant is red |
+
+### Live validation, 0.8.0
+
+2026-11-11 and 2026-11-12, by the lead, on the devices of 0.7.0's live validation (an Android 14
+emulator, an Android 11 one, an iOS 26.1 simulator of an iPhone 16e) against debug builds of an app
+that claims a custom scheme. The rehearsal was run on the code as released; the other runs on the
+code before it was moved onto 0.7.1, which changed nothing a link passes through.
+
+- **iOS Simulator, a link into the running app.** A `url` step opened a link to a profile. The
+  agent found the system's alert and tapped Open (`alert_confirmed: true`), the app showed the
+  profile, and the two rests after it held no frame, no layer commit and no display update: the
+  query of SpringBoard did not disturb the app under test.
+- **The system asks once.** On the same simulator every later link opened without an alert, also
+  after the app had been uninstalled and installed again and the simulator's keychain reset. The
+  step then waits out its five seconds, reports `alert_confirmed: false` and passes. The recording
+  of a `url` step therefore differs between a simulator's first link and its later ones: its
+  signature read `T TD` with the alert and `TD` without (README, Known limits).
+- **A stale alert.** On a simulator made for the purpose and deleted afterwards, a link was opened
+  by hand and left unanswered. The next run cancelled that alert before its first step
+  (`stale_alert.cleared: true`, a note at the gate), opened its own link and confirmed the new
+  alert; its rests were still. The machine's load was 182 during that run.
+- **Rehearse and replay.** A scenario with a link, a rest, and a tap found by its description on
+  the link's screen: the rehearsal opened the link and read the position on that screen (two
+  reads), and the measured run replayed it in a fresh process. It passed with every rest still.
+- **Android 14, a start by link.** `launch_url` started the app cold on the link's screen
+  (`LaunchState: COLD`, 2.1 s); the rests were still and the launch's requests were counted.
+- **Android 14, a link into the running app.** The step is recorded as opened, with the activity am
+  named; its frames and its four requests were counted in the step, and the rest after it sent
+  nothing.
+- **Android 11.** A start by link passed (1.4 s). A link into the running app was opened, and the
+  rest after it failed on one request: the app under test starts a second instance of its activity
+  for a link (launch mode `standard`), and that instance opened another event stream. The tool
+  measured what the app did (README, Known limits).
+- **A link delivered to an activity that is already on top** (a launch mode that reuses it): am
+  prints a `Warning:` line, `Status: ok` and the `Activity:` line and exits 0, on Android 14 and
+  on Android 11 (read with the system's Settings app). The step counts that as opened.
+
+Not validated: a physical device; the alert's labels in another language or on another iOS
+version; an `https` link (a universal link) on the simulator; an app that opens a link in a scene
+of its own.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

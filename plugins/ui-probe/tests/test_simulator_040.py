@@ -134,6 +134,12 @@ if cmd == "launch":
         f.write("agent started before the launch\\n" if os.path.exists(os.path.join(S, "agent-pids")) else "no agent yet\\n")
     out = read("launch.out", f"{{a[3]}}: {PID}\\n")
     sys.stdout.write(out); sys.exit(int(read("launch.rc", "0")))
+if cmd == "openurl":
+    # 0.8.0: a 'url' step; openurl.rc and openurl.err make it fail as simctl would
+    rc = int(read("openurl.rc", "0"))
+    if rc:
+        sys.stderr.write(read("openurl.err", "An error was encountered processing the command (domain=NSOSStatusErrorDomain, code=-10814)\\n"))
+    sys.exit(rc)
 if cmd == "io" and a[3] == "recordVideo":
     path = a[-1]
     with open(os.path.join(S, "recorder-pids"), "a") as f:
@@ -273,6 +279,14 @@ while True:
             reply = {{"ok": True}}
             if mode == "issue" and c == "tap":
                 reply = {{"ok": False, "error": "XCTest recorded: Failed to synthesize event"}}
+        elif c == "alert":
+            # 0.8.0: the system's alert. alert.<button> says what happens: "yes" (an alert, tapped), "no" (none
+            # within the timeout) or "fail" (the agent could not do it); by default Open is tapped, Cancel finds none
+            what = read("alert." + str(obj.get("button")), "yes" if obj.get("button") == "Open" else "no").strip()
+            if what == "fail":
+                reply = {{"ok": False, "error": "XCTest recorded: Failed to tap the alert's button"}}
+            else:
+                reply = {{"ok": True, "tapped": what == "yes"}}
         elif c == "quit":
             reply = {{"ok": True}}
         else:

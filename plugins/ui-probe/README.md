@@ -90,6 +90,7 @@ with different files is not replaced without `--force`. The scripts can also be 
   "name": "open-and-return",
   "package": "<applicationId>",
   "activity": "<launch component, optional>",
+  "launch_url": "<a link to start the app by, Android only, optional>",
   "until_quiet": true,
   "quiet": {"ms": 800, "max_ms": 15000},
   "steps": [
@@ -141,7 +142,32 @@ More keys, one example each:
 {"id": "open-below", "do": "tap", "find": {"text": "Settings", "scroll": {"from": [0.5, 0.8], "to": [0.5, 0.3], "max": 5}}}
 {"id": "open-slow", "do": "tap", "find": {"desc": "Phone number", "nth": 1, "timeout_ms": 15000}, "until_quiet": true, "quiet": {"max_ms": 30000}}
 {"id": "rest-field", "do": "rest", "ms": 5000, "allow": {"frames_max": 12, "reason": "the caret blinks twice a second"}}
+{"id": "open-invite", "do": "url", "url": "example://join/ABC123?from=probe"}
 ```
+
+- `url` opens a link in the app while it runs, as a tap on a link outside the app would: a screen
+  reached only by a link (an invitation that joins a group, say) can then be measured. It is an
+  input step like a tap: the same waits (`until_quiet`, `quiet`, `settle_ms`, default 3000), the
+  same recording, judged like a tap's (a state change), the same counts (frames, sections,
+  signposts, requests) and `expect`. It takes only `url` besides those. On Android the device
+  script runs `am start -W -a android.intent.action.VIEW -d '<url>' -p "$PKG"`: `-p` sends the link
+  to the app under test only, so a link another app also claims never opens a chooser. On the iOS
+  Simulator the host runs `xcrun simctl openurl <udid> <url>`, and the system then asks `Open in
+  "<app>"?` (`Cancel`, `Open`): nothing reaches the app until `Open` is tapped (iOS 26.1 simulator,
+  2026-11-11). So the step has the input agent tap `Open` on that alert, waiting up to 5 s for it
+  (see "Input on the iOS Simulator"); no alert in that time is not a failure (another iOS version,
+  or a universal link, may open directly), and the step's record says whether one was confirmed. A
+  link nothing opened fails the step (check `input`) with the tool's own words: on Android when am
+  exits non-zero, prints an `Error` line or names no activity it reached (`raw/url-<step>.txt`
+  keeps what it printed; a link nothing handles prints `Error: Activity not started, unable to
+  resolve Intent` and exits 0, which the `Error` line catches); on a simulator when `simctl` exits
+  non-zero, or when the agent could not look for the alert. The link is a scheme (a
+  lower-case letter, then lower-case letters, digits, `+`, `.` or `-`), a colon and the rest, at
+  most 500 characters of printable ASCII. Since the link reaches a shell on Android, the error
+  names and refuses the first space, quote of any kind, backslash, or any of `$ ; | < > ( ) { } * !
+  ~ ^`; the argument is quoted as well. `& ? = % / : @ , _ #` and the rest of printable ASCII work,
+  so a link can carry a query and a fragment (`#` is read specially by a shell only at the start of a
+  word, and the link is one quoted word that starts with its scheme).
 
 - `text` types into whatever has focus. The text is at most 200 characters of letters, digits,
   space and `@ . _ + -`; anything else is an error that names the character. It takes the keys a
@@ -169,6 +195,15 @@ change what is gated:
 
 - `package` is an application id (dot-separated names of letters, digits and `_`). `activity` is
   letters, digits, `_`, `.` and `$`, so an inner class such as `.Outer$Inner` works.
+- `launch_url` (Android) starts the app by a link instead of its launcher activity, for a screen the
+  app opens only from a link: the launch runs `am start -W -a android.intent.action.VIEW -d
+  '<launch_url>' -p "$PKG"` (the `url` step's line, to the scenario's package only), and its output
+  is read as a launch's (status, launch state, total time; an `Error` line fails the launch, as a
+  link nothing handles prints). The app is stopped before the launch, so this is a cold start by
+  link. The launch's time, its request window and budget (`launch_requests_max`) and its first
+  frames are counted as for any launch. It takes the `url` step's rules for the link. `activity` and
+  `launch_url` cannot both be given. The iOS Simulator refuses it: an app started by a link cannot be
+  given its launch environment there; launch it and open the link in a `url` step right after.
 - `quiet.ms` and `quiet.max_ms` are numbers of at least 100, with `max_ms` at least `ms`, in the
   scenario's block and in a step's (where the check uses the scenario's value for a key the step
   leaves out). `until_quiet`, `meminfo` and `background` are `true` or `false`. `count_sections`
@@ -543,9 +578,10 @@ produce packet loss.
 Simulator instead of an Android device (exactly one of `--serial` and `--simulator`, neither
 empty). A simulator gives no input from a command line (`simctl` has no tap) and nothing to detect
 quiet with; its exact counts of the app's frames come from its log store (see "The simulator's log
-store"). This version runs rests, and taps and swipes at
+store"). This version runs rests, taps and swipes at
 fractions of the display through a small UI-test agent (`ios-agent/`, see "Input on the iOS
-Simulator"), driven from the host; there is no device script. A measured run never looks an
+Simulator"), and links (`url`, opened by `xcrun simctl openurl`), driven from the host; there is no
+device script. A measured run never looks an
 element up and never types: a tap that names its target with `find` goes to a position found
 beforehand by `ui-probe rehearse`, and typing happens only there (see "A rehearsal on the iOS
 Simulator"). A simulator run reads its log store.
@@ -558,13 +594,15 @@ on its rest (`allow.frames_max`, `allow.changed_frames_max`, `allow.updates_max`
 `allow.unchanged_frames_max` for a caret that composes frames that change nothing).
 
 - **The scenario.** `package` is the bundle identifier (letters, digits and `-` in dot-separated
-  names). `activity`, `quiet` and `count_sections` must be absent and `until_quiet` false or
+  names). `activity`, `launch_url`, `quiet` and `count_sections` must be absent and `until_quiet` false or
   absent, in the scenario and in a step. A step is a `rest` of at least 1000 ms (the CPU time is
-  read in steps of 0.01 s) without `meminfo` or `background`, a `tap` with `x` and `y`, or a
-  `swipe` with `from`, `to`, `ms` and `judge`; a tap or a swipe waits its `settle_ms` after the
-  input (default 3000 for a tap, 2500 for a swipe, as on Android). In `expect`, a rest takes only
-  `signposts_max` and `requests_max`, and a tap or a swipe only `signature`, `signposts_max` and
-  `requests_max`. A swipe lasts at most 60000 ms (what the agent accepts), and so does a step's
+  read in steps of 0.01 s) without `meminfo` or `background`, a `tap` with `x` and `y`, a
+  `swipe` with `from`, `to`, `ms` and `judge`, or a `url` with its link; a tap, a swipe or a link
+  waits its `settle_ms` after the input (default 3000 for a tap and a link, 2500 for a swipe, as on
+  Android). In `expect`, a rest takes only `signposts_max` and `requests_max`, and a tap, a swipe or
+  a link only `signature`, `signposts_max` and `requests_max`. A `url` step needs no rehearsal: it
+  looks nothing up, a rehearsal opens the link and confirms the system's alert too (so the steps
+  after it are rehearsed on the screen it leads to) and a run does both again itself. A swipe lasts at most 60000 ms (what the agent accepts), and so does a step's
   `settle_ms` and a `find.scroll.settle_ms` (each is a wait between two commands to the agent, which
   ends itself after an idle limit). A tap may name its target with `find` (`text` or `desc`,
   `nth`, `timeout_ms`, `scroll`) instead of `x` and `y`; such a run needs `--rehearsal` (see "A
@@ -953,7 +991,7 @@ against that rest.
 
 ## Input on the iOS Simulator
 
-A scenario with a tap or a swipe on a simulator drives them through ui-probe's input agent: one
+A scenario with a tap, a swipe or a link on a simulator drives them through ui-probe's input agent: one
 UI test (`ios-agent/`, a hand-written Xcode project and one Swift file, naming no app) that serves
 commands on a loopback socket.
 
@@ -979,8 +1017,13 @@ commands on a loopback socket.
   (`raw/agent.log`). This installs the agent's runner app (`dev.uiprobe.agent.uitests.xctrunner`)
   on the simulator for the run's duration.
 - **What it does.** `ping` (the app's state, the display's size in points and whether it serves
-  lookups), `tap` (`x`, `y`), `swipe` (`from`, `to`, `ms`) and `quit`, one JSON object per
-  connection. Taps and drags go through the system app at fractions of the display. Started for a
+  lookups), `tap` (`x`, `y`), `swipe` (`from`, `to`, `ms`), `alert` and `quit`, one JSON object per
+  connection. Taps and drags go through the system app at fractions of the display. `alert`
+  (`{"cmd": "alert", "button": "Open", "timeout_s": 5}`, answered `{"ok": true, "tapped": true}` or
+  `false`) waits up to `timeout_s` (at most 30) for a button with that label on an alert of the
+  system's own process (SpringBoard) and taps it if one appears. It queries SpringBoard alone, never
+  the app under test, so it is served in a measured run: a read of the measured app's accessibility
+  tree would change that app for the rest of its life. Started for a
   measured run, the agent reads nothing of the app under test but its state and refuses `find`,
   `type` and `labels`. Started for a rehearsal (`TEST_RUNNER_UI_PROBE_AGENT_LOOKUPS=1`, set by
   `ui-probe rehearse` only, and removed from what a measured run's agent inherits), it also serves
@@ -999,7 +1042,19 @@ commands on a loopback socket.
   issue's text. It listens on 127.0.0.1 only, and ends by itself once no command has arrived for the
   idle limit, so a killed host cannot leave it running.
 - **Per step.** A tap or a swipe: the recorder started and awaited, CPU read, the command sent,
-  `settle_ms` waited, CPU read, a `ping` for the app's state, the recorder stopped. A rest: as
+  `settle_ms` waited, CPU read, a `ping` for the app's state, the recorder stopped. A link (`url`):
+  the same, with `xcrun simctl openurl` and then the agent's `alert` for `Open` (5 s) as the input
+  (`raw/step-<step>.json` keeps `url_open`: whether it opened, simctl's exit status and what it
+  printed when it failed, and `alert_confirmed`; the agent's command and reply as for a tap). The
+  `ping` at the end checks that the app is in front after the link, as after a tap.
+- **A system alert left behind.** The alert outlives the app and sits above it after the next
+  launch, where it would take the run's taps. So a run of a scenario with a link, once the agent is
+  up and before the launch (a rehearsal: before its first step), asks the agent for `Cancel` with a
+  1 s timeout, and keeps the answer in `raw/stale-alert.json` (`stale_alert` in `run.json` and in
+  `rehearsal.json`). A run that cancelled one says so in a note; an agent that could not look for
+  one fails the launch (check `input`), and stops a rehearsal. A run or a rehearsal that opened a
+  link and then stopped before confirming it leaves its alert up: the next run of a scenario with a
+  link clears it this way. A scenario without a link sends nothing new to the agent. A rest: as
   before, with the `ping` at the end. `raw/step-<step>.json` keeps the command, the agent's reply,
   the round trip and the app's state. A tap is judged as a state change and a swipe as motion
   unless its `judge` is `state`, as on Android; `run.json` carries each input step's signature,
@@ -1169,11 +1224,22 @@ without `--rehearsal`, and the refusal says what to run first.
 
 ## Known limits
 
-- **Android, and the iOS Simulator for rests, taps and swipes.** Nothing here drives a physical
+- **Android, and the iOS Simulator for rests, taps, swipes and links.** Nothing here drives a physical
   iPhone. On a simulator the app's frame counts come from its log store, known only when the run
   read the store to the end; there is no quiet detection, and a measured run's input is by
   position only: lookups and typing happen in a rehearsal (an accessibility read can change the
   app it reads), whose positions hold only while the screen is the same in both passes.
+  On a simulator a link's alert is confirmed by its label (`Open`) and a stale one cancelled by
+  `Cancel`: another language or iOS version may label them differently.
+- **A simulator asks about a link once.** The first link an app is handed on a simulator brings up
+  the system's alert; later links open directly, also after the app is installed again (measured
+  on iOS 26.1). The recording of a `url` step holds the alert the first time and not afterwards,
+  so its signature differs between the two: do not approve a signature on a `url` step. What
+  follows the step is the same either way.
+- **A link into a running Android app opens whatever the app's launch mode gives.** An activity
+  declared `standard` gets a second instance for the link, above the first, and the step measures
+  that (its frames, its requests, and whatever the second instance goes on doing at rest). To
+  measure the link's screen itself, start the app by the link (`launch_url`).
 - **Per-frame timings assume the device has not slept since boot.** Frame rows use the monotonic
   clock and step marks the boot clock; they agree only then. The run is flagged when they do not
   line up. Counts are unaffected; the recording then no longer decides a rest window.

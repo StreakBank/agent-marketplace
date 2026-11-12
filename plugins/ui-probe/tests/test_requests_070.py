@@ -1168,7 +1168,9 @@ class DocsTest(unittest.TestCase):
         self.assertIn("`limits` now holds `rest_requests_max`", " ".join((root / "CHANGELOG.md").read_text().split()))
         self.assertIn("### Validation, 0.7.0", (root / "PROVENANCE.md").read_text())
         self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], u.VERSION)
-        # 0.7.1: the version moved on (test_portable_071 pins it); the manifests still name the code's version
+        # 0.8.0: the version moved on; the manifests still name the code's version
+        market = json.loads((root.parent.parent / ".claude-plugin" / "marketplace.json").read_text())
+        self.assertIn("## 0.13.0", (root.parent.parent / "CHANGELOG.md").read_text())
         self.assertIn("## 0.12.0", (root.parent.parent / "CHANGELOG.md").read_text())
 
     def test_installed_and_reachable(self):

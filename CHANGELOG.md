@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.0 — 2026-11-11
+
+- ui-probe 0.8.0: a `url` step opens a link in the running app (`am start -a
+  android.intent.action.VIEW -d <url> -p <package>` on Android, `xcrun simctl openurl` on the iOS
+  Simulator), so that a screen reached only by a link can be measured. It is an input step like a
+  tap (waits, recording, judging, counts, `expect`); a link nothing opened fails the step as
+  `input` with the tool's own words. On the simulator the input agent confirms the system's `Open
+  in ...?` alert with a new command that queries SpringBoard alone, and a stale alert is cancelled
+  before a run. Android can also start the app by a link (`launch_url`). See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.12.1 — 2026-11-11
 
 - ui-probe 0.7.1: a request log replaced during a run is told by its first bytes as well as its

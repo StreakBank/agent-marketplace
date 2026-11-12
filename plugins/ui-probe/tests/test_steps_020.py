@@ -1104,7 +1104,7 @@ class DocsAndDoctorTest(unittest.TestCase):
         readme = (Path(u.HERE).parent / "README.md").read_text()
         block = readme.split("More keys, one example each:", 1)[1].split("```json", 1)[1].split("```", 1)[0]
         steps = [json.loads(line) for line in block.strip().splitlines()]
-        self.assertEqual(len(steps), 5)
+        self.assertEqual(len(steps), 6)                # 0.8.0: a url step
         for st in steps:
             u.validate_scenario(scenario([st]))
 
