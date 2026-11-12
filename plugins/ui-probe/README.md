@@ -405,7 +405,7 @@ exits 1 on a violation.
 | Check | Fails when |
 |---|---|
 | Frames at rest | the app drew more than `rest_frames_max` frames (default 0, or the step's `allow.frames_max`) in a rest step, or no count of its frames and no aligned recording exist |
-| Recording at rest | frames were composed that changed nothing on screen (beyond those the display composed for another layer: `frames_display` above `frames_layers`, both known), or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes. Both are notes, not violations, when the app presented no frame by any count (platform and per-layer both known and 0, a trace's 0 or absent); a step with `allow.changed_frames_max` keeps its allowance for changes in the app's area |
+| Recording at rest | frames were composed that changed nothing on screen (beyond those the display composed for another layer: `frames_display` above the largest of the app's own counts, all known), or the app's area changed in more recorded frames than the step's `allow.changed_frames_max` (default none). Only an aligned recording decides, and only while the app is in front; otherwise these are notes. Both are notes, not violations, when the app presented no frame by any count (platform and per-layer both known and 0, a trace's 0 or absent); a step with `allow.changed_frames_max` keeps its allowance for changes in the app's area |
 | CPU at rest | the app used more than `rest_cpu_pct_max` percent of one core (default 2.0, or the step's `allow.cpu_pct_max`) |
 | Find | a tap with `find` holds no record of where its element was found, or the element was matched in another package than the one asked for |
 | Run | a run folder holds `failed.json`, `device-script.sh` or `raw/` but no capture: the run did not complete |
@@ -477,19 +477,23 @@ judged against that allowance for changes in the app's area as before; there is 
 allowance key for frames that changed nothing.
 
 On Android a recorded frame that changed nothing is held against the app only as far as the app's
-own layers can account for it. The compositor's statistics count the frames the app's own layers
-latched (`frames_layers`, L) and the frames the display composed (`frames_display`, D); the
-recording counts the frames that changed the app's area (`app_region_frames`, A: any change there,
-a caret's blink included) and those that changed nothing (I). Each of the app's latches that no
-recorded change in its area accounts for may have produced a frame that changed nothing, so the app
-owns up to `min(I, max(0, L - A))` of them. Only the rest can have been composed for a layer that is
-not the app's, and no more of them than the display composed beyond the app's layers: `min(I -
-owned, max(0, D - L))` are set aside, not held against `allow.unchanged_frames_max` or the default
-of none, and the gate says so in a note for the step with D and L. What is left is judged as
-before, and its failure says how many were set aside. If L, D or A is not a known count, nothing is
-set aside, and the changed-frames check does not use this. An animation nobody can see still fails:
-its frames are latched by the app's own layer and change nothing on screen, so they are the app's
-own whatever the display did. A frame the app drew that changed nothing (a redraw of the same
+own account of its frames allows. That account (F) is the largest of the app-side counts, the same
+figure the frame check uses: the platform's (`frames`), the one of the frames the app's own layers
+latched (`frames_layers`, L) and a trace's when there is one. The compositor's statistics also
+count the frames the display composed (`frames_display`, D); the recording counts the frames that
+changed the app's area (`app_region_frames`, A: any change there, a caret's blink included) and
+those that changed nothing (I). Each of the app's frames that no recorded change in its area
+accounts for may have produced a frame that changed nothing, so the app owns up to `min(I, max(0,
+F - A))` of them. Only the rest can have been composed for a layer that is not the app's, and no
+more of them than the display composed beyond the app's account: `min(I - owned, max(0, D - F))`
+are set aside, not held against `allow.unchanged_frames_max` or the default of none, and the gate
+says so in a note for the step with D and F. What is left is judged as before, and its failure says
+how many were set aside. If the platform's count, L, D or A is not a known count (an integer of 0 or
+more), or a trace's count is there and is not one, nothing is set aside, and the changed-frames
+check does not use this. A surface whose layer the layers' count does not give to the app (a
+pop-up window whose layer name does not carry the package, on Android 11 and older) is still in the
+platform's count, so its frames stay the app's. An animation nobody can see still fails: its frames
+are the app's and change nothing on screen, so they are the app's own whatever the display did. A frame the app drew that changed nothing (a redraw of the same
 picture) is the app's own too: a 150 s rest on Android 14 with L 4, D 9, A 2 and I 2 fails as
 before, its five extra composites being the status bar's, which the recorder kept as frames that
 changed only outside the app's area. Measured on an Android 11 emulator (2026-11-11): two rests on a focused field
@@ -1073,7 +1077,8 @@ commands on a loopback socket.
   `ping` at the end checks that the app is in front after the link, as after a tap.
 - **A system alert left behind.** The alert outlives the app and sits above it after the next
   launch, where it would take the run's taps. So a run of a scenario with a link, once the agent is
-  up and before the launch (a rehearsal: before its first step), asks the agent for `Cancel` with a
+  up and before the launch (a rehearsal: after the launch, before its first step, since a
+  rehearsal starts its agent after the app), asks the agent for `Cancel` with a
   1 s timeout, and keeps the answer in `raw/stale-alert.json` (`stale_alert` in `run.json` and in
   `rehearsal.json`). A run that cancelled one says so in a note; an agent that could not look for
   one fails the launch (check `input`), and stops a rehearsal. A run or a rehearsal that opened a
@@ -1249,13 +1254,18 @@ without `--rehearsal`, and the refusal says what to run first.
 ## Known limits
 
 - **Frames that changed nothing are set aside by the compositor's counts (Android).** Only those
-  beyond the app's latches that no recorded change in its area accounts for, and no more than the
-  display composed beyond the app's layers (see "The gate"). What this can still hide: a frame the
-  app latched that changed nothing on screen, when in the same rest (1) the recording counted a
-  change in the app's area that none of the app's latches made (encoder noise, or another window
-  drawn over the app's area), and (2) the display composed a frame for another layer. Each frame so
-  hidden needs one of each. The frame check still counts the app's frames, and fails them unless the
-  step's `allow.frames_max` covers them.
+  beyond the app's own frames (F, the largest of its counts) that no recorded change in its area
+  accounts for, and no more than the display composed beyond F (see "The gate"). The number of the
+  app's own frames this can set aside in a rest is at most the sum of two things, and is 0 when both
+  are 0. (1) Recorded changes in the app's area that none of the app's frames made: encoder noise
+  that the recording counts in the app's area, or another window drawn over it (the keyboard, a
+  toast, a system dialog). Each such frame can hide one frame of the app's that changed nothing; the
+  frame composed for that window also gives the display its extra composition. (2) Frames of the
+  app that every app-side count misses: a surface the app draws outside the platform's renderer (a
+  video or GL surface of its own) whose layer the layers' count does not give to the app (on Android
+  11 and older a layer name that does not start with the package, or an unknown uid). Each such
+  frame can hide itself, and the frame check misses it too. In case (1) the frame check still
+  counts the app's frames, and fails them unless the step's `allow.frames_max` covers them.
 
 - **Android, and the iOS Simulator for rests, taps, swipes and links.** Nothing here drives a physical
   iPhone. On a simulator the app's frame counts come from its log store, known only when the run
@@ -1263,7 +1273,15 @@ without `--rehearsal`, and the refusal says what to run first.
   position only: lookups and typing happen in a rehearsal (an accessibility read can change the
   app it reads), whose positions hold only while the screen is the same in both passes.
   On a simulator a link's alert is confirmed by its label (`Open`) and a stale one cancelled by
-  `Cancel`: another language or iOS version may label them differently.
+  `Cancel`: another language or iOS version may label them differently. A link whose alert was not
+  confirmed within the 5 s wait passes with a note on its step, since a link may open without
+  asking: if the system asked later, the app has not opened the link, the alert stays above the
+  app, and the steps after it are measured under the alert. Approve an `expect.signature` on a later
+  step to catch that. In a rehearsal a stale alert is cancelled after the launch, where a run
+  cancels it before: a rehearsal starts its agent after the app (see "A rehearsal on the iOS
+  Simulator"), and only the agent
+  can look. An alert with a `Cancel` button that the app itself raises while the agent starts is
+  therefore cancelled in a rehearsal and not in a run.
 - **A simulator asks about a link once.** The first link an app is handed on a simulator brings up
   the system's alert; later links open directly, also after the app is installed again (measured
   on iOS 26.1). The recording of a `url` step holds the alert the first time and not afterwards,

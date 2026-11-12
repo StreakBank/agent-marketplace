@@ -1,5 +1,29 @@
 # Changelog — ui-probe
 
+## 0.8.2 — 2026-11-12
+
+- Android: the app's account of its frames, for the rule of 0.8.1, is the largest of the app-side
+  counts (F: the platform's, the app's layers' and a trace's), the figure the frame check uses, no
+  longer the layers' count alone. The app may own `min(I, max(0, F - A))` of the recorded frames
+  that changed nothing, and at most `max(0, D - F)` of the rest are set aside; the note and the
+  failure name D and F. Nothing is set aside unless the platform's count, the layers' count, D and A
+  are all known counts (and a trace's, when there is one). A pop-up window whose layer name does not
+  carry the package (Android 11 and older) draws frames the layers' count misses: 0.8.1 set them
+  aside (platform 3, layers 0, display 3, three frames that changed nothing: a pass under a
+  `frames_max` allowance); they fail again. A larger F only sets aside less, and on the saved runs
+  of the case 0.8.1 was made for the platform's count equals the layers' (10 and 10), so those rests
+  pass as before.
+- A count is an integer that is not a bool and is not negative. Before, a negative count from a run
+  made by hand could set frames aside.
+- iOS Simulator: a link whose system alert was not confirmed within the 5 s wait passes with a note
+  on its step: if the system asked later, the app has not opened the link and the alert is still
+  above it. No new agent call; the README's known limits say so.
+- iOS Simulator: a rehearsal cancels a stale alert after the launch and a run before it. The reason
+  is now written beside the call and in the README: a rehearsal starts its agent after the app, and
+  only the agent can look. A test pins both orders.
+- The tests and PROVENANCE describe their evidence by what it was, without the run folders,
+  scenario names or card numbers of the project it came from. Every number is kept.
+
 ## 0.8.1 — 2026-11-12
 
 - Android: a recorded frame that changed nothing at rest is held against the app only as far as the

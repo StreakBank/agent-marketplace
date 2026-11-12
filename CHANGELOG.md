@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.3 — 2026-11-12
+
+- ui-probe 0.8.2: on Android a recorded frame that changed nothing at rest is set aside only beyond
+  the largest of the app's own frame counts (the platform's, its layers' and a trace's), no longer
+  beyond its layers' count alone, so the frames of a pop-up window whose layer the layers' count
+  misses stay the app's; a negative count is not a count. On the iOS Simulator a link whose alert
+  was not confirmed passes with a note, and the order in which a rehearsal and a run cancel a stale
+  alert is written down and tested. See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.13.2 — 2026-11-12
 
 - ui-probe 0.8.1: on Android a recorded frame that changed nothing at rest is set aside when the

@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -2817,6 +2817,10 @@ def _rehearse(udid: str, scn: dict, out: Path, emit, facts: dict) -> dict:
             if not _number_pair(screen):
                 raise ProbeError(f"the input agent's first answer gives no screen size ({screen!r})")
             if sim_has_url(scn):
+                # After the launch here, where a measured run does it before the launch: in a rehearsal the agent
+                # starts after the app (see above), and the agent is what looks for the alert. So an alert with a
+                # Cancel button that the app itself raises in the time the agent takes to start is cancelled in a
+                # rehearsal and not in a run (README, known limits).
                 stale = sim_clear_stale_alert(agent, raw)
                 if not stale["reply"].get("ok"):
                     raise ProbeError("the agent could not look for a system alert left by an earlier link: "
@@ -3375,6 +3379,12 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                 elif not reply.get("ok"):
                     fail("input", sid, "the agent could not look for the system's alert to confirm the link: "
                          f"{reply.get('error') or 'no reply'}")
+                elif not opened.get("alert_confirmed"):
+                    # Not a failure: a link may open without asking. But if the system asked after the wait, the
+                    # alert is still up and the app has not opened the link.
+                    notes.append(f"{sid}: no system alert was confirmed within the {SIM_ALERT_CONFIRM_TIMEOUT_S} s "
+                                 "wait; if the system asked later, the app has not opened the link and the alert is "
+                                 "still above it")
             else:
                 reply = (s.get("agent") or {}).get("reply") or {}
                 if not reply.get("ok"):
@@ -4081,8 +4091,8 @@ NO_REQUEST_LOG = "not counted: the run was given no request log"
 
 
 def _count(value) -> bool:
-    """A known count: an int, not a bool (JSON's true is not a count)."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    """A known count: an int that is not a bool (JSON's true is not a count) and is not negative."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _plural(n: int, one: str, many: str | None = None) -> str:
@@ -5100,25 +5110,33 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 quiet_identical = identical > 0 and presented_none
                 quiet_change = real > 0 and presented_none and not changed_allowed
                 # A recorded frame that changed nothing is held against the app only as far as the app's own
-                # layers can account for it. The app may own as many such frames as its layers latched beyond
-                # the recorded frames that changed its area (any change there, the caret's included); only the
-                # rest can have been composed for another layer, and no more of them than the display composed
-                # beyond the app's layers. Unknown counts set nothing aside.
-                display, layers = s.get("frames_display"), s.get("frames_layers")
+                # account of its frames allows. That account (F) is the largest of the app-side counts, the one
+                # the frame check uses: the platform's, the app's layers' and a trace's. A frame of a surface the
+                # layers' count misses (a pop-up window whose layer name does not carry the package, on Android
+                # 11 and older) is still in the platform's count, so it stays the app's. The app may own as many
+                # such frames as F exceeds the recorded frames that changed its area (any change there, the
+                # caret's included); only the rest can have been composed for another layer, and no more of them
+                # than the display composed beyond F. Nothing is set aside unless the platform's count, the
+                # layers' count, the display's count and A are all known counts (and a trace's, when there is one).
+                display, layers, platform = s.get("frames_display"), s.get("frames_layers"), s.get("frames")
+                trace = s.get("frames_compositor")
                 area = vid.get("app_region_frames")
-                other_layer = 0
-                if not quiet_identical and _count(display) and _count(layers) and _count(area):
-                    app_may_own = min(identical, max(0, layers - area))
-                    other_layer = min(identical - app_may_own, max(0, display - layers))
+                other_layer, app_frames = 0, None
+                if (not quiet_identical and _count(display) and _count(layers) and _count(platform) and _count(area)
+                        and (trace is None or _count(trace))):
+                    app_frames = max(platform, layers, trace or 0)
+                    app_may_own = min(identical, max(0, app_frames - area))
+                    other_layer = min(identical - app_may_own, max(0, display - app_frames))
                 held = identical - other_layer
-                set_aside = (f" ({other_layer} more set aside: the display composed {display} frames, the app's "
-                             f"layers {layers})" if other_layer else "")
+                set_aside = (f" ({other_layer} more set aside: the display composed {display} frames, the app "
+                             f"{app_frames})" if other_layer else "")
                 if other_layer:
                     was = lambda n: "was" if n == 1 else "were"
                     notes.append(f"{sid}: {_plural(other_layer, 'frame')} of {identical} composed at rest that changed "
                                  f"nothing on screen {was(other_layer)} set aside: the display composed {display} frames "
-                                 f"and the app's own layers {layers}, so {_plural(display - layers, 'frame')} "
-                                 f"{was(display - layers)} composed for a layer that is not the app's")
+                                 f"and the app {app_frames} by the largest of its own counts, so "
+                                 f"{_plural(display - app_frames, 'frame')} {was(display - app_frames)} composed for a "
+                                 "layer that is not the app's")
                 if held > unchanged_max and not quiet_identical:
                     findings.append((held, unchanged_max, unchanged_allowed,
                                      f"{held} frames were composed at rest that changed nothing on screen" + set_aside

@@ -35,7 +35,7 @@ def count(steps):
 
 
 class LiveCaseTest(t70.Segment):
-    """tmp/sb120/runs/and-certR-20261111T212004Z/signed-in-tabs-at-rest/run-01, rebuilt from its numbers: u =
+    """A certifying run's scenario of rests between taps on tabs (Android 14 emulator), rebuilt from its numbers: u =
     0.062 s, each tap's own request reaching the front 10 to 26 ms after the tap's start mark."""
 
     SCN = {"name": "x", "package": ta.PKG, "steps": [
