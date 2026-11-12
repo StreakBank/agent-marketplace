@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 REPAIR = "Task board update required. "
 STATUSES = ["To Do", "In Progress", "Blocked", "Review", "Done"]
 DELEGATE = {"Agent", "Workflow", "spawn_agent", "followup_task"}
@@ -154,8 +154,12 @@ def instructions(w, s, child=False):
     if child:
         return base + "Worker for " + str(s.get("task") or "unbound parent") + ". Return accomplishments, changed paths, evidence, blockers and next action to the lead. Do not create a separate task or checkpoint the lead's record. Read applicable workspace instructions: " + paths
     cmd = "task-board"
+    bound = str(s.get("task") or "none")
+    if s.get("task") and s.get("released"):
+        # Naming a released task as bound sends the lead to a checkpoint that is refused.
+        bound = "none (" + s["task"] + " is released; bind a task before the next checkpoint)"
     return (base + "Maintain it automatically; do not ask the user to request bookkeeping. "
-            "Session token: " + s["token"] + ". Bound task: " + str(s.get("task") or "none") + ". "
+            "Session token: " + s["token"] + ". Bound task: " + bound + ". "
             "Before working, reuse the relevant task with `" + cmd + " start --session " + s["token"] +
             " --task TASK-ID`, or create one with `" + cmd + " start --session " + s["token"] +
             " --title TITLE --description SCOPE --ac CRITERION`. Do not claim another lead's active task. "
@@ -166,6 +170,15 @@ def instructions(w, s, child=False):
             s["token"] + " -- task edit TASK-ID ...`. A pure conversational reply requires no new task. "
             "Pending interruption observations: " + str(len(s["pending"])) + ". "
             "Read applicable workspace instructions: " + paths)
+
+
+def bind_hint(s):
+    """How to get an active binding, for a refusal that would otherwise name no way out."""
+    cmd = "task-board start --session " + s["token"]
+    hint = "Bind one first: `" + cmd + " --title TITLE --description SCOPE --ac CRITERION` creates a task"
+    if s.get("task"):
+        hint += ", and `" + cmd + " --task " + s["task"] + "` reopens " + s["task"]
+    return hint + "."
 
 
 def board_command(data):
@@ -433,7 +446,15 @@ def session_command(args):
         s = read_json(state_path(w, args.session))
         if args.command == "start":
             switching = not args.task or args.task.upper() != str(s.get("task", "")).upper()
-            if switching and s.get("task") and s["generation"] != s["checkpoint_generation"]:
+            # Only an ACTIVE binding owes a checkpoint before the session moves on.
+            # A released one (a Done checkpoint, or `release`) owns nothing, and
+            # `checkpoint` refuses it: holding the next binding hostage to that
+            # checkpoint left the session with no command that could succeed.
+            active = bool(s.get("task")) and not s.get("released")
+            stale = s["generation"] != s["checkpoint_generation"]
+            previous = s.get("task")
+            unbound = s["generation"] - s["checkpoint_generation"] if previous and s.get("released") else 0
+            if switching and active and stale:
                 raise ValueError("Checkpoint the current task before binding a different one")
             if switching:
                 require_reconciled_followups(s)
@@ -453,7 +474,7 @@ def session_command(args):
                 if not match:
                     raise RuntimeError("Task created, but ID not recognized. Inspect backlog before retrying.")
                 task_id = match.group(1)
-            if s.get("task") and s["task"] != task_id and s["generation"] != s["checkpoint_generation"]:
+            if active and s["task"] != task_id and stale:
                 raise ValueError("Checkpoint the current task before binding a different one")
             for path in state_path(w, args.session).parent.glob("*.json"):
                 other = read_json(path)
@@ -468,16 +489,25 @@ def session_command(args):
             s["released"] = False
             s["generation"] += 1
             message = "Lead bound: " + s["harness"] + ", session " + s["session_id"] + ", checkout " + str(s.get("checkout") or "unavailable") + ", observed " + now() + ". Board maintained automatically."
+            if unbound > 0:
+                # Work counted while no binding was active has no other record.
+                message += (" Runtime observation: " + str(unbound) + " lead work event(s) were counted after " +
+                            previous + " was released and before this binding.")
             if s["pending"]:
                 message += "\n" + "\n".join(s["pending"])
             backlog(w, ["task", "edit", task_id, "--status", "In Progress", "--append-notes", message, "--plain"])
             s["pending"] = []
-            journal(w, s, "bound")
+            journal(w, s, "bound", unbound_events=unbound)
             save(w, s)
             return {"task": task_id, "session": s["token"], "board": w["board"]}
         if args.command == "status":
             return s
         if args.command == "release":
+            if not s.get("task"):
+                raise ValueError("No task is bound; there is nothing to release")
+            if s.get("released"):
+                # Already given up. Work counted since then is not a reason to refuse.
+                return {"released": s["task"], "already_released": True}
             if s["generation"] != s["checkpoint_generation"]:
                 raise ValueError("Checkpoint before releasing task ownership")
             require_reconciled_followups(s)
@@ -487,8 +517,10 @@ def session_command(args):
             journal(w, s, "released")
             save(w, s)
             return {"released": s.get("task")}
-        if not s.get("task") or s.get("released"):
-            raise ValueError("Bind an active task first")
+        if not s.get("task"):
+            raise ValueError("No task is bound. " + bind_hint(s))
+        if s.get("released"):
+            raise ValueError(s["task"] + " is released, so this session has no active task. " + bind_hint(s))
         if args.command == "reconcile-worker":
             observation = s["workers"].get(args.agent)
             known_worker = observation is not None

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.1 — 2026-11-12
+
+- task-board 0.1.3: a session whose task is Done (or released) can bind its next task after
+  further tool calls. Before, `checkpoint`, `release` and `start` each refused for a reason only
+  one of the others could clear, and the way out was to reopen the Done task. Refusals on a
+  released binding now name the `start` command to run. See `plugins/task-board/CHANGELOG.md`.
+
 ## 0.13.0 — 2026-11-11
 
 - ui-probe 0.8.0: a `url` step opens a link in the running app (`am start -a

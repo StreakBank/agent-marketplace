@@ -416,6 +416,102 @@ class Lifecycle(unittest.TestCase):
         self.sid = "session-a"
         self.assertEqual(self.event("Stop"), {})
 
+    # --- A released binding must not strand the session ---
+
+    def finish(self):
+        task_id = self.start()
+        self.command("backlog", "--", "task", "edit", task_id, "--check-ac", "1", "--check-dod", "1", "--plain")
+        self.checkpoint("Done")
+        return task_id
+
+    def lead_tool(self, use_id):
+        return self.event("PostToolUse", tool_name="Bash", tool_input={"command": "pwd"}, tool_use_id=use_id)
+
+    def test_work_after_done_can_be_bound_to_a_new_task(self):
+        done = self.finish()
+        self.lead_tool("after-done")
+        # The session is held at Stop, and before 0.1.3 nothing could clear it
+        # but rebinding the Done task: checkpoint refused the released binding,
+        # while release and start both refused the stale generation.
+        self.assertEqual(self.event("Stop")["decision"], "block")
+        new = self.start()
+        self.assertNotEqual(new, done)
+        self.assertEqual(tb.task(self.w, done)["status"], "Done")
+        status = self.command("status")
+        self.assertEqual(status["task"], new)
+        self.assertFalse(status["released"])
+        # What ran unbound is on the new record, and that record still owes a checkpoint.
+        notes = tb.task(self.w, new)["implementationNotes"]
+        self.assertIn("1 lead work event(s) were counted after " + done + " was released", notes)
+        self.assertEqual(self.event("Stop")["decision"], "block")
+        self.checkpoint()
+        self.assertEqual(self.event("Stop"), {})
+
+    def test_work_after_an_explicit_release_can_be_bound_to_a_new_task(self):
+        first = self.start()
+        self.checkpoint()
+        self.command("release")
+        self.lead_tool("after-release")
+        second = self.start()
+        self.assertNotEqual(second, first)
+        self.assertEqual(self.command("status")["task"], second)
+        self.assertEqual(tb.task(self.w, first)["status"], "In Progress")
+
+    def test_switch_from_an_active_task_still_needs_its_checkpoint(self):
+        self.start()
+        self.checkpoint()
+        self.lead_tool("active-work")
+        with self.assertRaises(ValueError):
+            self.start()
+        self.assertNotIn("T-2", tb.backlog(self.w, ["task", "list", "--plain"]))
+
+    def test_a_clean_switch_records_no_unbound_work(self):
+        done = self.finish()
+        new = self.start()
+        self.assertNotIn("lead work event(s)", tb.task(self.w, new)["implementationNotes"])
+        self.assertEqual(tb.task(self.w, done)["status"], "Done")
+
+    def test_released_task_can_be_reopened_by_its_lead_after_more_work(self):
+        done = self.finish()
+        self.lead_tool("after-done")
+        self.lead_tool("after-done-again")
+        self.command("start", "--task", done)
+        self.assertFalse(self.command("status")["released"])
+        record = tb.task(self.w, done)
+        self.assertEqual(record["status"], "In Progress")
+        self.assertIn("2 lead work event(s) were counted after " + done + " was released", record["implementationNotes"])
+
+    def test_release_is_idempotent_once_released(self):
+        done = self.finish()
+        self.lead_tool("after-done")
+        self.assertEqual(self.command("release")["released"], done)
+        self.assertTrue(self.command("status")["released"])
+
+    def test_release_without_a_task_says_so(self):
+        with self.assertRaises(ValueError) as caught:
+            self.command("release")
+        self.assertIn("No task is bound", str(caught.exception))
+
+    def test_refusals_on_a_released_binding_name_the_way_out(self):
+        done = self.finish()
+        self.lead_tool("after-done")
+        for attempt in (self.checkpoint,
+                        lambda: self.command("backlog", "--", "task", "list", "--plain")):
+            with self.assertRaises(ValueError) as caught:
+                attempt()
+            text = str(caught.exception)
+            self.assertIn(done + " is released", text)
+            self.assertIn("task-board start --session " + self.token, text)
+        reason = self.event("Stop")["reason"]
+        self.assertIn("Bound task: none (" + done + " is released", reason)
+        prompt = self.event("UserPromptSubmit", prompt="next")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Bound task: none (" + done + " is released", prompt)
+
+    def test_an_active_binding_is_named_plainly(self):
+        task_id = self.start()
+        prompt = self.event("UserPromptSubmit", prompt="next")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Bound task: " + task_id + ". ", prompt)
+
     def test_binding_records_actual_checkout(self):
         task_id = self.start()
         self.assertIn(str(self.board), tb.task(self.w, task_id)["implementationNotes"])

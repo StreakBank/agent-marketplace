@@ -61,6 +61,10 @@ lead instead of creating competing records.
 5. Before another lead takes unfinished work, checkpoint and run `task-board release
    --session TOKEN`. Done checkpoints release ownership automatically. Process
    idleness never releases unfinished work.
+6. After a Done checkpoint or a release the session has no active task. Bind the
+   next work with `task-board start` (a new task, or `--task` to reopen one); a
+   checkpoint is refused until then. The binding note records how many lead work
+   events were counted in between.
 
 `task-board status --session TOKEN` shows that session's binding and observations.
 `task-board doctor` shows registrations, last observations, outstanding bindings,

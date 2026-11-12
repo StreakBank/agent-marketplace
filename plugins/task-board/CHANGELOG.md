@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.1.3 — 2026-11-12
+
+- Let a session bind its next task after a released one. A Done checkpoint (or
+  `release`) leaves the session with a released binding; once the lead then ran any
+  tool, `checkpoint` refused the released binding while `release` and `start` both
+  refused the uncheckpointed work, so no command could succeed and the only way out
+  was to rebind the Done task, which reopened it. `start` now asks for a checkpoint
+  only when the binding it leaves is active. The active-task guard is unchanged.
+- Record on the new binding how many lead work events were counted after the
+  previous task was released, in the binding note and in the journal's `bound`
+  entry (`unbound_events`), since that work has no other record.
+- Make `release` succeed when the binding is already released, and say "No task is
+  bound" when there is none.
+- Name the way out in the refusals: `checkpoint`, `backlog` and `reconcile-worker`
+  on a released or missing binding now give the `start` commands that bind one,
+  and the hook's instructions read "Bound task: none (T is released; ...)" instead
+  of naming the released task as bound.
+- Add regression coverage: work after Done and after `release` bound to a new
+  task with the first task left as it was, reopening the released task, the
+  idempotent release, the refusal texts, and a control that an active stale
+  binding still refuses a switch and creates no orphan task.
+
 ## 0.1.2 — 2026-10-05
 
 - Count only the lead's own tool calls toward checkpoint staleness. Worker and

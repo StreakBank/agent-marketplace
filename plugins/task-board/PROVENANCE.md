@@ -44,3 +44,15 @@ edit stamp an append moves on its own, so a content-free stamp bump inside the
 same window remains unreported. A foreign write that lands after the re-read is
 caught by the ordinary Stop comparison, not by this scope.
 Validated 2026-10-05 against Backlog.md 1.52.0: 45 tests, all passing.
+
+2026-11-12 released-binding correction (0.1.3), from a live session rather than
+inferred: a lead checkpointed its task Done, ran further tools, and found
+`checkpoint` ("Bind an active task first"), `release` ("Checkpoint before releasing
+task ownership") and `start` ("Checkpoint the current task before binding a
+different one") all refusing; rebinding the Done task was the only command that
+worked, and it set that task back to In Progress. Validated with Backlog.md 1.52.0:
+the unit suite (54 tests, real Backlog files, native-shaped payloads), and one pass
+of the script as a subprocess on a throwaway board (hook payloads on stdin, commands
+as argv), run against 0.1.2 and against this version: 0.1.2 refused all three
+commands, this version bound the second task and left the first Done. That pass does
+not certify installed hook trust or live callback ordering in either harness.
