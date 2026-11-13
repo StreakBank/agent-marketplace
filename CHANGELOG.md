@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.0 (2026-11-13)
+
+- ui-probe 0.10.0: `scope` on a tap, url, text or key step, and the gate's check `outside`: a step
+  fails when the control it touched moved, a change outside it stays, a band beside it slid, or a
+  change outside came back after 50 ms or more, by release 1's group rule against the frame before
+  the input. See `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.14.0 (2026-11-12)
 
 - ui-probe 0.9.0: `sheet --full --distinct` writes each step's frames at full resolution and sheets

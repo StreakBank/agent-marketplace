@@ -1,5 +1,34 @@
 # Changelog — ui-probe
 
+## 0.10.0 (2026-11-13)
+
+A check for what a step changed outside the control it touched.
+
+- `scope` on a tap, url, text or key step: `{"control"?, "may_change": [{"region" | "screen",
+  "reason"}], "came_back_ms_min"?, "move_px_min"?}`. Opt-in; a step without it is judged as before.
+- The control's box: a declared `control`; on Android the smallest clickable node among the matched
+  element and its ancestors in the lookup's window tree, at most 25 % of the app's area; on the iOS
+  Simulator the rehearsal match's frame (a rehearsal's replay now records it). No box: unknown,
+  which fails. The box and its source are in `run.json`.
+- A change outside is release 1's group rule (8-connected, over 10 levels, at least 3e-5 of the app's
+  area) against the last frame before the input, outside the control's box widened by a block and
+  outside every allowed region. The gate's new check `outside` fails when the control moved by
+  `move_px_min` (default 8 px at 1080 wide), a change outside is still there at the step's end, a
+  band outside slid by `move_px_min`, or a change outside came back after `came_back_ms_min`
+  (default 50 ms) by the frames' own times; one that came back sooner is a note, below the hand.
+- The control's search starts at the node the lookup matched (the deepest with the named text or
+  description and the matched bounds) and climbs to the first clickable node; one larger than a
+  quarter of the app's area makes the box unknown. On Android the check is unknown when the screen
+  changed outside the control in the 500 ms before the input. A slide is told only when its match is
+  unique, and the control's own move too, which also needs its content gone from its old place and
+  not at the new place before the input (a switch that changed its look among like switches did
+  not move: seen live on an Android 14 emulator). Only pixels changed by more than `join_level`
+  (default 30) join within a closing by 3 px before grouping; the minimum is counted on the pixels
+  over 10. The not-at-rest message names the place and both remedies.
+- `run.json` keeps each change outside with its box, start, duration and how it ended, and
+  `sheets/outside-<step>.png` shows the frame before, the frame with the most change outside and the
+  last frame, with the box.
+
 ## 0.9.0 (2026-11-12)
 
 Reading a film frame by frame, rests watched long enough to see a change made once a minute, parts

@@ -760,6 +760,97 @@ Not established by this version's author: the rule on a real phone's capture (th
 another encoder or bit rate, the region check on a real recording, `sheet --full` on a long real
 recording.
 
+### Validation, 0.10.0
+
+**What the author of this version ran, on macOS (Python 3), on 2026-11-13: single test files, planted
+faults in scratch copies, and the repository's coupling check. No device, emulator, simulator or
+network, and no saved recording.** The author did not run the whole suite or anything live.
+
+The recordings of the tests are synthetic, made by `test_outside_0100.py` to be shaped like real ones:
+1080 x 2400, a frame only when the screen changes, frame times 16 to 40 ms apart, and around each
+change a border of pixels 4 levels off and a scatter of single pixels 14 levels off (no group at the
+minimum). The known cases are generic shapes: a switch flipped while two rows of the same screen
+change and come back after 77 ms and after 33 ms; a tapped chip in a row of four that moves 70 px
+with its neighbours; a theme change with the whole screen allowed and without; a keyboard rising
+over four frames into a declared region and with none; a caption that appears 40 px under the
+control and stays, allowed and not; a glow 14 px around the control; a plain switch in a list of
+identical switches; changes of 50 and 49 ms; moves of 8 and 7 px.
+
+The first form of the slide search failed its own test and was changed before release: it looked
+for where the old content of a changed band went, and on lines that repeat every 200 px it found it
+(a row that changed colour was taken for a slide of 200 px); it now looks for where the new content
+came from, refuses a patch too plain to place, and requires the match to leave a mean change of at
+most 4 levels.
+
+A review of the first form found five things, all fixed with tests: the control's search started at
+the first node with the matched bounds, so a wrapper with the same bounds as a clickable switch
+made the whole row the control; a clickable element over the cap fell back to the label's box; a
+toast of the step before, still fading, failed the step; on content that repeats every 200 px a
+change undone during the step was reported as a slide; and rows that changed only by strokes 3 px
+wide, 9 px apart, were not seen. The review's cases are tests here.
+
+The lead then ran the second form live on an Android 14 emulator (a settings screen with three
+identical switches, the middle one flipped off and on, three runs): the rows beside the switch,
+redrawn for one frame, were reported every time (17 to 54 ms), and the control's box was the switch
+itself; but every flip off failed "the control moved" by 171 px, a match on the neighbouring switch
+with a second match also within the tolerance. The control's own move now needs a unique match, its
+content gone from its old place, and not at the new place before the input. A reviewer's libx264
+films showed the 3 px join turning key-frame noise on dense text into one large group; only pixels
+changed by more than 30 levels now join. The author measured that on a synthetic screen of
+antialiased text through libx264 at crf 23 (a key frame every 30 frames): across the key frame about
+168,000 pixels over 10 levels and a few dozen over 30; joining every pixel over 10 made one group of
+about 168,000 px, joining only those over 30 left none over 27 px. On a screen of random texture
+inside glyph shapes the key frame's noise made a group of 85 px with no joining at all (the release 1
+rule), over the minimum of 78; that screen is not used in the tests and is said as a limit.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-13 | New tests, one file at a time | `python3 -B -m unittest test_outside_0100` in `plugins/ui-probe/tests`: the known cases, the boundaries, where the box comes from (a window tree, a rehearsal's frame, a declared box), the Android and simulator wiring with a stand-in decoder, the scenario check, the gate on both platforms, the hook in `analyze_run`, the docs | 51 tests, `OK` (the three libx264 tests run where ffmpeg has libx264; they ran here) |
+| 2026-11-13 | Existing tests, one file at a time | `test_film_090`, `test_regions_090`, `test_ui_video`, `test_analysis`, `test_gate`, `test_scenario_and_parsers`, `test_simulator_040`, `test_store_050`, `test_steps_020`, `test_docs`, `test_fixes_082`, `test_rehearsal_060`, `test_input_050`, `test_review_050`, `test_profiles_030`, `test_presence_and_loss`, `test_other_layer_081`, `test_borders_070`, `test_run_and_cli`, `test_url_080`, `test_compare_summary_cli` | each file `OK`. One existing test changed: `test_film_090`'s docs test no longer pins the plugin's version (0.9.0); `test_outside_0100` pins 0.10.0 |
+| 2026-11-13 | That the tests can fail | 31 faults, one at a time, each in its own copy of the plugin, then the one test named below; every named test passes on the unchanged code | each turned its test red. The closing of 5 px (below) first stayed green once the join level came in, since the test's noise was too weak to join at any radius; its noise was made strong (50 levels), a weak pair added, and it turned red |
+| 2026-11-13 | Coupling | `scripts/check-coupling.sh ui-probe` at the repository root | passes |
+| 2026-11-13 | The whole suite, by the lead | `python3 -B -m unittest discover -s plugins/ui-probe/tests` from an archive of the reviewed code, on macOS and in a Linux container (Python 3.12, ffmpeg 7.1 with libx264, a user that is not root) | 1,005 tests, `OK` on both, nothing skipped |
+| 2026-11-13 | The gate of 0.9.0 against this version, by the lead | the released 0.9.0 as installed and this version's script from the same archive: `gate` on every saved run folder of the project that uses the probe, 1,007 folders | the same exit status and text in all 1,007: a step without `scope` is judged as before |
+| 2026-11-13 | Live, by the lead, on an Android 14 emulator | a settings screen with three identical switches; the middle one flipped off and on, `scope` with nothing allowed outside, three runs, twice: first with the second form of this version, then with the final one; the Mac was loaded (13 to 22) | in every flip the two neighbouring rows were redrawn for one frame and the check saw it, 17 to 62 ms, below the hand mostly and failing `came_back` when over 50 ms. The second form reported every flip off as a move of the control: the switch had only changed its look and the search matched the identical switch above it. The final form (a move needs a unique match, gone from the old place, not already at the new) reported no move in six flips |
+| 2026-11-13 | Independent review | a reviewer that did not write the code, default-refute, over three rounds on synthetic recordings and films encoded with libx264 | fixed, each with a test that fails without it: a wrapper node making the whole row the control; a large card falling back to its label; the step before still moving; slides on repeating content; thin strokes not seen; key-frame noise joined into a change. Stated as limits: faint thin text under `join_level`, a constant-rate recording compressed harder than about crf 23, a slide on rows of identical height |
+
+| Fault planted | Test that turned red |
+|---|---|
+| a change of exactly 50 ms taken as below the hand | `test_50_ms_fails_and_49_does_not` |
+| a change still there at the step's end not failed | `test_a_caption_that_appears_under_the_control_and_stays` |
+| the control's move not failed | `test_a_tapped_chip_that_moves_70_px` |
+| no band searched for a slide | `test_a_tapped_chip_that_moves_70_px` |
+| the control's box not widened by a block | `test_a_glow_just_around_the_control_is_the_controls` |
+| the allowed regions excusing nothing | `test_a_keyboard_rising_into_a_declared_region` |
+| the whole screen allowed excusing nothing | `test_a_theme_change_with_the_whole_screen_allowed` |
+| a slide searched from the old content, where a repeating screen matches | `test_rows_that_change_for_77_ms_and_come_back_fail` |
+| a loose match taken for a move (no absolute closeness) | `test_rows_that_change_for_77_ms_and_come_back_fail` |
+| a plain patch searched for a shift | `test_a_plain_switch_in_a_list_of_like_switches_did_not_move` |
+| the move threshold not scaled to the width | `test_the_move_threshold_is_a_fraction_of_the_width` |
+| the search started at the first node with the matched bounds (a wrapper) | `test_the_search_starts_at_the_node_find_matched_not_a_wrapper` |
+| a clickable element over the cap falling back to the label's box | `test_a_clickable_element_over_a_quarter_of_the_app_is_unknown` |
+| no check that the screen was at rest before the input | `test_a_toast_fading_out_from_the_step_before` |
+| a screen not at rest not made unknown | `test_a_toast_fading_out_from_the_step_before` |
+| the frame before the half second not handed over | `test_the_wiring_hands_over_the_half_second_before` |
+| an ambiguous match taken for a slide | `test_a_line_like_the_lines_around_it_is_no_slide` |
+| no closing before grouping | `test_thin_strokes_in_other_rows_for_77_ms_fail` |
+| a closing of 5 px instead of 3 | `test_two_noise_groups_8_px_apart_stay_apart` |
+| the control's move not required to be unique | `test_a_move_among_identical_chips_cannot_be_placed` |
+| content already at the new place before the input still taken for a move | `test_with_one_lookalike_only_it_did_not_move_either` |
+| every pixel over 10 joining within the closing | `test_the_switch_flipping_is_not_unknown_and_fails_nothing` (libx264) |
+| the same | `test_two_noise_groups_8_px_apart_stay_apart` |
+| the scope's `join_level` not handed over | `test_the_scopes_join_level_reaches_the_check` |
+| the not-at-rest message without its remedies | `test_a_toast_fading_out_from_the_step_before` |
+| an unknown check passing | `test_unknown_fails` |
+| the first frame after the input taken as the frame before | `test_android_the_tree_box_scaled_and_the_frames_around_the_input` |
+| the lookup's box winning over a declared control | `test_android_a_declared_control_wins` |
+| a rehearsal replay keeping no frame | `test_a_rehearsal_replay_carries_the_matched_frame` |
+| each frame compared with the one before it, not with the frame before the input | `test_rows_that_change_for_77_ms_and_come_back_fail` |
+| the gate ignoring `scope` | `test_each_rule_fails_with_one_line` |
+
+Not established by this version's author: the check on any real recording, the defaults (50 ms,
+8 px, 25 %) on real screens, and a step whose control resizes itself.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

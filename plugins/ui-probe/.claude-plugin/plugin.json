@@ -1,6 +1,6 @@
 {
   "name": "ui-probe",
   "description": "Watch a mobile app from outside while a scripted scenario runs: frames drawn, CPU used and requests sent while nothing happens, the sequence of visual states each step passes through (from a screen recording), and timings as distributions. App-agnostic CLI with a gate for the counts, a base-against-head comparison, contact sheets an agent can read, and a shaping proxy for slow networks. Android first.",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "author": { "name": "StreakBank" }
 }

@@ -959,9 +959,7 @@ class DocsTest(unittest.TestCase):
         self.assertIn("## 0.9.0", (root / "CHANGELOG.md").read_text())
         self.assertIn("### Validation, 0.9.0", (root / "PROVENANCE.md").read_text())
         self.assertIn("ui-probe 0.9.0", (root.parent.parent / "CHANGELOG.md").read_text())
-        # the plugin's own version only; the marketplace's is never pinned here (another plugin's bump moves it)
-        self.assertEqual(u.VERSION, "0.9.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.9.0")
+        # the plugin's version is pinned by the newest release's test (test_outside_0100), the marketplace's never
         self.assertEqual((u.WATCH_MIN_MS, v.BLOCK_OF_WIDTH, v.BLOCK_PIXEL_LEVEL, v.BLOCK_SHARE), (70000, 24 / 1080, 10, 0.40))
         self.assertEqual((u.WATCH_MIN_FLOOR_MS, v.FILM_LEVEL, v.FILM_GROUP_SHARE, u.FILM_CAUTION_PCT / 100),
                          (10000, 10, 3e-5, v.FILM_CAUTION))

@@ -84,6 +84,23 @@ FILM_STEADY_SHARE = 0.25      # pixels over the level in this share of a window'
 # window's last frame with its first, by the same group rule.
 FILM_SLOW_S = 0.5
 FILM_EXPLAIN_PX = 3           # a slow change within this many pixels of a counted change is that change
+# A change outside the control that was touched (a step's `scope`): decided by the film's group rule
+# against the last frame before the input. Defaults measured on a 1080 x 2400 emulator: a control that
+# moves 8 px (held as a fraction of the width) or a band beside it that slides as far, a change outside
+# that lasts 50 ms (three frames at 60 a second) before it comes back.
+OUTSIDE_MOVE_PX = 8           # at 1080 px wide
+OUTSIDE_SEARCH_PX = 300       # the farthest shift searched, vertically and horizontally
+OUTSIDE_CAME_BACK_MS = 50
+OUTSIDE_STILL_SCORE = 2.0     # mean change (levels) at no shift above which content may have moved
+OUTSIDE_MATCH_RATIO = 0.5     # a shift that leaves at most this share of that change is where it went
+OUTSIDE_SLIDE_GROUPS = 3      # the largest groups of a frame searched for a slide
+OUTSIDE_MATCH_MAX = 4.0       # and leaves at most this mean change (levels): content that moved matches closely
+OUTSIDE_JOIN_PX = 3           # pixels over the level this close (a closing by 3 px) join before grouping:
+                              # a line of text that changes is one group, scattered encoder noise is not
+OUTSIDE_JOIN_LEVEL = 30       # only pixels changed by more than this join within the closing; a redraw changes
+                              # its pixels far more, encoder noise on dense text (libx264 at crf 23) mostly less
+OUTSIDE_SETTLE_MS = 500       # the screen must not change outside the control in this long before the input
+OUTSIDE_TEXTURE = 4.0         # a patch whose grey spreads less than this (standard deviation) has no shift to find
 PER_PAGE = 24                 # frames on one page of a distinct sheet
 PAGE_COLS = 6
 
@@ -1271,3 +1288,260 @@ def analyze_film(video: Path, out: Path, windows: list[dict], insets_px: list[in
             "frame_interval_ms_median": round(interval * 1000, 2) if gaps else None,
             "insets_px": [top, bottom], "app_rows": list(rows), "block_px": block_side(width),
             "recording_floor": floor, "steps": steps}
+
+
+# --------------------------------------------------------------------------------------------
+# A change outside the control a step touched (`scope`)
+# --------------------------------------------------------------------------------------------
+
+def _grey(frame: np.ndarray) -> np.ndarray:
+    return frame.astype(np.float32).mean(axis=2)
+
+
+def find_shift(a: np.ndarray, b: np.ndarray, box, limit: int) -> dict:
+    """Where the content of box in grey frame a lies in grey frame b: the vertical or horizontal shift of
+    at most `limit` px (one axis at a time) that makes b's pixels closest to a's, by mean absolute
+    difference. Searched at about half resolution, then refined at full resolution. Returns the shift
+    [dx, dy], the difference with no shift ('still') and at the shift ('best')."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    h, w = a.shape
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return {"shift": [0, 0], "still": 0.0, "best": 0.0, "flat": True}
+    patch = a[y0:y1, x0:x1]
+    if float(patch.std()) < OUTSIDE_TEXTURE:
+        # A plain patch matches every plain area as well as its own place: no shift can be told.
+        return {"shift": [0, 0], "still": round(float(np.abs(b[y0:y1, x0:x1] - patch).mean()), 3), "best": 0.0,
+                "flat": True}
+
+    def score(dx, dy):
+        if y0 + dy < 0 or y1 + dy > h or x0 + dx < 0 or x1 + dx > w:
+            return None
+        return float(np.abs(b[y0 + dy:y1 + dy, x0 + dx:x1 + dx] - patch).mean())
+
+    f = max(1, int(round(w / 540)))
+    sa, sb = a[::f, ::f], b[::f, ::f]
+    bx0, by0, bx1, by1 = x0 // f, y0 // f, max(x0 // f + 1, x1 // f), max(y0 // f + 1, y1 // f)
+    sp = sa[by0:by1, bx0:bx1]
+    sh, sw = sb.shape
+    best, where = None, (0, 0)
+    scores = []
+    for axis in ("y", "x"):
+        for d in range(-(limit // f), limit // f + 1):
+            dx, dy = (d, 0) if axis == "x" else (0, d)
+            if by0 + dy < 0 or by1 + dy > sh or bx0 + dx < 0 or bx1 + dx > sw:
+                continue
+            v = float(np.abs(sb[by0 + dy:by1 + dy, bx0 + dx:bx1 + dx] - sp).mean())
+            scores.append((v, dx * f, dy * f))
+            if best is None or v < best:
+                best, where = v, (dx * f, dy * f)
+    # The best score among shifts away from the best one (more than two steps of the search, or on the
+    # other axis): content that repeats matches there as well, and then no shift can be told.
+    far = [v for v, dx, dy in scores if (dx, dy) != (0, 0)
+           and not (abs(dx - where[0]) <= 2 * f and abs(dy - where[1]) <= 2 * f)]
+    second = min(far) if far else None
+    still = score(0, 0)
+    best, shift = still, (0, 0)
+    for dx in range(where[0] - f, where[0] + f + 1):
+        for dy in range(where[1] - f, where[1] + f + 1):
+            if (dx and dy) or abs(dx) > limit or abs(dy) > limit:
+                continue
+            v = score(dx, dy)
+            if v is not None and v < best:
+                best, shift = v, (dx, dy)
+    return {"shift": [int(shift[0]), int(shift[1])], "still": round(still, 3), "best": round(best, 3), "flat": False,
+            "second": None if second is None else round(second, 3)}
+
+
+def moved(found: dict, move_px: float) -> bool:
+    """Whether a find_shift result says the content moved by move_px or more."""
+    return (not found.get("flat") and found["still"] > OUTSIDE_STILL_SCORE
+            and found["best"] <= min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * found["still"])
+            and max(abs(found["shift"][0]), abs(found["shift"][1])) >= move_px)
+
+
+def unique(found: dict) -> bool:
+    """Whether a find_shift result's match is the only one: no other shift comes within the tolerance."""
+    tolerance = min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * found["still"])
+    return found.get("second") is None or found["second"] > tolerance
+
+
+def joined_groups(mask: np.ndarray, r: int = OUTSIDE_JOIN_PX, strong: np.ndarray | None = None) -> list[tuple[int, list[int]]]:
+    """Groups of the True pixels of mask, 8-connected, where the pixels of `strong` (default: all of
+    mask) also join within a closing by r px (each grown by r): (pixels of mask in the group, their box)."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return []
+    h, w = mask.shape
+    y0, y1 = max(0, int(ys.min()) - r), min(h, int(ys.max()) + 1 + r)
+    x0, x1 = max(0, int(xs.min()) - r), min(w, int(xs.max()) + 1 + r)
+    sub = mask[y0:y1, x0:x1]
+    grow = sub if strong is None else strong[y0:y1, x0:x1]
+    lab = _label(sub | _dilate(grow, r))
+    ry, rx0, rx1, roots, _size = lab
+    labels = np.full(sub.shape, -1, dtype=np.int32)
+    lengths = rx1 - rx0
+    offsets = np.repeat(np.cumsum(lengths) - lengths, lengths)
+    labels[np.repeat(ry, lengths), np.arange(lengths.sum()) - offsets + np.repeat(rx0, lengths)] = np.repeat(roots, lengths)
+    sy, sx = np.nonzero(sub)
+    ids, inv = np.unique(labels[sy, sx], return_inverse=True)
+    n = len(ids)
+    size = np.bincount(inv, minlength=n)
+    bx0 = np.full(n, np.iinfo(np.int64).max)
+    by0 = np.full(n, np.iinfo(np.int64).max)
+    bx1 = np.zeros(n, dtype=np.int64)
+    by1 = np.zeros(n, dtype=np.int64)
+    np.minimum.at(bx0, inv, sx)
+    np.minimum.at(by0, inv, sy)
+    np.maximum.at(bx1, inv, sx + 1)
+    np.maximum.at(by1, inv, sy + 1)
+    return [(int(size[k]), [int(bx0[k]) + x0, int(by0[k]) + y0, int(bx1[k]) + x0, int(by1[k]) + y0]) for k in range(n)]
+
+
+def _excused(size, box, allowed, screen: bool, rows) -> np.ndarray:
+    """The pixels a step with scope may change: the system bars, the control's box widened by a block,
+    every allowed box widened by FILM_EXPLAIN_PX, or all of them with the whole screen allowed."""
+    width, height = size
+    side = block_side(width)
+    excused = np.zeros((height, width), dtype=bool)
+    excused[:rows[0]] = True
+    excused[rows[1]:] = True
+    x0, y0, x1, y1 = (int(v) for v in box)
+    excused[max(0, y0 - side):y1 + side, max(0, x0 - side):x1 + side] = True
+    for ax0, ay0, ax1, ay1 in allowed:
+        r = FILM_EXPLAIN_PX
+        excused[max(0, int(ay0) - r):int(ay1) + r, max(0, int(ax0) - r):int(ax1) + r] = True
+    if screen:
+        excused[:] = True
+    return excused
+
+
+def outside_groups(a: np.ndarray, b: np.ndarray, excused: np.ndarray, least: int,
+                   join_level: float = OUTSIDE_JOIN_LEVEL) -> list[tuple[int, list[int]]]:
+    """The changes outside from frame a to frame b: groups of pixels over FILM_LEVEL, not excused, of at
+    least `least` such pixels; pixels changed by more than join_level also join within OUTSIDE_JOIN_PX."""
+    d = channel_delta(a, b)
+    out = (d > FILM_LEVEL) & ~excused
+    if not out.any():
+        return []
+    return [g for g in joined_groups(out, strong=out & (d > join_level)) if g[0] >= least]
+
+
+def outside_check(video: Path, size: tuple[int, int], before: int, frames: list[tuple[int, float]], box,
+                  allowed: list, screen: bool, rows: tuple[int, int], move_px: float, came_back_ms: float,
+                  strip: Path | None = None, prior: list[int] | None = None,
+                  join_level: float = OUTSIDE_JOIN_LEVEL) -> dict:
+    """What a step changed outside the control it touched. before: the index of the last recorded frame
+    before the input; frames: [(index, ms since the input)] of the frames after it, in order; box: the
+    control's box, in pixels of the recording; allowed: the boxes of the step's may_change regions;
+    screen: whether the whole screen may change. A change outside is an 8-connected group of pixels
+    over FILM_LEVEL, of at least film_min_group() of the app's area, outside the control's box widened
+    by a block, outside every allowed box (widened by FILM_EXPLAIN_PX) and outside the system bars,
+    each frame against the frame before the input. Returns the changes (episodes in time, with their
+    box, start, duration and how they ended), whether the control moved, the bands that slid, and the
+    four verdicts. strip: where to draw the frame before, the frame with the most change outside and
+    the last frame, with the box (None: nothing is drawn). prior: the recorded frames of the
+    OUTSIDE_SETTLE_MS before the input, after the last one before that time and ending with `before`;
+    when one of them changed outside since the one before it, the screen was not at rest, nothing else
+    is judged, and the result holds 'unsettled'."""
+    width, height = size
+    app_h = rows[1] - rows[0]
+    least = film_min_group(width, app_h)
+    excused = _excused(size, box, allowed, screen, rows)
+    x0, y0, x1, y1 = (int(v) for v in box)
+    if prior and len(prior) > 1:
+        previous = None
+        for i, frame in iter_frames(video, prior, size):
+            if previous is not None:
+                groups = outside_groups(previous[1], frame, excused, least, join_level)
+                if groups:
+                    return {"box_px": [x0, y0, x1, y1], "unsettled": {"frame": i, "px": sum(g[0] for g in groups),
+                                                                      "boxes_px": [g[1] for g in groups]}}
+            previous = (i, frame)
+    seen, slid = [], []
+    b_frame = b_grey = last = None
+    most = (0, None, None)
+    order = [before] + [i for i, _t in frames]
+    when = dict(frames)
+    for i, frame in iter_frames(video, order, size):
+        if i == before:
+            b_frame, b_grey = frame, _grey(frame)
+            continue
+        groups = outside_groups(b_frame, frame, excused, least, join_level)
+        px = sum(g[0] for g in groups)
+        rec = {"i": i, "t_ms": round(when[i], 1), "groups": [g[1] for g in groups], "px": px}
+        if groups:
+            grey = _grey(frame)
+            for size_, gbox in sorted(groups, key=lambda g: -g[0])[:OUTSIDE_SLIDE_GROUPS]:
+                # Where the new content of the changed band came from in the frame before: content that
+                # was already elsewhere on a screen that repeats (a list) is not taken for a slide.
+                found = find_shift(grey, b_grey, gbox, OUTSIDE_SEARCH_PX)
+                if moved(found, move_px) and unique(found):
+                    slid.append({"i": i, "t_ms": rec["t_ms"], "box_px": gbox,
+                                 "shift_px": [-found["shift"][0], -found["shift"][1]], "px": size_})
+            if px > most[0]:
+                most = (px, i, frame)
+        seen.append(rec)
+        last = (i, frame)
+    end_i, end_frame = last if last is not None else (before, b_frame)
+    control = find_shift(b_grey, _grey(end_frame), box, OUTSIDE_SEARCH_PX)
+    # A move needs the control's content found at one place only at the step's end (another shift as
+    # close is a lookalike), gone from its old place, and not already at the new place before the input:
+    # a switch that changed its own look among switches like it did not move.
+    already = None
+    if not control.get("flat") and control["shift"] != [0, 0]:
+        dx, dy = control["shift"]
+        already = round(float(np.abs(b_grey[y0 + dy:y1 + dy, x0 + dx:x1 + dx] - b_grey[y0:y1, x0:x1]).mean()), 3)
+    control["already_there"] = already
+    tolerance = min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * control["still"])
+    control["moved"] = bool(moved(control, move_px) and unique(control)
+                            and already is not None and already > tolerance)
+    changes, cur = [], None
+    for rec in seen:
+        if rec["groups"]:
+            if cur is None:
+                cur = {"start_ms": rec["t_ms"], "first_frame": rec["i"], "box_px": None, "frames": 0, "most_px": 0}
+            cur["frames"] += 1
+            cur["most_px"] = max(cur["most_px"], rec["px"])
+            for g in rec["groups"]:
+                b = cur["box_px"]
+                cur["box_px"] = list(g) if b is None else [min(b[0], g[0]), min(b[1], g[1]), max(b[2], g[2]), max(b[3], g[3])]
+        elif cur is not None:
+            cur.update({"ended": "came back", "end_ms": rec["t_ms"], "duration_ms": round(rec["t_ms"] - cur["start_ms"], 1),
+                        "below_the_hand": rec["t_ms"] - cur["start_ms"] < came_back_ms})
+            changes.append(cur)
+            cur = None
+    if cur is not None:
+        cur.update({"ended": "still there at the step's end", "end_ms": None, "duration_ms": None, "below_the_hand": False})
+        changes.append(cur)
+    fails = {"moved": control["moved"], "still_there": any(c["ended"] != "came back" for c in changes),
+             "slid": bool(slid), "came_back": any(c["ended"] == "came back" and not c["below_the_hand"] for c in changes)}
+    strip_name = None
+    if strip is not None:
+        tiles = [(b_frame, f"#{before} before the input"), (most[2], f"#{most[1]} most change outside"),
+                 (end_frame, f"#{end_i} the step's end")]
+        imgs = []
+        for frame, label in tiles:
+            if frame is None:
+                continue
+            img = Image.fromarray(frame).convert("RGB")
+            d = ImageDraw.Draw(img)
+            d.rectangle([x0, y0, x1 - 1, y1 - 1], outline=(255, 0, 0), width=max(2, width // 270))
+            if frame is most[2]:
+                for c in changes:
+                    if c["box_px"]:
+                        d.rectangle([c["box_px"][0], c["box_px"][1], c["box_px"][2] - 1, c["box_px"][3] - 1],
+                                    outline=(255, 200, 0), width=max(2, width // 270))
+            imgs.append((thumbnail(img), label))
+        th = max(t.size[1] for t, _ in imgs)
+        page = Image.new("RGB", (len(imgs) * (THUMB_W + 6), th + 22), "white")
+        for n, (t, label) in enumerate(imgs):
+            page.paste(t, (n * (THUMB_W + 6), 22))
+            ImageDraw.Draw(page).text((n * (THUMB_W + 6) + 2, 4), label, fill="black")
+        strip.parent.mkdir(parents=True, exist_ok=True)
+        page.save(strip)
+        strip_name = strip.name
+    return {"box_px": [x0, y0, x1, y1], "before_frame": before, "end_frame": end_i, "frames": len(frames),
+            "min_group_px": least, "move_px": round(move_px, 2), "came_back_ms_min": came_back_ms,
+            "control": control, "slid": slid, "changes": changes, "fails": fails,
+            "below_the_hand": sum(1 for c in changes if c["below_the_hand"]), "strip": strip_name}

@@ -194,6 +194,8 @@ More keys, one example each:
 - `allow` on a rest step raises its limits on purpose, with a reason. See "Screens that are never
   still". `allow.regions` lets parts of the screen change on their own limits (see "Regions that
   change on their own").
+- `scope` on a tap, url, text or key step checks that the input changed nothing outside the control
+  it touched, beyond what the step says may change (see "A change outside the control: `scope`").
 
 The file is checked strictly before anything runs, because a key the tool ignored would silently
 change what is gated:
@@ -435,6 +437,8 @@ keeps `failed.json`, and `gate` fails the run (see "Runs that did not complete")
   sheets/<step>-distinct-NN.png   written by `sheet --distinct`: only the frames that changed the
                         app's area, 24 to a page, each labelled with its index and its time since the
                         step's start
+  sheets/outside-<step>.png   a step with `scope`: the frame before the input, the frame with the most
+                        change outside the control and the last frame, the control's box drawn
 ```
 
 `analyze`, `gate`, `summary` and `compare` read only these files. No device is needed to redo
@@ -504,6 +508,7 @@ exits 1 on a violation.
 | Expectations | a step's `expect` is not met, or cannot be checked (no aligned recording for a signature, a section the app never emitted, a trace that lost data) |
 | Missing step, scenario | a step of the scenario has no record in the run, or its kind differs |
 | Analysis | a capture has no `run.json`, or one older than the capture: run `ui-probe analyze` |
+| Outside (`outside`) | a step with `scope` changed something outside its control that it does not allow (one line per rule broken: the control moved, a change is still there at the step's end, a band slid, a change came back after lasting long enough to be seen), or the check is unknown (no box for the control, a recording that cannot be placed around the input) |
 | Region at rest (`rest-region`) | a region of a rest's `allow.regions` changed in more recorded frames than its `changed_frames_max`, or the run holds no usable report of the step's regions (see "Regions that change on their own") |
 
 A clean app's frames at rest are zero; its CPU at rest is not always. On a real app three of 80
@@ -594,6 +599,104 @@ then the defaults. `--advisory` reports the same violations and exits 0. `gate -
 gates with a revised copy of the run's own scenario (a limit, an allowance): it refuses (exit 2) a
 scenario whose `name` differs from the one stored with the run, and each `allowance:` line then
 says that it came from `--scenario`.
+
+## A change outside the control: `scope`
+
+A tap should change the control it touched and what the step expects, and nothing else. A row that
+blinks while a switch beside it flips, a chip that jumps when it is chosen, a caption that appears
+under a button and stays: the at-rest checks do not see them, because they happen during the step.
+A tap, url, text or key step can say what it may change:
+
+```json
+{"id": "flip-reminders", "do": "tap", "find": {"text": "Reminders"},
+ "scope": {"may_change": [{"region": [0.0, 0.62, 1.0, 1.0], "reason": "the keyboard rises"}],
+           "came_back_ms_min": 50, "move_px_min": 8}}
+```
+
+- `scope` takes `control` (optional: `[x0, y0, x1, y1]`, fractions of the app's area), `may_change`
+  (required, may be empty: a list of `{"region": [x0, y0, x1, y1] or "screen", "reason": "..."}`,
+  fractions of the app's area, each with its reason), `came_back_ms_min` (a number of ms, 0 or more,
+  default 50), `move_px_min` (a number of pixels at 1080 px wide, above 0, default 8) and
+  `join_level` (levels from 10 to 255, default 30; see the closing below). It is opt-in: a step
+  without it is judged exactly as before. A swipe or a rest refuses it.
+- The control's box: a declared `control` always wins. Otherwise on Android, for a tap with `find`,
+  the search starts at the node the lookup matched in the window tree it read (`raw/ui-<step>.xml`):
+  among the nodes with the matched bounds, the deepest whose text or content description is the one
+  `find` named (a wrapper with the same bounds is passed over), and climbs to the first clickable
+  node. That node is the control when its area is at most 25 % of the app's area; when it is larger,
+  the box is unknown ("the clickable element is larger than a quarter of the app's area: declare
+  'scope.control'"), since a large card's own press highlight would otherwise be judged against its
+  label. With nothing clickable on the way, the matched node is the control. On the iOS Simulator,
+  the frame of the element the rehearsal matched. A tap by position, a url, a text or a key step
+  without `control` has no box. With no box the check is unknown, and unknown fails. `run.json`
+  records the box and where it came from.
+- The screen must be at rest before the input. On Android, when the recording changed outside the
+  control's widened box in the 500 ms before the step's start mark (a toast of the step before still
+  fading out), the check is unknown, and the message names the place that changed and both
+  remedies: "the screen was not at rest before the input: it changed at [x0, y0, x1, y1] px (...);
+  declare it in scope.may_change, or put a rest before this step". On the iOS Simulator the step's
+  recording starts with the step, so this is not checked.
+- Each recorded frame from the input to the step's end is compared with the last frame before the
+  input (on Android, the last frame before the step's start mark; on the iOS Simulator, the first
+  frame of the step's recording) by the film's rule: an 8-connected group of pixels changed by more
+  than 10 levels, of at least 3e-5 of the app's area, counts; before grouping, the pixels changed by
+  more than `join_level` (default 30) also join within a closing by 3 px (each grown by 3 px), so a
+  line of text that changes is one group, while the minimum is still counted on the pixels over 10.
+  Encoder noise is mostly weak: on a dense screen of antialiased text through libx264 at crf 23, a
+  key frame put about 168,000 pixels over 10 levels and a few dozen over 30; joining every pixel over
+  10 made them one group, joining only those over 30 left none larger than 27 px. A real redraw
+  changes its pixels by far more than 30. Pixels inside the control's box
+  widened by one block (24/1080 of the width), inside a `may_change` region widened by 3 px, or in
+  the system bars, are left out; with `"screen"` everything is left out but the control's own move.
+- It fails (check `outside`, one line per rule) when:
+  - (a) the control moved: the content of its box, between the frame before the input and the
+    step's end, lies `move_px_min` or more away (searched vertically and horizontally up to 300 px;
+    the shift that matches must leave a mean change of at most 4 levels and at most half of the
+    change with no shift, and a plain box, whose grey spreads less than 4 levels, has no shift to
+    find). The match must be unique (no other shift within that tolerance), the content must be gone
+    from its old place, and it must not have been at the new place already before the input: a
+    switch that changed its own look among switches like it did not move;
+  - (b) a change outside is still there at the step's end;
+  - (c) a band outside slid at any point by `move_px_min` or more (where the changed content came
+    from in the frame before, by the same search, for the three largest groups of each frame). A
+    slide is reported only when its match is unique: when another shift, more than two search steps
+    away, also comes within the tolerance (content that repeats), no slide is told and the change is
+    judged by the other rules;
+  - (d) a change outside came back after lasting `came_back_ms_min` or more. On an Android 14
+    emulator, a settings screen redrew the two rows beside a flipped switch for one frame, lasting
+    17 to 54 ms, and the check reported it every time, below the hand or failing at 54 ms. Its duration runs from
+    the first frame that shows it to the first that no longer does, by the frames' own times: a
+    recording on Android holds a frame only when the screen changes (a 150 s rest held 164 frames),
+    so frame counts are not durations. One that came back sooner is reported in a note, "below the
+    hand".
+- Where the defaults come from: 50 ms (three frames at 60 a second, the shortest a person sees
+  reliably), 8 px at 1080 wide and the 25 % cap were set by this release's design; none was measured
+  for this release. The level of 10 and the minimum of 3e-5 are release 1's, measured on one phone
+  capture; the block is the block map's. A project that measures otherwise sets `came_back_ms_min`
+  and `move_px_min` per step.
+- `run.json` holds per step with `scope` (key `outside`): the box and its source, the frame before
+  and the last, each change outside with its box, start, duration and how it ended, the control's
+  search, the bands that slid, and the four verdicts. `sheets/outside-<step>.png` shows the frame
+  before the input, the frame with the most change outside and the last frame, with the box drawn.
+- Limits: the box comes from the tree the lookup read before the step, so a control that resizes
+  itself is judged by its old box. A change inside the widened box of the control is never seen,
+  however large. A change outside smaller than the minimum group, or fainter than 10 levels, is not
+  seen. A change between 10 and `join_level` levels (grey text on a grey background) is grouped
+  without the closing, so thin strokes that faint stay under the minimum and are not seen: strokes
+  3 x 20 px, 9 px apart, 25 levels darker in two rows for 77 ms passed, where the same strokes 60
+  levels darker failed. A slide is told only for a band whose new content is textured and was somewhere in the frame
+  before within 300 px on one axis; a diagonal move or one farther is reported as a change, not a
+  slide, and so is a slide on content that repeats within the search: a slide on rows of identical
+  height cannot be placed, so it is judged as a change, and one that came back within 50 ms is below
+  the hand. Dense content with fine texture can leave key-frame noise in a group over the minimum
+  even without joining (random texture inside glyphs, through libx264 at crf 23: 85 px). A recording
+  at a constant frame rate holds a key frame in most half seconds, and on dense text a key frame
+  compressed harder than about crf 23 changes enough to make every scoped step unknown as not at
+  rest (libx264 at crf 30: one group of 63,967 px); a recorder that writes frames only on change, as
+  the Android emulator's does, meets this rarely. Two changes outside closer
+  than the closing (6 px) join, so two pieces of noise next to each other can reach the minimum
+  together. On the iOS
+  Simulator the times run from the recording's start, a moment before the input.
 
 ## A film no run made: `ui-probe film`
 

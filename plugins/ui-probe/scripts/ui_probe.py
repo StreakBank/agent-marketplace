@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -78,11 +78,11 @@ TOP_KEYS = {"name", "package", "activity", "launch_url", "until_quiet", "quiet",
             "count_sections", "gate", "launch_requests_max", "watch_min_ms"}
 STEP_KEYS = {
     "rest": {"ms", "meminfo", "background", "allow", "watch"},
-    "tap": {"x", "y", "find", "find_settle_ms", "settle_ms", "until_quiet", "quiet"},
+    "tap": {"x", "y", "find", "find_settle_ms", "settle_ms", "until_quiet", "quiet", "scope"},
     "swipe": {"from", "to", "ms", "judge", "settle_ms", "until_quiet", "quiet"},
-    "key": {"code", "settle_ms", "until_quiet", "quiet"},
-    "text": {"text", "settle_ms", "until_quiet", "quiet"},
-    "url": {"url", "settle_ms", "until_quiet", "quiet"},
+    "key": {"code", "settle_ms", "until_quiet", "quiet", "scope"},
+    "text": {"text", "settle_ms", "until_quiet", "quiet", "scope"},
+    "url": {"url", "settle_ms", "until_quiet", "quiet", "scope"},
 }
 COMMON_STEP_KEYS = {"id", "do", "expect"}
 EXPECT_KEYS = {"signature", "frames", "frames_max", "sections_max", "signposts_max", "requests_max"}
@@ -560,6 +560,8 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
         elif do == "url":
             problem = link_problem(step.get("url"), "url")
             need(problem is None, f"step '{sid}': {problem}")
+        if "scope" in step:
+            check_scope(need, step["scope"], f"step '{sid}'")
         if "expect" in step:
             exp = step["expect"]
             need(isinstance(exp, dict), f"step '{sid}': 'expect' must be an object")
@@ -616,6 +618,46 @@ def check_watch(need, scn: dict, step: dict, ms: float) -> None:
                           + ("the scenario's 'watch_min_ms'" if "watch_min_ms" in scn else
                              "a window of exactly one minute can miss a change made once a minute")
                           + f"); this one lasts {ms:g} ms")
+
+
+SCOPE_KEYS = ("control", "may_change", "came_back_ms_min", "move_px_min", "join_level")
+CONTROL_AREA_MAX = 0.25       # a control's box found in a tree is at most this share of the app's area
+
+
+def check_scope(need, scope, where: str) -> None:
+    """A step's scope: {"control": [x0, y0, x1, y1]? (fractions of the app's area), "may_change":
+    [{"region": [x0, y0, x1, y1] | "screen", "reason": "..."}], "came_back_ms_min": n?, "move_px_min": n?}."""
+    unit = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1   # noqa: E731
+    number = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)                 # noqa: E731
+    box_ok = lambda b: isinstance(b, list) and len(b) == 4 and all(unit(v) for v in b) and b[0] < b[2] and b[1] < b[3]  # noqa: E731
+    need(isinstance(scope, dict), f"{where}: 'scope' must be an object")
+    unknown = sorted(k for k in scope if k not in SCOPE_KEYS and not _is_comment(k))
+    need(not unknown, f"{where}: unknown 'scope' keys {unknown}; known: {', '.join(SCOPE_KEYS)}")
+    if "control" in scope:
+        need(box_ok(scope["control"]), f"{where}: 'scope.control' must be [x0, y0, x1, y1], fractions of the app's "
+                                       "area between 0 and 1 with x0 < x1 and y0 < y1")
+    may = scope.get("may_change")
+    need(isinstance(may, list), f"{where}: 'scope.may_change' is required: a list (empty when nothing outside the "
+                                "control may change) of {\"region\": [x0, y0, x1, y1] or \"screen\", \"reason\": ...}")
+    for n, item in enumerate(may, 1):
+        at = f"{where}: 'scope.may_change' item {n}"
+        need(isinstance(item, dict), f"{at} must be an object")
+        unknown = sorted(k for k in item if k not in ("region", "reason") and not _is_comment(k))
+        need(not unknown, f"{at}: unknown keys {unknown}; known: region, reason")
+        need(item.get("region") == "screen" or box_ok(item.get("region")),
+             f"{at}: 'region' must be \"screen\" or [x0, y0, x1, y1], fractions of the app's area with x0 < x1 "
+             "and y0 < y1")
+        need(isinstance(item.get("reason"), str) and item["reason"].strip(),
+             f"{at}: 'reason' is required: say why that part of the screen changes")
+    if "came_back_ms_min" in scope:
+        need(number(scope["came_back_ms_min"]) and scope["came_back_ms_min"] >= 0,
+             f"{where}: 'scope.came_back_ms_min' must be a number of milliseconds of at least 0")
+    if "move_px_min" in scope:
+        need(number(scope["move_px_min"]) and scope["move_px_min"] > 0,
+             f"{where}: 'scope.move_px_min' must be a number of pixels (at 1080 px wide) above 0")
+    if "join_level" in scope:
+        need(number(scope["join_level"]) and 10 <= scope["join_level"] <= 255,
+             f"{where}: 'scope.join_level' must be a number of levels from 10 to 255")
 
 
 def check_regions(need, regions, where: str) -> None:
@@ -2349,6 +2391,8 @@ def replay_lookup(agent: SimAgent, rehearsal: dict, step: dict) -> dict:
         swipes.append({**sw, "reply": reply, "round_trip_ms": round_trip})
         time.sleep(sw["settle_ms"] / 1000)
     return {"x": done["center"][0], "y": done["center"][1], "swipes": swipes, "rehearsal": rehearsal["path"],
+            # the matched element's frame and the screen, in points: the step's control for `scope`
+            "frame": (done.get("match") or {}).get("frame"), "screen": rehearsal["data"].get("screen"),
             "rehearsal_finished": rehearsal["data"]["finished"]}
 
 
@@ -3342,6 +3386,245 @@ def sim_recording_counts(mp4: Path, workdir: Path, step: dict | str, name: str) 
                if k in seg}}
 
 
+# --------------------------------------------------------------------------------------------
+# scope: a change outside the control a step touched
+# --------------------------------------------------------------------------------------------
+
+BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+
+
+CONTROL_TOO_LARGE = ("the clickable element is larger than a quarter of the app's area: declare 'scope.control'")
+
+
+def clickable_box(xml_text: str | None, bounds, area_max: float, find: dict | None = None) -> tuple[list[int] | None, str]:
+    """The control a lookup matched, from the window tree it read. The search starts at the node the
+    lookup matched: among the nodes whose bounds are `bounds`, the deepest whose text (or content
+    description) is the one `find` named, else the deepest of them; a wrapper with the same bounds is
+    passed over. From there it climbs to the first clickable node (the smallest that holds the
+    match): that is the control when its area is at most area_max (pixels), and the box is unknown
+    when it is larger. With no clickable node on the way, the matched node is the control within
+    area_max. (box, where it came from), or (None, why not)."""
+    import xml.etree.ElementTree as ET
+    if not xml_text:
+        return None, "the run holds no window tree of the lookup"
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        return None, f"the lookup's window tree cannot be read ({exc})"
+    parent = {c: n for n in root.iter() for c in n}
+
+    def box_of(node):
+        m = BOUNDS_RE.fullmatch(node.get("bounds") or "")
+        return [int(v) for v in m.groups()] if m else None
+
+    def depth(node):
+        d = 0
+        while node in parent:
+            node, d = parent[node], d + 1
+        return d
+
+    same = [n for n in root.iter("node") if box_of(n) == list(bounds)]
+    if not same:
+        return None, f"no node of the lookup's window tree has the matched bounds {list(bounds)}"
+    find = find or {}
+    named = [n for n in same if ("text" in find and n.get("text") == find["text"])
+             or ("desc" in find and n.get("content-desc") == find["desc"])]
+    node = max(named or same, key=depth)
+    area = lambda b: max(0, b[2] - b[0]) * max(0, b[3] - b[1])      # noqa: E731
+    n = node
+    while n is not None and n.tag == "node":
+        b = box_of(n)
+        if b and n.get("clickable") == "true":
+            if area(b) > area_max:
+                return None, CONTROL_TOO_LARGE
+            return b, ("the matched element, which is clickable" if n is node else
+                       "the smallest clickable ancestor of the matched element")
+        n = parent.get(n)
+    if area(list(bounds)) <= area_max:
+        return list(bounds), "the matched element (nothing clickable holds it)"
+    return None, f"the matched element is larger than {int(CONTROL_AREA_MAX * 100)} % of the app's area"
+
+
+def scope_geometry(scope: dict, width: int, rows: tuple[int, int]) -> tuple[list, bool, float, float]:
+    """The allowed boxes in pixels of the recording, whether the whole screen may change, the move
+    threshold in pixels and the came-back minimum in ms."""
+    app_h = rows[1] - rows[0]
+    to_px = lambda b: [b[0] * width, rows[0] + b[1] * app_h, b[2] * width, rows[0] + b[3] * app_h]   # noqa: E731
+    allowed = [to_px(m["region"]) for m in scope["may_change"] if m["region"] != "screen"]
+    screen = any(m["region"] == "screen" for m in scope["may_change"])
+    move_px = scope.get("move_px_min", None)
+    move_px = (move_px if move_px is not None else _ui_video().OUTSIDE_MOVE_PX) * width / 1080
+    return allowed, screen, move_px, scope.get("came_back_ms_min", _ui_video().OUTSIDE_CAME_BACK_MS)
+
+
+def _ui_video():
+    sys.path.insert(0, str(HERE))
+    import ui_video
+    return ui_video
+
+
+NOT_AT_REST = "the screen was not at rest before the input"
+NOT_AT_REST_REMEDY = "declare it in scope.may_change, or put a rest before this step"
+
+
+def run_outside(out: Path, sid: str, scope: dict, video: Path, size, before, frames, box, source, rows,
+                prior: list[int] | None = None) -> dict:
+    v = _ui_video()
+    allowed, screen, move_px, came_back = scope_geometry(scope, size[0], rows)
+    try:
+        res = v.outside_check(video, size, before, frames, box, allowed, screen, rows, move_px, came_back,
+                              strip=out / "sheets" / f"outside-{sid}.png", prior=prior,
+                              join_level=scope.get("join_level", v.OUTSIDE_JOIN_LEVEL))
+    except v.VideoError as exc:
+        return {"unknown": f"the recording could not be read for it: {exc}", "box_source": source}
+    if res.get("unsettled"):
+        u_ = res["unsettled"]
+        boxes = u_["boxes_px"]
+        place = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
+        return {"unknown": f"{NOT_AT_REST}: it changed at {place} px (frame #{u_['frame']}, within "
+                           f"{v.OUTSIDE_SETTLE_MS} ms of the step's start); {NOT_AT_REST_REMEDY}",
+                "box_source": source, "box_px": res["box_px"], "unsettled": u_}
+    if res.get("strip"):
+        res["strip"] = f"sheets/{res['strip']}"
+    app_h = rows[1] - rows[0]
+    b = res["box_px"]
+    return {**res, "box_source": source, "unknown": None,
+            "box": [round(b[0] / size[0], 4), round((b[1] - rows[0]) / app_h, 4), round(b[2] / size[0], 4),
+                    round((b[3] - rows[0]) / app_h, 4)]}
+
+
+def outside_android(out: Path, scn: dict, result: dict, steps_out: list, facts: dict, marks: dict, mp4: Path) -> None:
+    """The outside check for every step with `scope` of an Android run, into its step record."""
+    v = _ui_video()
+    vblock = result.get("video") or {}
+    by_id = {s["id"]: s for s in scn["steps"]}
+    try:
+        frames = json.loads((out / "video-frames.json").read_text())
+    except (OSError, ValueError):
+        frames = []
+    for rec in steps_out:
+        step = by_id.get(rec["id"])
+        if step is None or "scope" not in step:
+            continue
+        sid, scope = rec["id"], step["scope"]
+
+        def unknown(why, source=None):
+            rec["outside"] = {"unknown": why, "box_source": source}
+
+        if vblock.get("clock") != "recorder-timestamps" or result.get("clock_mismatch_suspected"):
+            unknown("the recording is not aligned with the step marks, so its frames cannot be placed around the input")
+            continue
+        insets = facts.get("stable_insets_top_bottom")
+        if not insets or not facts.get("height") or not facts.get("width"):
+            unknown("the run holds no system-bar insets, so the app's area is unknown")
+            continue
+        width, height = v.probe_size(mp4)
+        rows = v.app_rows(height, insets[0] / facts["height"], insets[1] / facts["height"])
+        sx, sy = width / facts["width"], height / facts["height"]
+        if "control" in scope:
+            c = scope["control"]
+            app_h = rows[1] - rows[0]
+            box, source = [c[0] * width, rows[0] + c[1] * app_h, c[2] * width, rows[0] + c[3] * app_h], "declared"
+        elif "find" in step:
+            found = rec.get("find") or {}
+            app_area = facts["width"] * (facts["height"] - insets[0] - insets[1])
+            box, source = clickable_box(_read_raw(out / "raw", f"ui-{sid}.xml"), found.get("bounds_px") or [],
+                                        CONTROL_AREA_MAX * app_area, step["find"])
+            if box is not None:
+                box = [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy]
+        else:
+            box, source = None, "no 'scope.control' declared, and the step names no element"
+        if box is None:
+            unknown(f"the control's box is unknown: {source}", source)
+            continue
+        start, end = marks.get(f"{sid}.start"), marks.get(f"{sid}.end")
+        before = [f for f in frames if start is not None and f["t"] < start]
+        if not before or end is None:
+            unknown("no recorded frame lies before the input", source)
+            continue
+        after = [(f["i"], (f["t"] - start) * 1000) for f in frames if start <= f["t"] < end]
+        # The frames of the half second before the input, after the last one before it: the screen must
+        # be at rest there, or a change of the step before would be taken for this step's.
+        settle = start - v.OUTSIDE_SETTLE_MS / 1000
+        prior = [f["i"] for f in before if f["t"] >= settle]
+        earlier = [f for f in before if f["t"] < settle]
+        prior = ([earlier[-1]["i"]] if earlier else []) + prior
+        rec["outside"] = run_outside(out, sid, scope, mp4, (width, height), before[-1]["i"], after, box, source, rows,
+                                     prior)
+
+
+def outside_sim(out: Path, step: dict, rec: dict, mp4: Path) -> dict:
+    """The outside check for a step with `scope` on the iOS Simulator: the step's own recording, whose
+    first frame is the screen before the input; the control is the declared box or the rehearsal
+    match's frame."""
+    v = _ui_video()
+    scope = step["scope"]
+    if not mp4.exists() or not (rec.get("recording") or {}) or (rec.get("recording") or {}).get("error"):
+        return {"unknown": "the step has no usable recording", "box_source": None}
+    try:
+        frames = json.loads((out / "video" / step["id"] / "video-frames.json").read_text())
+    except (OSError, ValueError):
+        return {"unknown": "the step's recording was not analysed", "box_source": None}
+    width, height = v.probe_size(mp4)
+    rows = v.app_rows(height, SIM_BARS_PERMILLE[0] / 1000, SIM_BARS_PERMILLE[1] / 1000)
+    if "control" in scope:
+        c = scope["control"]
+        app_h = rows[1] - rows[0]
+        box, source = [c[0] * width, rows[0] + c[1] * app_h, c[2] * width, rows[0] + c[3] * app_h], "declared"
+    else:
+        resolved = rec.get("resolved") or {}
+        frame, screen = resolved.get("frame"), resolved.get("screen")
+        if not (isinstance(frame, list) and len(frame) == 4 and isinstance(screen, list) and len(screen) == 2
+                and screen[0]):
+            return {"unknown": "the control's box is unknown: no 'scope.control' declared, and the run holds no "
+                               "rehearsal frame of the element", "box_source": None}
+        k = width / screen[0]
+        box = [frame[0] * k, frame[1] * k, (frame[0] + frame[2]) * k, (frame[1] + frame[3]) * k]
+        source = "the rehearsal's match"
+    if len(frames) < 1:
+        return {"unknown": "the step's recording holds no frame", "box_source": source}
+    t0 = frames[0]["pts"]
+    after = [(f["i"], (f["pts"] - t0) * 1000) for f in frames[1:]]
+    return run_outside(out, step["id"], scope, mp4, (width, height), frames[0]["i"], after, box, source, rows)
+
+
+def gate_outside(fail, notes: list, sid: str, step: dict, s: dict) -> None:
+    """A step with `scope` against its outside check (check 'outside'): unknown fails, and so does each
+    of the four rules."""
+    if "scope" not in step:
+        return
+    o = s.get("outside")
+    if o is None:
+        fail("outside", sid, "the run holds no outside check for this step (an analysis from before 0.10.0, or one "
+             "made with another scenario): run `ui-probe analyze`")
+        return
+    if o.get("unknown"):
+        fail("outside", sid, f"unknown: {o['unknown']}")
+        return
+    look = f" (sheets/outside-{sid}.png)" if o.get("strip") else ""
+    if o["fails"]["moved"]:
+        c = o["control"]
+        fail("outside", sid, f"the control moved: its content shifted by {c['shift']} px between the frame before the "
+             f"input and the step's end ({o['box_source']}; the limit is {o['move_px']:g} px)" + look,
+             rule="moved", observed=c["shift"])
+    for c in o["changes"]:
+        if c["ended"] != "came back":
+            fail("outside", sid, f"a change outside the control is still there at the step's end: {c['box_px']} px, "
+                 f"from {c['start_ms']:.0f} ms after the input" + look, rule="still_there", box_px=c["box_px"])
+        elif not c["below_the_hand"]:
+            fail("outside", sid, f"a change outside the control came back after {c['duration_ms']:.0f} ms (the limit is "
+                 f"{o['came_back_ms_min']:g} ms): {c['box_px']} px, from {c['start_ms']:.0f} ms after the input" + look,
+                 rule="came_back", observed=c["duration_ms"], box_px=c["box_px"])
+        else:
+            notes.append(f"{sid}: a change outside the control came back after {c['duration_ms']:.0f} ms, under the "
+                         f"{o['came_back_ms_min']:g} ms limit: below the hand ({c['box_px']} px)")
+    if o["slid"]:
+        first = o["slid"][0]
+        fail("outside", sid, f"a band outside the control slid by {first['shift_px']} px at {first['t_ms']:.0f} ms "
+             f"after the input ({len(o['slid'])} times in all; the limit is {o['move_px']:g} px)" + look,
+             rule="slid", observed=first["shift_px"], box_px=first["box_px"])
+
+
 def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
     raw = out / "raw"
     launched = _read_raw(raw, "launch.txt")
@@ -3393,6 +3676,8 @@ def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
                           "round_trip_ms": data.get("round_trip_ms"), "end_ping": data.get("end_ping")}}),
             **({} if "resolved" not in data else {"resolved": data["resolved"]}),
             **({} if "url_open" not in data else {"url_open": data["url_open"]})})
+        if "scope" in step:
+            steps_out[-1]["outside"] = outside_sim(out, step, steps_out[-1], mp4)
         prev = pid_now if pid_now is not None else prev
     result = {
         "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": SIM_PLATFORM,
@@ -3549,6 +3834,7 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                          "missed its target; give the step expect.signature '-' if nothing is meant to change",
                          observed=got)
             gate_requests(fail, notes, r, sid, s, step, opts, rest=False)
+            gate_outside(fail, notes, sid, step, s)
             if "signature" in expect:
                 got = None if rec is None or rec.get("error") else rec.get("signature")
                 if got is None:
@@ -4065,6 +4351,8 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
             import ui_video
             try:
                 result["video"] = ui_video.analyze(mp4, out, frames, marks, scn, facts)
+                if any("scope" in st for st in scn["steps"]):
+                    outside_android(out, scn, result, steps_out, facts, marks, mp4)
             except ui_video.UnusableRecording as exc:
                 result["video_error"] = str(exc)
             except ui_video.VideoError as exc:
@@ -5423,6 +5711,8 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 fail("sections", sid, msg)
             elif got > limit:
                 fail("sections", sid, f"{got} '{name}' sections, approved at most {limit}", observed=got, allowed=limit)
+        if step is not None:
+            gate_outside(fail, notes, sid, step, s)
         gate_requests(fail, notes, r, sid, s, step if step is not None else launch_budget(scn), opts,
                       rest=s["kind"] == "rest")
     for sid in records:
