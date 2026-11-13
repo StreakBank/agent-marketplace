@@ -101,6 +101,25 @@ OUTSIDE_JOIN_LEVEL = 30       # only pixels changed by more than this join withi
                               # its pixels far more, encoder noise on dense text (libx264 at crf 23) mostly less
 OUTSIDE_SETTLE_MS = 500       # the screen must not change outside the control in this long before the input
 OUTSIDE_TEXTURE = 4.0         # a patch whose grey spreads less than this (standard deviation) has no shift to find
+# The control's own move is judged by the zero-mean normalised cross-correlation (-1 to 1) of the gradient
+# magnitude of its grey patch: a tapped control changes its look (a selected chip turns bold and dark),
+# which a difference of grey levels takes for a poor match while the shape of its edges still correlates.
+# Measured on a day strip on an Android 14 emulator whose tapped chip moves 70 px and changes its look
+# (18 steps): 0.866 to 0.901 at the move, one place each, its next local best 0.312 or more under it, no
+# shift -0.050 to 0.128, the new place before the input -0.040 to 0.102. A switch flipped among identical
+# switches (8 steps): the neighbours 171 px away correlate as much as they did there before the input
+# (0.987 or 0.728) and are dropped; the best left is at no shift (0.727 to 0.728).
+OUTSIDE_MOVE_MEASURE = "zero-mean normalised cross-correlation of the grey patch's gradient magnitude"
+OUTSIDE_MOVE_CORR_MIN = 0.7   # the correlation at the move reaches at least this
+OUTSIDE_MOVE_MARGIN = 0.15    # places within this of the best are alike; no shift and a lookalike already there
+                              # before the input lie at least (more than) this under it
+OUTSIDE_MOVE_GONE_SHARE = 0.5 # and no shift keeps at most this share of the best, or at most the margin over what
+                              # it would keep had everything around moved too: content scrolling behind a still
+                              # control (0.501 at no shift against 0.708, 0.233 expected) is not the control moving
+OUTSIDE_MOVE_ARRIVE_SHARE = 0.5  # the new place's part outside the old box keeps this share of the leading part's
+                              # edges: a switch's knob sliding inside its still box leaves that part empty (11.5 to 0)
+OUTSIDE_MOVE_SUSPECT_MIN = 0.4  # from this up to the minimum, a move that holds by every other rule is said, not failed
+OUTSIDE_MOVE_PEAK_MIN = 0.2   # peaks of the search under this correlation are not kept
 PER_PAGE = 24                 # frames on one page of a distinct sheet
 PAGE_COLS = 6
 
@@ -1319,25 +1338,11 @@ def find_shift(a: np.ndarray, b: np.ndarray, box, limit: int) -> dict:
             return None
         return float(np.abs(b[y0 + dy:y1 + dy, x0 + dx:x1 + dx] - patch).mean())
 
-    f = max(1, int(round(w / 540)))
-    sa, sb = a[::f, ::f], b[::f, ::f]
-    bx0, by0, bx1, by1 = x0 // f, y0 // f, max(x0 // f + 1, x1 // f), max(y0 // f + 1, y1 // f)
-    sp = sa[by0:by1, bx0:bx1]
-    sh, sw = sb.shape
-    best, where = None, (0, 0)
-    scores = []
-    for axis in ("y", "x"):
-        for d in range(-(limit // f), limit // f + 1):
-            dx, dy = (d, 0) if axis == "x" else (0, d)
-            if by0 + dy < 0 or by1 + dy > sh or bx0 + dx < 0 or bx1 + dx > sw:
-                continue
-            v = float(np.abs(sb[by0 + dy:by1 + dy, bx0 + dx:bx1 + dx] - sp).mean())
-            scores.append((v, dx * f, dy * f))
-            if best is None or v < best:
-                best, where = v, (dx * f, dy * f)
+    scores, where, at_limit, f, _limits = _axis_search(a, b, (x0, y0, x1, y1), limit,
+                                                       lambda p, q: -float(np.abs(q - p).mean()))
     # The best score among shifts away from the best one (more than two steps of the search, or on the
     # other axis): content that repeats matches there as well, and then no shift can be told.
-    far = [v for v, dx, dy in scores if (dx, dy) != (0, 0)
+    far = [-s for s, dx, dy in scores if (dx, dy) != (0, 0)
            and not (abs(dx - where[0]) <= 2 * f and abs(dy - where[1]) <= 2 * f)]
     second = min(far) if far else None
     still = score(0, 0)
@@ -1350,14 +1355,225 @@ def find_shift(a: np.ndarray, b: np.ndarray, box, limit: int) -> dict:
             if v is not None and v < best:
                 best, shift = v, (dx, dy)
     return {"shift": [int(shift[0]), int(shift[1])], "still": round(still, 3), "best": round(best, 3), "flat": False,
-            "second": None if second is None else round(second, 3)}
+            "second": None if second is None else round(second, 3), "at_search_limit": at_limit}
+
+
+def _axis_search(a: np.ndarray, b: np.ndarray, box, limit: int, score) -> tuple[list, tuple[int, int], bool, int, set]:
+    """The coarse half of a shift search: every vertical and horizontal shift of box's content from a
+    into b of at most `limit` px, at about half resolution (a step of f px), scored by score(patch of a,
+    patch of b), higher is better. Returns [(score, dx, dy)], the best shift (dx, dy) in pixels, whether
+    it lies at a limit, f, and the set of shifts (dx, dy) in pixels that lie at a limit. A limit is an
+    end of an axis where the search could not see whether a farther shift is better still: the search
+    limit, or the frame's edge when the patch one step farther, cut off by the edge, scores at least as
+    well on what is left of it. A patch that fits the frame exactly and scores less one step farther
+    is no limit: the content lies against the edge."""
+    x0, y0, x1, y1 = box
+    f = max(1, int(round(a.shape[1] / 540)))
+    sa, sb = a[::f, ::f], b[::f, ::f]
+    bx0, by0, bx1, by1 = x0 // f, y0 // f, max(x0 // f + 1, x1 // f), max(y0 // f + 1, y1 // f)
+    sp = sa[by0:by1, bx0:bx1]
+    sh, sw = sb.shape
+    best, where = None, (0, 0)
+    scores, ends, at = [], {}, {}
+    for axis in ("y", "x"):
+        for d in range(-(limit // f), limit // f + 1):
+            dx, dy = (d, 0) if axis == "x" else (0, d)
+            if by0 + dy < 0 or by1 + dy > sh or bx0 + dx < 0 or bx1 + dx > sw:
+                continue
+            lo, hi = ends.get(axis, (d, d))
+            ends[axis] = (min(lo, d), max(hi, d))
+            v = score(sp, sb[by0 + dy:by1 + dy, bx0 + dx:bx1 + dx])
+            at[(axis, d)] = v
+            scores.append((v, dx * f, dy * f))
+            if best is None or v > best:
+                best, where = v, (dx * f, dy * f)
+
+    def cut(axis, d):
+        """The score one step past an end cut off by the frame: on the part of the patch still inside."""
+        dx, dy = (d, 0) if axis == "x" else (0, d)
+        ya, yb = max(0, -(by0 + dy)), min(by1 - by0, sh - by0 - dy)
+        xa, xb = max(0, -(bx0 + dx)), min(bx1 - bx0, sw - bx0 - dx)
+        if yb - ya < 2 or xb - xa < 2:
+            return None
+        return score(sp[ya:yb, xa:xb], sb[by0 + dy + ya:by0 + dy + yb, bx0 + dx + xa:bx0 + dx + xb])
+
+    limits = set()
+    for axis, (lo, hi) in ends.items():
+        for d, step in ((lo, -1), (hi, 1)):
+            if d == 0:
+                continue
+            if abs(d) >= limit // f:
+                hit = True
+            else:
+                beyond = cut(axis, d + step)
+                hit = beyond is None or beyond >= at[(axis, d)]
+            if hit:
+                limits.add((d * f, 0) if axis == "x" else (0, d * f))
+    return scores, where, where in limits, f, limits
+
+
+def gradient_magnitude(g: np.ndarray) -> np.ndarray:
+    """The gradient magnitude of a grey frame by central differences (levels a pixel; 0 at the border)."""
+    gx = np.zeros_like(g, dtype=np.float32)
+    gy = np.zeros_like(g, dtype=np.float32)
+    gx[:, 1:-1] = g[:, 2:] - g[:, :-2]
+    gy[1:-1] = g[2:] - g[:-2]
+    return np.hypot(gx, gy) * 0.5
+
+
+def _ncc(p: np.ndarray, q: np.ndarray) -> float:
+    """The zero-mean normalised cross-correlation of two patches of one size: 1 the same shape at any
+    contrast, 0 unrelated, -1 inverted; 0 when either is plain."""
+    p = p - p.mean()
+    q = q - q.mean()
+    d = float(np.sqrt(float((p * p).sum()) * float((q * q).sum())))
+    return float((p * q).sum()) / d if d > 0 else 0.0
+
+
+def find_move(a: np.ndarray, b: np.ndarray, box, limit: int) -> dict:
+    """Where the content of box in grey frame a (before the input) lies in grey frame b (the step's end),
+    by OUTSIDE_MOVE_MEASURE, which a change of the content's look (bolder, darker, another colour,
+    inverted) leaves high: every vertical and horizontal shift of at most `limit` px, at about half
+    resolution. Returns 'peaks': each shift where the correlation is highest among its neighbours on
+    its axis and reaches OUTSIDE_MOVE_PEAK_MIN, refined at full resolution, with its correlation, the
+    correlation in frame a of the content with that place ('already_there': what stood there before the
+    input), what no shift would keep had everything around the control moved by that shift too
+    ('no_shift_if_moved': in frame a, the content against the place as far on the other side), the
+    spread of the gradient magnitude of the control's leading part (as deep as the shift) before the
+    input and of the part of the new place outside the old box at the step's end ('texture_ahead') and
+    whether it lies at a limit of the search ('at_search_limit'); the correlation at no shift
+    ('at_no_shift'); and 'flat' (a patch with no texture). judge_move reads them."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    h, w = a.shape
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+    out = {"measure": OUTSIDE_MOVE_MEASURE, "flat": True, "at_no_shift": None, "peaks": []}
+    if x1 <= x0 or y1 <= y0 or float(a[y0:y1, x0:x1].std()) < OUTSIDE_TEXTURE:
+        # A plain patch matches every plain area as well as its own place: no shift can be told.
+        return out
+    ga, gb = gradient_magnitude(a), gradient_magnitude(b)
+    patch = ga[y0:y1, x0:x1]
+
+    def corr(frame, dx, dy):
+        if y0 + dy < 0 or y1 + dy > h or x0 + dx < 0 or x1 + dx > w:
+            return None
+        return _ncc(patch, frame[y0 + dy:y1 + dy, x0 + dx:x1 + dx])
+
+    def ahead(dx, dy):
+        """The spread of the edges of the control's leading part (as deep as the shift, at most the box)
+        before the input, and of the part of the NEW box (the old one moved by the shift) that lies
+        outside the old box, at the step's end: for a move longer than the box, all of the new box."""
+        if dx:
+            n = min(abs(dx), x1 - x0)
+            src = patch[:, :n] if dx < 0 else patch[:, -n:]
+            dst = gb[y0:y1, x0 + dx:x0 + dx + n] if dx < 0 else gb[y0:y1, x1 + dx - n:x1 + dx]
+        else:
+            n = min(abs(dy), y1 - y0)
+            src = patch[:n] if dy < 0 else patch[-n:]
+            dst = gb[y0 + dy:y0 + dy + n, x0:x1] if dy < 0 else gb[y1 + dy - n:y1 + dy, x0:x1]
+        return [round(float(src.std()), 3), round(float(dst.std()), 3) if dst.size else 0.0]
+
+    scores, _where, _at, f, limits = _axis_search(ga, gb, (x0, y0, x1, y1), limit, _ncc)
+    r = lambda x: None if x is None else round(x, 3)   # noqa: E731
+    peaks = {}
+    for axis in ("x", "y"):
+        line = sorted(((dx if axis == "x" else dy), v) for v, dx, dy in scores if (dy if axis == "x" else dx) == 0)
+        for i, (d, v) in enumerate(line):
+            left = line[i - 1][1] if i else -2.0
+            right = line[i + 1][1] if i + 1 < len(line) else -2.0
+            if v < OUTSIDE_MOVE_PEAK_MIN or v < left or v < right:
+                continue
+            best, shift = None, None
+            for e in range(d - f, d + f + 1):
+                dx, dy = (e, 0) if axis == "x" else (0, e)
+                if abs(e) > limit:
+                    continue
+                c = corr(gb, dx, dy)
+                if c is not None and (best is None or c > best):
+                    best, shift = c, (dx, dy)
+            if shift is None or (shift in peaks and peaks[shift]["correlation"] >= r(best)):
+                continue
+            peaks[shift] = {"shift": [int(shift[0]), int(shift[1])], "correlation": r(best),
+                            "already_there": r(corr(ga, *shift)),
+                            "no_shift_if_moved": r(corr(ga, -shift[0], -shift[1])),
+                            "texture_ahead": ahead(*shift) if shift != (0, 0) else None,
+                            "at_search_limit": ((d, 0) if axis == "x" else (0, d)) in limits}
+    out.update(flat=False, at_no_shift=r(corr(gb, 0, 0)),
+               peaks=sorted(peaks.values(), key=lambda p: (-p["correlation"], p["shift"])))
+    return out
+
+
+def judge_move(c: dict, move_px: float) -> dict:
+    """What a find_move result says, on the rounded measures run.json keeps (a reader can repeat it).
+    The places: the peaks left after dropping each one at least move_px from no shift whose content
+    already stood there before the input (its correlation then within OUTSIDE_MOVE_MARGIN of now: a
+    switch flipped among switches like it matches its neighbour, which was there all along), and of
+    those, the ones within the margin of the best. The shift is the place nearest to no shift. The
+    control moved when the best reaches OUTSIDE_MOVE_CORR_MIN, it is gone from its place, no place lies
+    nearer than move_px to no shift, the shift is no limit of the search, and something arrived there:
+    the part of the new place outside the old box holds at least OUTSIDE_MOVE_ARRIVE_SHARE of the edge
+    spread the control's leading part had (a knob that slides inside a still switch leaves that part
+    empty). Gone: no shift correlates
+    the margin or more under the best, and at most OUTSIDE_MOVE_GONE_SHARE of it or at most the margin
+    over what it would keep had everything around moved by the shift too (a short move of a strip
+    overlaps its old place; content scrolling behind a still control leaves the control at its place,
+    well over that). The same with the best from
+    OUTSIDE_MOVE_SUSPECT_MIN up to the minimum is 'suspected': said, not failed."""
+    out = {"shift": [0, 0], "correlation": None, "best_correlation": None, "places": 0, "lookalikes": 0,
+           "already_there": None, "no_shift_if_moved": None, "texture_ahead": None, "arrived": False,
+           "at_search_limit": False, "gone": False, "moved": False, "suspected": False}
+    if c.get("flat") or not c.get("peaks"):
+        return out
+    m = OUTSIDE_MOVE_MARGIN
+    near = lambda p: max(abs(p["shift"][0]), abs(p["shift"][1])) < move_px   # noqa: E731
+    kept = [p for p in c["peaks"] if near(p) or p["already_there"] is None
+            or round(p["correlation"] - p["already_there"], 3) > m]
+    out["lookalikes"] = len(c["peaks"]) - len(kept)
+    if not kept:
+        return out
+    best = max(p["correlation"] for p in kept)
+    places = [p for p in kept if round(best - p["correlation"], 3) < m]
+    p = min(places, key=lambda q: (max(abs(q["shift"][0]), abs(q["shift"][1])), -q["correlation"]))
+    z = c["at_no_shift"]
+    echo = p.get("no_shift_if_moved")
+    gone = round(best - z, 3) >= m and (z <= round(OUTSIDE_MOVE_GONE_SHARE * best, 3)
+                                        or (echo is not None and round(z - echo, 3) <= m))
+    lead = p.get("texture_ahead")
+    arrived = lead is None or lead[1] >= round(OUTSIDE_MOVE_ARRIVE_SHARE * lead[0], 3)
+    told = gone and arrived and not any(near(q) for q in places) and not p["at_search_limit"]
+    out.update(shift=p["shift"], correlation=p["correlation"], best_correlation=best, places=len(places),
+               already_there=p["already_there"], no_shift_if_moved=echo, at_search_limit=p["at_search_limit"],
+               texture_ahead=lead, gone=gone, arrived=arrived,
+               moved=bool(told and best >= OUTSIDE_MOVE_CORR_MIN),
+               suspected=bool(told and OUTSIDE_MOVE_SUSPECT_MIN <= best < OUTSIDE_MOVE_CORR_MIN))
+    return out
+
+
+def control_moved(c: dict, move_px: float) -> bool:
+    """Whether a find_move result says the control moved (judge_move)."""
+    return judge_move(c, move_px)["moved"]
 
 
 def moved(found: dict, move_px: float) -> bool:
-    """Whether a find_shift result says the content moved by move_px or more."""
-    return (not found.get("flat") and found["still"] > OUTSIDE_STILL_SCORE
+    """Whether a find_shift result says the content moved by move_px or more (a slide: content that slid
+    without changing matches closely), to a shift short of the farthest searched."""
+    return (not found.get("flat") and not found.get("at_search_limit") and found["still"] > OUTSIDE_STILL_SCORE
             and found["best"] <= min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * found["still"])
             and max(abs(found["shift"][0]), abs(found["shift"][1])) >= move_px)
+
+
+def source_change(now: np.ndarray, before: np.ndarray, box, shift) -> float:
+    """How much the place a slide's content came from (box moved by shift, in the frame before) changed
+    between the frame before and now, by the slides' own measure (mean absolute difference, levels). A
+    slide leaves its source: vacated, overwritten by what follows, or (a short slide) holding the
+    content moved on. A source that still holds what it held is something that stayed, and the new
+    content beside it a lookalike of it."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    dx, dy = shift
+    h, w = before.shape
+    sx0, sy0, sx1, sy1 = max(0, x0 + dx), max(0, y0 + dy), min(w, x1 + dx), min(h, y1 + dy)
+    if sx1 <= sx0 or sy1 <= sy0:
+        return 0.0
+    return round(float(np.abs(now[sy0:sy1, sx0:sx1] - before[sy0:sy1, sx0:sx1]).mean()), 3)
 
 
 def unique(found: dict) -> bool:
@@ -1474,28 +1690,31 @@ def outside_check(video: Path, size: tuple[int, int], before: int, frames: list[
             grey = _grey(frame)
             for size_, gbox in sorted(groups, key=lambda g: -g[0])[:OUTSIDE_SLIDE_GROUPS]:
                 # Where the new content of the changed band came from in the frame before: content that
-                # was already elsewhere on a screen that repeats (a list) is not taken for a slide.
+                # was already elsewhere on a screen that repeats (a list) is not taken for a slide, nor
+                # is content whose source still holds it (a digit typed beside a digit like it).
                 found = find_shift(grey, b_grey, gbox, OUTSIDE_SEARCH_PX)
                 if moved(found, move_px) and unique(found):
-                    slid.append({"i": i, "t_ms": rec["t_ms"], "box_px": gbox,
-                                 "shift_px": [-found["shift"][0], -found["shift"][1]], "px": size_})
+                    left = source_change(grey, b_grey, gbox, found["shift"])
+                    if left > min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * found["still"]):
+                        slid.append({"i": i, "t_ms": rec["t_ms"], "box_px": gbox,
+                                     "shift_px": [-found["shift"][0], -found["shift"][1]], "px": size_,
+                                     "source_change": left})
             if px > most[0]:
                 most = (px, i, frame)
         seen.append(rec)
         last = (i, frame)
     end_i, end_frame = last if last is not None else (before, b_frame)
-    control = find_shift(b_grey, _grey(end_frame), box, OUTSIDE_SEARCH_PX)
-    # A move needs the control's content found at one place only at the step's end (another shift as
-    # close is a lookalike), gone from its old place, and not already at the new place before the input:
-    # a switch that changed its own look among switches like it did not move.
-    already = None
-    if not control.get("flat") and control["shift"] != [0, 0]:
-        dx, dy = control["shift"]
-        already = round(float(np.abs(b_grey[y0 + dy:y1 + dy, x0 + dx:x1 + dx] - b_grey[y0:y1, x0:x1]).mean()), 3)
-    control["already_there"] = already
-    tolerance = min(OUTSIDE_MATCH_MAX, OUTSIDE_MATCH_RATIO * control["still"])
-    control["moved"] = bool(moved(control, move_px) and unique(control)
-                            and already is not None and already > tolerance)
+    if screen:
+        # The whole screen may change (a navigation): the control may go with it.
+        control = {"judged": False, "moved": False, "suspected": False,
+                   "not_judged": "the whole screen may change (may_change holds \"screen\"), so the control's move "
+                                 "is not judged"}
+    else:
+        # A move needs the control's content found at one place only at the step's end (another shift as
+        # close is a lookalike), gone from its old place, and not already at the new place before the
+        # input: a switch that changed its own look among switches like it did not move.
+        control = find_move(b_grey, _grey(end_frame), box, OUTSIDE_SEARCH_PX)
+        control.update(judge_move(control, move_px), judged=True)
     changes, cur = [], None
     for rec in seen:
         if rec["groups"]:

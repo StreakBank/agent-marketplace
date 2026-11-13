@@ -1,5 +1,107 @@
 # Changelog — ui-probe
 
+## 0.11.0 (2026-11-13)
+
+The recorder of a cabled iPhone's screen.
+
+- `ui-probe phone list` and `ui-probe phone record --seconds N --out DIR --go "..." --build "..."
+  [--device <id-prefix>]`: `DIR/film.json` is written before the recording starts (the go, the
+  build, the seconds asked, the tool's version) and completed after it (the device's name and
+  model, UTC start and stop, the seconds recorded, the exit status); the film is `DIR/screen.mov`.
+- The recorder is `scripts/phone_screen.swift`, adapted from a working recorder: compiled with
+  `swiftc` on first use into a cache keyed by the source's SHA-256; no binary ships; the installer
+  copies the source. `doctor --phone` checks for macOS and `swiftc`.
+- Held in code and by tests: the picture only (the video ports, else the muxed ports when the phone
+  offers no video port, as the recorder that first filmed a phone did; an audio port never; which
+  were offered and which connected go into `film.json`; after the recording the film's sound tracks
+  are counted, and a film that holds sound, or could not be checked, fails the run and is left for
+  the person who ran it to delete); no
+  process started and no device managed by the recorder; a module that imports nothing of the rest
+  of ui-probe and that no other verb calls; no watch mode; `--go` and `--build` required and never
+  read from the environment or a file; a hard cap of 300 s in both languages; more than one phone
+  refused without `--device` (the recorder takes one exact id and no longer falls back to the
+  first); an existing output refused (the recorder no longer deletes it); any system but macOS
+  refused.
+- The Mac posts a notification when a recording starts, and nothing is recorded if it cannot;
+  `list` and `record` say that the phone's status bar reads 9:41 while it is recorded. Both are owner
+  rulings. The notice's text reaches AppleScript as an argument, so the owner's words arrive as they
+  are (curly quotes and dashes broke the first form).
+- `film.json` is written to a temporary file and renamed over, records `interrupted` on Ctrl-C or a
+  signal, and holds the recorder's SHA-256 and the media types of the ports the phone offered. The
+  cached binary's SHA-256 is kept in `built.ok` and checked before every run: a replaced binary is
+  compiled again or refused, never run. A device that is not an iPhone or iPad is recorded only when
+  `--device` names it; a lock file created only if absent keeps two runs out of one folder.
+- The static tests are allow-lists: the phone module's only process calls are three
+  `subprocess.run` and the recorder's one `subprocess.Popen`, and the Swift source imports only
+  AVFoundation, CoreMediaIO and Foundation, with a deny-list for process, loading and scripting calls.
+- `phone record` keeps the phone in ONE recorder process from the listing to the end of the
+  recording: the recorder waits for a phone up to 60 s, offers its devices as one line
+  (`{"offered": [...]}`), and records only the id `ui-probe` writes to its stdin after `film.json`
+  and the notice; a refusal or a failed notice closes its stdin (exit 11, nothing recorded). The
+  first live run found that a phone a process saw is not offered to the next process for about 11
+  to 32 s after it exits (one iPhone, one Mac), so listing and recording in two processes failed
+  with no phone offered; `list` and `record` now say so when they find no phone. After the id,
+  `ui-probe` keeps the recorder's stdin open until the recorder ends, and the recorder stops its
+  recording at once when its stdin ends (exit 12): a recorder whose starter was killed no longer
+  records to the end.
+- `phone record`, second review: the recorder lists every track of the finalised film and counts
+  as sound every audio track, every muxed track and every audible track (`tracks`,
+  `audio_tracks`); a film the movie output has not reported finished is never checked and fails
+  with exit 10; the count waits at most 20 s, turning the run loop. The lock is taken before
+  compiling and listing, the folder must then hold only the lock, and `film.json` is created only
+  if it does not exist. `film.json` always says `sound_checked` and `film_on_disk`; exits 8, 9 and
+  10 are mapped without a summary; a summary that is not a JSON object, a Ctrl-C while the notice
+  is posted, and a zero that is not the integer 0 can no longer leave "recording" or "done".
+  `--go` needs a letter or digit, `--build` three words that each hold one. Whenever a film is on
+  disk that holds sound or was not checked, the command asks whoever ran it to delete it.
+- `phone record`, third review: `--go` and `--build` need a letter or digit of any script by
+  Unicode category, and the Hangul fillers (U+115F, U+1160, U+3164, U+FFA0) count as none. The
+  count's 20 s bound is a deadline by the clock, and each turn waits on the count itself before
+  turning the run loop. Ctrl-C after the recorder returned leaves `film.json` "interrupted" with
+  `film_on_disk` as it is. A film is "done" only when its `tracks` hold `vide` and neither `soun`
+  nor `muxx`, and the recorder exits 9 ("the film holds no picture track") for a film with no
+  picture track.
+- `phone record`, last review notes: the Egyptian hieroglyph full and half blanks (U+13441,
+  U+13442) are invisible letters too. The README says what the check is: it refuses a statement
+  with nothing a person can read in it, and cannot tell a true statement from a false one. A
+  Ctrl-C after `film.json`'s final status was written keeps that record as it is (the delete
+  advice is still printed when it applies).
+
+Fixed:
+
+- The check `outside`, rule (a): the control's move is judged by the zero-mean normalised
+  cross-correlation of its grey patch's gradient magnitude, which a tapped control's change of look
+  (bolder, another colour, inverted) leaves high. Each local best of the search is a place; a place
+  whose content already stood there before the input is a lookalike and is dropped; the shift told
+  is the place within 0.15 of the best nearest to the old one. A move needs a best of at least 0.7,
+  no place nearer than `move_px_min` to the old one, the old place gone (0.15 or more under the
+  best, and at most half of it or at most 0.15 over what it would keep had everything around moved
+  too), something arrived at the new place (the part of the new box outside the old one holds at
+  least half the edge spread of the control's leading part), and a shift short of the farthest searched (300 px, or the frame's edge where the patch
+  would be cut off). Up to 0.10.0 a mean difference of grey levels judged it and never told the
+  case it was made for: a day strip on an Android 14 emulator whose tapped chip moves 70 px and
+  turns bold (18 of 18 steps missed; all 18 told now, and a switch flipped among identical
+  switches, 8 steps, still not moved). A second review fixed: a still icon over a list that
+  scrolled was told as moved; a strip moved sideways among its lookalike chips, and a chip moved
+  against the frame's edge, were missed. A third: what arrived was first read just past the old box,
+  the gap for a move longer than the control, so a 24 px icon moved 70 px and a 60 px label moved
+  150 to 280 px were missed; it is read in the new box.
+- A move that holds by every rule but with a best from 0.4 up to 0.7 is suspected: `run.json`
+  says `suspected: true` and the gate prints a note, not a failure ("the control may have moved
+  by ..."). `run.json`'s `control` holds the peaks, the judgement and its measures (`shift`,
+  `correlation`, `best_correlation`, `places`, `lookalikes`, `at_no_shift`, `already_there`,
+  `no_shift_if_moved`, `texture_ahead`, `gone`, `arrived`, `at_search_limit`, `moved`,
+  `suspected`); `still`, `best` and `second` are gone from it.
+- With `"screen"` in `may_change` the control's move is not judged (`judged: false` and the reason
+  in `not_judged`), and the gate does not fail the step for it.
+- A slide (rule c) whose best shift is the farthest searched (300 px, or the frame's edge where the
+  band would be cut off) is not told: on the day strip above, a band was reported sliding by
+  exactly 300 px in 19 to 34 frames of a step.
+- A slide (rule c) whose source still holds what it held before the input is not told: on a real
+  clip a counter's "0" turned "2", a copy of the "2" of "24" 52 px beside it, which never moved, and
+  was reported as a slide of 52 px. The source must change by more than the slide's tolerance; each
+  slide told records `source_change`.
+
 ## 0.10.0 (2026-11-13)
 
 A check for what a step changed outside the control it touched.

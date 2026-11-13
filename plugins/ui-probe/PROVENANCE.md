@@ -851,6 +851,385 @@ rule), over the minimum of 78; that screen is not used in the tests and is said 
 Not established by this version's author: the check on any real recording, the defaults (50 ms,
 8 px, 25 %) on real screens, and a step whose control resizes itself.
 
+### Validation, 0.11.0
+
+**What the author of this version ran, on macOS 26 (Python 3, Swift 6.2.4), on 2026-11-13: single
+test files, planted faults in scratch copies, one compile of the Swift source, and the repository's
+coupling check. No recording, no camera device opened, no phone, no notification posted.** The
+compiled recorder was never run: every behavioural test hands the Python module a stand-in recorder
+(a short Python script) and a stand-in `osascript` on PATH. The live recording is the lead's, on the
+owner's go, after review.
+
+The Swift source is adapted from a recorder another lead wrote and ran on a real iPhone for 113 s
+(read only, not edited or run here). What changed from it: the device is chosen by the Python module
+from the recorder's `list` and handed to it by its whole id, so more than one phone is refused
+without `--device` instead of the first being recorded; an existing output is refused instead of
+deleted; the video ports are connected, or the muxed ports when the phone offers no video port, as
+the original did (it recorded a phone for 113 s that way), and never an audio port; the recorder
+holds its own cap of 300 s; it prints a JSON
+summary (device, model, UTC start and stop, seconds recorded, failure, the ports offered) for
+`film.json`.
+
+A review of the first form (stand-ins only) found: the notice put the owner's words into the script's
+text through a JSON escape, so curly quotes or a dash made osascript fail and every recording refused;
+`os.system`, `subprocess.check_call` and `NSAppleScript` each left the static tests green, which were
+deny-lists; `film.json` was written in place and said nothing of an interruption; the cached binary
+was trusted without a check; a device that is not a phone could be recorded; two runs could share a
+folder; nothing recorded what ports the phone offered. All are fixed with tests. The author checked
+how osascript passes arguments once, with a script that only returns them (it posts nothing):
+`osascript -e 'on run argv' -e 'return ...' -e 'end run' -- "<curly quotes and a dash>" "ui-probe"`
+returned the text unchanged and a count of two.
+
+An addendum by the lead set the port choice: a first form of this round connected video ports only
+and would have refused a phone that offers its picture on a muxed port alone, which the recorder
+that filmed a phone may have used; nobody kept which port type that phone offered. The recorder
+now connects the video ports, else the muxed ones, waits on the connection it made, and reports
+the port types offered and which were connected.
+
+Last, the sound guard: a muxed port is the combined stream, so a film recorded from one may hold
+sound. After the recording stops and before success is reported, the recorder opens the film with
+AVURLAsset and counts its audio tracks (exit 8 with sound, 9 when the file could not be read).
+The author checked the counter once, as a separate scratch program, on two movies made with ffmpeg
+for the purpose (a grey picture, and the same with a sine tone): it read 0 and 1, and -1 for a
+missing file; the program and the movies were deleted. No camera was involved.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-13 | New tests | `python3 -B -m unittest test_phone_0110` in `plugins/ui-probe/tests`: `film.json` before and after a recording (written whole, `interrupted` on Ctrl-C), the notice before the recording with the owner's words passed as an argument and no recording without it, the notice script compiled with `osacompile` (into a file, not run), a replaced cached binary not run, the lock, a device that is not a phone, a failed recording, `list`, every refusal (the cap at 300 s, `--go` and `--build`, the environment, an existing output, several phones, none, a system other than macOS), the cache keyed by the source's SHA-256 with a stand-in `swiftc`, a failed compile, a real compile, the static checks on the Swift source, the phone module and the command line, `doctor --phone`, the installer's file list, the docs | 39 tests, `OK`; the real compile ran here (Swift 6.2.4, no warnings when compiled by hand the same way into a scratch folder; that binary was deleted, never run) |
+| 2026-11-13 | Existing tests, one file at a time | the 23 files of 0.10.0, `test_installers` included (the review's round touched only `phone.py`, `phone_screen.swift`, the README, the CHANGELOG and `test_phone_0110`; after it `test_docs`, `test_installers` and `test_run_and_cli` were run again) | each file `OK`. One existing test changed: `test_outside_0100`'s docs test no longer pins the plugin's version; `test_phone_0110` pins 0.11.0 |
+| 2026-11-13 | That the tests can fail | 48 faults, one at a time, each in its own copy of the plugin, then the one test named below | each turned its test red. Two first stayed green and were fixed in the tests: a planted call from another verb was first only a comment, and a compiler that fails after writing its output was not tried |
+| 2026-11-13 | Coupling | `scripts/check-coupling.sh ui-probe` at the repository root | passes |
+
+| Fault planted | Test that turned red |
+|---|---|
+| the cap at 600 s | `test_the_hard_cap_of_300_s` |
+| no cap check in Python | `test_the_hard_cap_of_300_s` |
+| no cap in the recorder | `test_the_swift_source_has_its_own_hard_cap_and_no_watch` |
+| --go read from the environment | `test_go_and_build_are_never_read_from_the_environment` |
+| a --build of one word accepted | `test_go_and_build_are_required` |
+| film.json not written before the recording | `test_film_json_before_and_after` |
+| no notice posted | `test_the_mac_posts_a_notice_before_the_recording_starts` |
+| a notice that failed ignored | `test_no_notice_no_recording` |
+| list without the 9:41 note | `test_list_says_the_status_bar_reads_9_41` |
+| with several phones, the first | `test_more_than_one_device_without_device_is_refused` |
+| an existing output accepted | `test_an_existing_output_is_refused` |
+| the recorder deletes an existing output | `test_an_existing_output_is_refused` |
+| any system accepted | `test_any_system_but_macos` |
+| the recorder starts a process | `test_the_swift_source_starts_no_process_and_manages_no_device` |
+| the phone module imports the probe | `test_the_phone_module_imports_nothing_of_the_probe` |
+| another verb calls the recorder | `test_no_other_verb_calls_it` |
+| the cache not keyed by the source | `test_the_cache_is_keyed_by_the_sources_sha256_and_compiled_once` |
+| a failed compile taken as built | `test_a_failed_compile_is_an_error_and_caches_nothing` |
+| doctor --phone without swiftc | `test_doctor_phone` |
+| a start on connect | `test_the_swift_source_has_its_own_hard_cap_and_no_watch` |
+| a failed recording recorded as done | `test_a_failed_recording_is_recorded_as_failed` |
+| the installer copies no recorder source | `test_the_installer_copies_the_recorders_source_and_no_binary` |
+| doctor --phone not handed to the checks | `test_the_command_line_asks_for_the_phone_checks` |
+| the owner's words written into the script | `test_the_owners_own_words_reach_the_notice_as_they_are` |
+| os.system in the phone module | `test_the_phone_module_starts_only_its_four_known_processes` |
+| subprocess.check_call in the phone module | `test_the_phone_module_starts_only_its_four_known_processes` |
+| pty.spawn in the phone module | `test_the_phone_module_starts_only_its_four_known_processes` |
+| NSAppleScript in the recorder | `test_the_swift_source_imports_three_frameworks_and_calls_nothing_denied` |
+| another framework imported by the recorder | `test_the_swift_source_imports_three_frameworks_and_calls_nothing_denied` |
+| an exec call in the recorder | `test_the_swift_source_imports_three_frameworks_and_calls_nothing_denied` |
+| film.json written in place | `test_film_json_is_written_whole_or_not_at_all` |
+| an interruption not recorded | `test_an_interrupted_recording_says_so` |
+| the cached binary's SHA-256 not checked | `test_a_replaced_binary_is_not_run` |
+| the recorder's SHA-256 not in film.json | `test_film_json_before_and_after` |
+| a device that is not a phone taken without --device | `test_a_device_that_is_not_a_phone_needs_device` |
+| the lock not exclusive | `test_two_runs_cannot_share_a_folder` |
+| the ports not in film.json | `test_film_json_before_and_after` |
+| the recorder emits no ports | `test_the_swift_source_attaches_the_picture_only` |
+| an audio port connected | `test_the_swift_source_attaches_the_picture_only` |
+| muxed ports connected beside the video ones | `test_the_swift_source_attaches_the_picture_only` |
+| the wait looks for a video connection only | `test_the_wait_accepts_the_connection_it_made` |
+| what was connected not in film.json | `test_a_phone_with_a_muxed_port_only_says_so_in_film_json` |
+| the recorder does not say what it connected | `test_the_swift_source_attaches_the_picture_only` |
+| the sound tracks not counted | `test_the_film_is_checked_for_sound_after_it_stops_and_before_success` |
+| a film that holds sound not failed in phone.py | `test_a_film_that_holds_sound_fails_and_is_not_deleted` |
+| audio_tracks not in film.json | `test_a_film_that_holds_sound_fails_and_is_not_deleted` |
+| the recorder reports success with sound | `test_the_film_is_checked_for_sound_after_it_stops_and_before_success` |
+| a film not checked for sound passed | `test_a_film_not_checked_for_sound_fails` |
+
+Not established by this version's author: a recording of any phone; which program macOS grants the
+camera access to when an agent runs the recorder; whether the phone must be unlocked; whether a
+phone offers its picture on a video port alone (if not, the recorder refuses it).
+
+### Validation, 0.11.0: the recorder's reviews and the handover
+
+**What this author ran, on macOS 26 (Python 3.12.8, Swift 6.2.4, ffmpeg), on 2026-11-13: single test
+files, planted faults in scratch copies of the plugin, compiles of the Swift source, and scratch
+programs holding only the recorder's track reading or only its line reader. The compiled recorder,
+`ui-probe phone list` and `ui-probe phone record` were never run; no capture device was opened, no
+notice posted, no phone touched.**
+
+The first live run (the lead, on the owner's go: macOS 26, an iPhone on a cable, unlocked) found
+what no stand-in could: `ui-probe phone list` found the phone in 0.8 s, but `record`, 7 s later,
+listed it in one process and recorded in a second, and the second found no phone (exit 4, "0
+offered"; nothing recorded, `film.json` "failed" as designed). Five listings back to back then found
+the phone, none, none (each about 13.4 s: the old 8 s wait counted turns, not time), the phone again
+about 32 s after the first ended, and none; earlier that day it came back about 11 s after a listing
+ended. So once a process that saw a phone exits, the phone is not offered to the next process for
+about 11 to 32 s (one iPhone, one Mac). This version keeps one recorder process from the listing to
+the end of the recording.
+
+Three review rounds before that (stand-ins only) are in this author's earlier commits: every track of
+the film read and audio, muxed and audible tracks counted as sound; a film not reported finished
+never counted (exit 10); the count's wait bounded by the clock; the lock taken first and `film.json`
+created only if absent; `sound_checked`, `film_on_disk` and `tracks` always in `film.json`; exits 8,
+9 and 10 mapped without a summary; `--go` and `--build` refused when nothing in them can be read; a
+final status kept on a late Ctrl-C; static allow-lists for every reference to a process function, for
+the environment and for the cap.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-13 | The track reading alone | a scratch program of the marked block in `phone_screen.swift` (no capture code: a grep for AVCapture, startRecording, CMIO and DiscoverySession found none), on movies ffmpeg made from its test sources, then deleted | picture only `["vide"]` 0; picture and a tone `["vide", "soun"]` 1; picture and timecode `["vide", "tmcd"]` 0; a tone alone `["soun"]` 1; a missing file and a file cut in half -1. A file with its index at the front, cut in half, still read `["vide", "soun"]` 1, which is why a film not finalised is never counted |
+| 2026-11-13 | The count's bound | the same block, limit 1 s, on a FIFO nobody writes | 1.10 s on the main thread; called from a secondary thread whose run loop has no source, 1.02 s. The first form (a bound counted in turns) gave up there after 0.003 s |
+| 2026-11-13 | The recorder's line reader alone | a scratch program of `readChoice` from `phone_screen.swift` (no capture code), fed on stdin | a line: the line, 0.00 s; end of input: nil, 0.00 s; input held open with no line, limit 2 s: nil, 2.00 s; a line after 1 s: the line, 1.01 s; 5000 bytes: nil; text without a newline then the end: nil |
+| 2026-11-13 | The recording's wait alone | a scratch program of `recordFor` from `phone_screen.swift` (no capture code), fed on stdin | stdin held open, limit 2 s: ran its time, 2.08 s; stdin closed after 1 s, limit 10 s: stopped at 1.00 s; bytes at 0.5 s then closed at 1.5 s: stopped at 1.52 s (the bytes ignored); bytes and held open, limit 2 s: ran its time, 2.02 s; already at end of input: stopped at once |
+| 2026-11-13 | Compiles | `swiftc -O phone_screen.swift` after each round, into a scratch folder | no warnings, no errors; each binary deleted, never run |
+| 2026-11-13 | Tests, one file at a time | `test_phone_0110`, `test_docs`, `test_installers`, `test_run_and_cli` in `plugins/ui-probe/tests` | 77, 12, 5 and 20 tests, each file `OK`; no unclosed pipe (`-W always::ResourceWarning`), and no stand-in left running |
+| 2026-11-13 | That the tests can fail | 72 faults, one at a time, each in its own copy of the plugin: 32 from the review rounds, 14 from the reviewer's addendum, 20 for the handover, 6 for an orphaned recorder | each turned its test red. Of the handover's, one first stayed green (a capture session opened before the choice) until the one session was pinned |
+| 2026-11-13 | An orphaned recorder (a review of the handover reproduced it: `ui-probe` killed with SIGKILL 7 s into a recording, and the recorder ran to its end) | `ui-probe` run in its own process with the stand-in recorder recording for 30 s, then killed with SIGKILL | the stand-in logged the end of its stdin and stopped within a second, instead of after 30 s; `film.json` stayed `recording` and the lock stayed, as the README tells whoever finds them. A normal recording of 1.5 s ran its whole time |
+| 2026-11-13 | Coupling | `scripts/check-coupling.sh ui-probe` at the repository root | passes |
+
+The handover's planted faults: a listing process before the recorder; the id written before
+`film.json` and the notice; a refusal, or a failed notice, that leaves the recorder's stdin open; the
+offer waited for without a bound; an unreadable offer taken as no device; a recorder that ended
+before offering waited out; a recorder that will not stop left running; the recorder's waiting note
+not passed on; `list` silent when no phone is offered; the refusal without the half-minute note;
+Python's offer wait raised; in the recorder, the line wait unbounded, its deadline unchecked,
+discovery cut to 8 s or counted in turns, the offer not flushed, the id taken from the command line,
+a capture session opened before the choice, and an unmatched line taken as a choice. The orphaned
+recorder's: `communicate()` restored (it closes stdin with the id); stdin closed right after the id;
+the stdin watch taken out of the recorder; end of input ignored by it; exit 12 not given; exit 12 not
+mapped.
+
+Moved static pins: the phone module's process calls are three `subprocess.run` and one
+`subprocess.Popen` (were four `subprocess.run`); the recorder's argument guard reads
+`arguments.count == 4` (was 5: no id on the command line); the phone module imports `select`; the
+order test reads the one recorder's offer, the notice, the id and the recording (were list, notice,
+recording), and then "recorder finished". For the orphaned recorder: the pinned ending gained two
+lines (the failure set and `exit(12)` when the starter ended, after exit 9 and before the single
+`exit(0)`), and the recording's `spin(seconds)` became `recordFor(seconds)`, so the only spin that is
+not a literal is `spin`'s own parameter. The cap, the finished guard, the sound check and the single
+`exit(0)` kept their order.
+
+Not established by this author: a recording of any phone; whether the phone stays offered to the
+one recorder process for the whole 60 s it may wait for its line (the live run showed a phone
+offered within 0.8 s to a fresh process and withheld from the next one, not how long one process
+keeps it); which port types a phone offers.
+
+### Validation, 0.11.0: the control's move
+
+**What the author of this fix ran, on macOS 26 (Python 3, numpy, Pillow, ffmpeg), on 2026-11-13:
+`analyze` and `gate` on copies of seven saved runs, single test files, planted faults in scratch
+copies, and the repository's coupling check. No device, emulator, simulator or phone; no network.**
+The runs were Android 14 emulator recordings (1080 x 2400) of a test account, made by others before
+this work and read only; every command that writes ran on copies. No picture from them is in the
+plugin, its tests or its docs: numbers only.
+
+The measure was chosen on those runs. For each step with `scope` (26: 18 taps on a day chip whose
+strip moves 70 px up or down while the chip becomes the selected one, 8 flips of a switch among
+identical switches), the frame before the input and the step's last frame were taken, and the
+zero-mean normalised cross-correlation was measured over the same search as the check, once of the
+grey patch and once of its gradient magnitude (corrected 2026-11-13 at the second review: the
+steps split 9 up and 9 down, three of each in each of the three runs, not 12 and 6 as first written;
+the ranges were right):
+
+| Steps | Measure | At the best shift | Second best | At no shift | Already there | Moved |
+|---|---|---|---|---|---|---|
+| day chip, strip up (9) | grey | 0.914 to 0.934 at [0, -70] | 0.659 to 0.769 | 0.125 to 0.156 | 0.061 to 0.082 | |
+| day chip, strip up (9) | gradient | 0.877 to 0.901 at [0, -70] | 0.447 to 0.549 | 0.091 to 0.128 | 0.039 to 0.102 | yes, all 9 |
+| day chip, strip down (9) | grey | 0.824 to 0.826 at [0, 70] | 0.581 to 0.583 | -0.046 | -0.038 to -0.036 | |
+| day chip, strip down (9) | gradient | 0.866 to 0.869 at [0, 70] | 0.490 to 0.494 | -0.050 to -0.047 | -0.040 to -0.031 | yes, all 9 |
+| switch flipped off (4) | grey | 0.998 to 0.999 at [0, ±171] | 0.984 | 0.401 | 0.998 | |
+| switch flipped off (4) | gradient | 0.987 at [0, ±171] | 0.783 to 0.784 | 0.727 to 0.728 | 0.987 | no, all 4 |
+| switch flipped on (4) | grey | 0.572 at [52, 0] | 0.516 | 0.401 | 0.064 | |
+| switch flipped on (4) | gradient | 0.727 to 0.728 at [0, 0] | 0.564 to 0.565 | 0.727 to 0.728 | none | no, all 4 |
+
+The gradient was chosen: a move's gap to its next best shift is 0.347 or more against 0.164 for the
+grey (its moves leave 0.164 to 0.255), and the flipped-on switch's grey peak lies on a
+spurious shift (0.572 at 52 px, 0.056 above the next) where the gradient's lies at no shift. The
+minimum, 0.7, lies 0.166 under the weakest move (0.866) and 0.135 over the best shift away from its
+place on the flipped-on switch (0.565). The margin, 0.15, lies 0.197 under the smallest gap a move
+left to any of the three (0.347, to its next best shift) and 0.15 over the flipped-off switch's gap
+to the neighbour that was already there (0.000).
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-13 | `analyze` then `gate`, before and after | copies of the seven runs, analysed first with the plugin at `be538f5` and then with this change | the control moved in 18 of the 18 day-chip steps (before: 0), at [0, -70] or [0, 70]; in none of the 8 switch steps (before: none). Every other key of every step's record and of the run is the same, and so is every other verdict, but the slides at exactly [0, 300], which are gone (19 to 34 frames in each of the six live up-steps); the slides at [0, -91] stay. The gate adds one `moved` line per day step and says so; the saved switch run still fails `came_back` at 99 and 100 ms, and one live switch run at 62 ms, as before |
+| 2026-11-13 | Tests, one file at a time | `test_outside_0100`, `test_docs`, `test_film_090`, `test_regions_090`, `test_ui_video`, `test_gate` in `plugins/ui-probe/tests` | each `OK` (73, 12, 59, 23, 41 and 30 tests) |
+| 2026-11-13 | That the tests can fail | 15 faults, one at a time, each in its own copy of the plugin, then `test_outside_0100` | each turned the test named below red. In a copy, `DocsTest.test_documented` also fails, the same as in an unpatched copy: it reads the repository's CHANGELOG, which a copy of the plugin alone does not hold |
+| 2026-11-13 | Coupling | `scripts/check-coupling.sh ui-probe` at the repository root | passes |
+
+Tests changed: three tests of 0.10.0 drew chips or a label as flat rectangles told apart by their
+grey alone (`test_a_tapped_chip_that_moves_70_px`, `test_a_chip_that_moves_70_px_still_moves`, and
+`BoundaryTest.moved_by`). To a measure that ignores contrast those are lookalikes (0.967 and 0.885
+the next best shift beside 1.0), or a few long straight edges that match a few pixels along
+themselves (0.861); they now draw glyph-like strokes, and their verdicts are unchanged.
+
+| Fault planted | Test that turned red |
+|---|---|
+| the control judged by the grey difference of 0.10.0 | `test_a_day_strip_that_moves_70_px_up_while_the_tapped_chip_turns_bold`, `test_and_back_down`, `test_a_button_label_that_moves_10_px_and_changes_colour`, and five more |
+| no minimum | `ControlMoveBoundaryTest.test_the_minimum` |
+| no uniqueness | `test_two_places_alike_cannot_be_told`, `test_a_move_among_identical_chips_cannot_be_placed` |
+| not required gone from its place | `test_a_copy_that_appears_beside_a_control_that_stayed` |
+| not required new at its place | `test_a_move_onto_a_place_where_a_lookalike_stood_before`, `test_with_one_lookalike_only_it_did_not_move_either` |
+| already there by the margin exactly counted as new | `test_not_already_there_by_more_than_the_margin` |
+| the margin at 0.05 | `test_a_copy_that_appears_beside_a_control_that_stayed` and the boundary tests |
+| the control's shift at the search limit counted | `test_a_shift_at_the_search_limit_is_no_move` |
+| only the 300 px limit taken for a limit, not the frame's edge | `test_the_frames_edge_is_a_limit_too` |
+| a slide at the search limit told | `test_content_from_beyond_the_search_is_no_slide` |
+| the move judged with the whole screen allowed | `test_the_whole_screen_allowed_is_not_judged` |
+| no texture check | `test_a_flat_control_has_no_shift`, `test_a_plain_switch_in_a_list_of_like_switches_did_not_move` |
+| no `move_px_min` | `test_8_px_is_a_move_and_7_is_not`, `test_the_move_threshold_and_flat` |
+| what stood at the new place not measured | `test_a_move_onto_a_place_where_a_lookalike_stood_before` and the moves |
+| the peak's own neighbours taken for the second best | `test_a_day_strip_that_moves_70_px_up_while_the_tapped_chip_turns_bold` and the other moves |
+
+Not established by this fix's author: the measure on any screen but the two above; a control on the
+iOS Simulator; the defaults on a phone's own recording.
+
+### Validation, 0.11.0: the control's move, second review
+
+**What the author of this fix ran, on macOS 26, on 2026-11-13, after an independent reviewer's
+synthetic probes of the first form: the reviewer's probes (read, run against this tree), `analyze`
+and `gate` again on the same seven copied runs, single test files, planted faults in scratch copies,
+and the coupling check. No device, emulator, simulator or phone; no network.**
+
+What the review found, and what changed:
+
+- A false move: a still icon drawn over a list that scrolls 100 px was told as moved (0.708 at
+  -100 px, 0.501 at no shift). The old place must now also keep at most half of the best, or at
+  most 0.15 over what it would keep had everything around moved by the shift too
+  (`no_shift_if_moved`: in the frame before, the content against the place as far on the other
+  side). The half alone would have cost the short moves the review had confirmed: a strip moved 8
+  to 11 px up keeps 0.559 to 0.572 at no shift against 0.901, with 0.601 to 0.624 expected from
+  the overlap; the icon keeps 0.501 with 0.233 expected. That allowance is this author's addition
+  to the lead's rule.
+- The frame's edge: a chip moved to x = 0 (1.0) was refused as at the search limit. The edge is now
+  a limit only when the patch one step farther, cut off by the edge, scores at least as well on what
+  is left of it.
+- Lookalike neighbours: a strip moved sideways 8 to 20 px, or left 40 or 70 px, was missed, another
+  chip scoring 0.794 at the pitch plus the move. Uniqueness is replaced by places: every local best,
+  less those whose content already stood there before the input, within 0.15 of the best; the move
+  is told at the place nearest to the old one, and refused when one lies nearer than `move_px_min`.
+- A stronger look change found the right shift under 0.7: dark fill 0.662, fill and bold 0.599, a
+  3 px outline 0.561. From 0.4 up to 0.7 the move is now `suspected` and the gate prints a note.
+- Places replacing uniqueness turned this author's synthetic switch (its knob dominating its
+  edges) into a move: the knob matches 52 px away at 0.744 once its identical neighbours are
+  dropped. A move now also needs something to have arrived at the new place: the part of it outside
+  the old box holds at least half the edge spread the control's leading part had. The knob left
+  11.5 before and 0.0 after (off to on: 2.61 and 0.0); every move measured kept 0.93 of it or more
+  (real down-moves 11.4 to 11.5 before and 11.7 after; up-moves 16.6 to 18.5 and 26.6 to 29.1).
+  Also this author's addition.
+
+The real runs, analysed again (the plugin at `107ab1b` plus this change):
+
+| Steps | Shift told | Correlation | Places | Lookalikes dropped | At no shift | No shift if moved | Edge spread ahead, before and after | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| day chip, strip up (9) | [0, -70] | 0.877 to 0.901 | 1 | 0 to 2 | 0.091 to 0.128 | 0.085 to 0.110 | 16.6 to 18.5, 26.6 to 29.1 | moved, all 9 |
+| day chip, strip down (9) | [0, 70] | 0.866 to 0.869 | 1 | 0 to 4 | -0.050 to -0.047 | -0.050 to -0.047 | 11.4 to 11.5, 11.7 | moved, all 9 |
+| switch flipped off (4) | [0, 0] | 0.727 to 0.728 | 1 | 5 | 0.727 to 0.728 | none | none | not moved, all 4 |
+| switch flipped on (4) | [0, 0] | 0.727 to 0.728 | 1 | 5 to 6 | 0.727 to 0.728 | none | none | not moved, all 4 |
+
+None suspected. Every other key of every record, and every gate line, is the same as with the first
+form of this fix.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-13 | Tests, one file at a time | `test_outside_0100`, `test_docs`, `test_film_090`, `test_regions_090`, `test_ui_video`, `test_gate` | each `OK` |
+| 2026-11-13 | That the tests can fail | 25 faults (the first form's 15, adapted to the new rule, with uniqueness's replaced by a place near the old one ignored and by places not limited to the margin; and the review's), one at a time in a copy, then `test_outside_0100` | each turned a test red; `DocsTest` also fails in any copy, as before |
+| 2026-11-13 | Coupling | `scripts/check-coupling.sh ui-probe` | passes |
+
+Tests changed: `test_a_move_among_identical_chips_cannot_be_placed` is now
+`test_a_move_among_identical_chips_is_told_at_the_nearest_place` (the chips did move: every place
+lies away from the old one and none stood there before); `test_two_places_alike_cannot_be_told` is
+now `test_two_places_alike_away_from_it_are_a_move_to_the_nearer` for the same reason;
+`test_a_copy_that_appears_beside_a_control_that_stayed` now asserts the place at the control's own;
+the lookalike test's old place holds "HI" instead of "KEEP 81", which correlates 0.775 with the
+label that left and is no longer gone by the half; the boundary tests read the peaks.
+
+| Fault planted | Test that turned red |
+|---|---|
+| the grey difference of 0.10.0 | the day strip, the button, the frame's edge, and more |
+| no minimum | `test_the_minimum_and_the_suspected_band`, `test_a_stronger_look_change_is_suspected_and_said` |
+| a place nearer than `move_px_min` ignored | `test_places_within_the_margin`, `test_8_px_is_a_move_and_7_is_not` |
+| not required gone | `test_a_still_icon_over_a_list_that_scrolls_did_not_move`, the gone boundaries |
+| no half for gone (A) | `test_a_still_icon_over_a_list_that_scrolls_did_not_move`, `test_gone_by_half_of_the_best` |
+| no allowance for a short move's overlap | `test_a_short_move_overlaps_its_old_place_and_is_told` |
+| the margin half of gone removed | `test_gone_by_the_margin` |
+| lookalikes already there kept | `test_a_move_onto_a_place_where_a_lookalike_stood_before`, the switch tests |
+| already there by the margin exactly kept | `test_a_lookalike_already_there_is_dropped` |
+| what stood at a place not measured | the lookalike and switch tests |
+| the margin at 0.05 | `test_a_strip_that_moves_sideways_while_the_chip_turns_bold` and the boundaries |
+| places not limited to the margin | the day strip and the moves |
+| uniqueness restored (C) | `test_a_strip_that_moves_sideways_while_the_chip_turns_bold`, the identical chips, two places alike |
+| the frame's edge always a limit (B) | `test_a_chip_against_the_frames_edge_is_no_limit` |
+| the frame's edge never a limit | `test_the_frames_edge_is_a_limit_when_the_patch_would_be_cut_off` |
+| the control's shift at the search limit counted | `test_a_shift_at_the_search_limit_is_no_move` |
+| a slide at the search limit told | `test_content_from_beyond_the_search_is_no_slide` |
+| the move judged with the whole screen allowed | `test_the_whole_screen_allowed_is_not_judged` |
+| no texture check | `test_a_flat_control_has_no_shift` |
+| `move_px_min` ignored | `test_the_move_threshold_and_flat`, `test_8_px_is_a_move_and_7_is_not` |
+| suspected never said (D) | `test_a_stronger_look_change_is_suspected_and_said`, the band boundaries |
+| the gate's note dropped (D) | `test_a_suspected_move_is_a_note` |
+| the band's floor at 0.3 (D) | `test_the_minimum_and_the_suspected_band` |
+| the grey for the gradient (E) | `test_an_inverted_chip_that_moves_70_px`, and three more |
+| nothing need arrive | `test_a_switch_alone_whose_knob_slides_did_not_move`, the switch tests |
+
+An addendum of the same day, from a real clip the lead holds: a counter's "0" turned "2", a copy
+of the "2" of "24" standing 52 px to its right, and the slides' backward search reported a slide of
+52 px. A slide now needs its source gone: the place the content came from, in the frame where the
+slide is found, differs from itself in the frame before by more than the slide's tolerance
+(`source_change`). On a synthetic counter the search finds the "2" at [52, 0] (0.0 levels off, 41.1
+with no shift) and the source changed 0.0: no slide; bands that slide 10, 70 and 174 px (the source
+vacated or overwritten) changed theirs by 18.5 to 64.3 and stay slides. On the seven copied runs no
+slide verdict changes: the day steps' slides at [0, -91] stay, 50 frames before and 50 after (9, 4,
+6, 11, 4, 6, 4, 4 and 2 a step), their sources changed by 16.3 to 17.0 levels against a tolerance
+of at most 4; the switch steps have none; every gate line is the same. Planted: the source test
+removed, and the source measured at the new place instead; each turned
+`test_a_digit_that_turns_into_a_copy_of_one_that_stayed_is_no_slide` red. The rerun of every
+earlier plant then found one green: with a slide told at the search limit,
+`test_content_from_beyond_the_search_is_no_slide` stayed green because its source had not changed,
+so the new rule refused the slide as well. Its source is now vacated (it asserts the source changed
+by more than the tolerance), and the plant turns it red again. All 27 plants are red.
+
+A third reading by the reviewer found a regression in this author's "arrived" rule: it read the
+strip just past the OLD box, as deep as the shift but at most the box, which for a move longer than
+the control along its axis is the gap, not the new place. A 24 px icon moved 70 px right with its
+look unchanged (1.0) and a 60 px label moved 150, 200 or 280 px down were not told (2aa205b told
+the icon). It now reads the part of the new box outside the old one (all of the new box for a long
+move) against the patch's leading part as deep. On synthetic frames the icon moved 70 px right and
+left and the label moved 150, 200 and 280 px down and up are told at the exact shift; the reviewer's
+probe tells 20 to 280 px down (a 60 x 60 "OK" moved 300 px is the search limit, not told). On the
+seven copied runs nothing changed, `texture_ahead` included: every move there is shorter than the
+chip (168 px). Planted, the old slice on either axis turned
+`test_a_move_longer_than_the_control_is_read_at_the_new_place` red; all 29 plants are red.
+
+The margin half of "gone" (0.15 under the best) is implied by the half whenever the best is 0.3 or
+more; it matters only when the overlap allowance lets a high value at no shift through. Removed
+alone, it turned `test_gone_by_the_margin` red (which reads the peaks directly) and no frame test.
+Not established by this fix's author: the review's look changes, diagonals and grounds on any real
+recording; a real switch whose knob dominates its edges; the measure on the iOS Simulator.
+
+### Validation, 0.11.0: by the lead
+
+**What the lead ran or had run, on 2026-11-13. Every suite and comparison ran from `git archive` of the exact
+commit under review, never from a tree a worker could still edit.**
+
+| When | What | How | Result |
+|---|---|---|---|
+| 2026-11-13 | The whole suite | `python3 -B -m unittest discover -s plugins/ui-probe/tests` from an archive of the reviewed code, on macOS and in a Linux container (Python 3.12, ffmpeg with libx264, a user that is not root) | 1,120 tests, `OK` on both; in Linux two are skipped, the compile of the Swift source and of the notice script, which need macOS |
+| 2026-11-13 | The gate of 0.10.0 against this version | the released 0.10.0 as installed and this version's script from the same archive: `gate` on every saved run folder of the project that uses the probe, 1,007 folders | the same exit status and text in all 1,007: a step without `scope` and a run without `phone` are judged as before |
+| 2026-11-13 | The control's move on real recordings | four run folders of an Android 14 emulator, 1080 x 2400, with `scope` on the tapped steps: two live runs made with 0.10.0 (a day strip tapped six times, twice; a settings switch flipped off and on, three times) and copies of two run folders another team had saved with 0.7.1 (the same two acts); re-analysed and gated from the archive | 0.10.0 found the 70 px shift in 18 of 18 day taps and called none of them a move. This version: 18 of 18 moved, 9 at [0, -70] and 9 at [0, 70], correlation 0.866 to 0.901; 8 of 8 switch flips not moved; the saved switch run fails `came_back` at 99 and 100 ms |
+| 2026-11-13 | 31 saved one-tap clips | plain screen recordings of an emulator with the window tree before and after each tap, through a glue script that supplies what a run folder would hold and calls this version's `run_outside` and `gate_outside`; a strict pass (nothing allowed) and, for the named acts, a pass with the regions a scenario author would declare | six switch flips fail `came_back` (the other rows redrawn for 84 to 144 ms) and are not moved; two day taps fail `moved` at -70 and +70 px; three theme changes pass with the whole screen allowed and fail without; a search field taking focus passes with the keyboard's region; a counter that changes beside a field is seen. One wrong verdict was found here and fixed: a counter digit told as a slide because a lookalike digit stood beside it (a slide now needs its source gone); after the fix that verdict alone changed |
+| 2026-11-13 | The recorder on a real phone, first run, on its owner's go | `ui-probe phone list`, then `ui-probe phone record --seconds 20` (the form that listed in one process and recorded in a second), macOS 26, an iPhone on a cable, unlocked | the listing found the phone in under a second; the recording failed before it began: exit 4, the device not offered to the second process; `film.json` said failed, no film on disk, as designed. Five listings back to back then showed why: once a process that saw the phone exits, the phone is not offered to the next for about 11 to 32 s. This led to the one-process handover |
+| 2026-11-13 | The recorder on a real phone, second run, on its owner's go | `ui-probe phone record --seconds 20` from an archive of the one-process form | recording began about 3 s after the command and ran 19.93 s; ports offered `vide`, `soun`, `clcp`, `mobj`, connected `video`, so the muxed fallback was not used on this phone; `film.json`: done, tracks `vide` only, `audio_tracks` 0, `sound_checked` true. Read by numbers only: ffprobe lists one stream, h264, 1206 x 2622, about 60 frames a second, 11.1 Mbit/s; mean brightness 136.6 of 255 in every frame with a spread of 136 inside the frame; `film --no-pictures` on a 17 s window counts 1,019 frames, 9 of them changed (by the half-second comparison, a few text-sized places), largest scattered groups 32 and 62 px against a minimum of 95. The film was deleted afterwards; no picture of it was opened or kept |
+| 2026-11-13 | A test that raced a slow machine | the whole suite on macOS while the machine was heavily loaded (load average 15 to 45; 805 s instead of about 670) | one error: a handover test gave its stand-in recorder 1 s to answer. The recorder was not at fault. The class's short bounds now apply only to the test of a recorder that never offers, and `SlowMachineTest` runs six tests with the stand-ins delayed by 2 to 3 s |
+| 2026-11-13 | Independent review of the recorder | a reviewer that wrote none of it, default-refute, six reads, stand-ins and real stand-in processes only (it never ran the recorder) | fixed, each with a test that fails without it: sound inside a muxed track not counted; success possible before the film was finalised; an unbounded, then a turn-counted wait; a second run overwriting a record; statuses left at "recording"; non-integer zeros read as no sound; invisible statements accepted; six planted faults the static tests had missed; a recorder that kept recording after its starter was killed. Its 36 planted faults all turn a test red. Its last line: point it at the phone, yes |
+| 2026-11-13 | Independent review of the control's move and the slide rule | the same reviewer, four reads, synthetic probes through the test file's helpers | fixed with tests: a still control over a scrolling list called moved; a move among lookalike neighbours, to the frame's edge, or farther than the control's own size not told. Stated as limits: the cases under "Limits" in the README. Its last line: ship, with the limits the README states |
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

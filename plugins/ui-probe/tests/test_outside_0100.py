@@ -57,14 +57,72 @@ def paint(f, box, value, halo=True, seed=0):
     return f
 
 
-def shifted(f, box, dx):
+def shifted(f, box, dx, ground=230):
     """f with the content of box moved dx px to the right (what it uncovers is the background)."""
     x0, y0, x1, y1 = box
     g = f.copy()
     part = f[y0:y1, x0:x1].copy()
-    g[y0:y1, x0:x1] = 230
+    g[y0:y1, x0:x1] = ground
     g[y0:y1, x0 + dx:x1 + dx] = part
     return g
+
+
+# Glyph-like strokes on a flat ground (0.11.0): seven-segment characters, softened by a 3 x 3 mean as a
+# renderer's antialiasing softens text. A tapped control's look changes by its strokes (bolder, darker).
+SEG = {"0": "abcdef", "1": "bc", "2": "abged", "3": "abgcd", "4": "fgbc", "5": "afgcd", "6": "afgedc", "7": "abc",
+       "8": "abcdefg", "9": "abcdfg", "A": "abcefg", "B": "cdefg", "C": "adef", "D": "bcdeg", "E": "afged",
+       "F": "afge", "H": "bcefg", "I": "ef", "K": "bcefg", "L": "def", "M": "abcefg", "N": "abcef", "O": "cdeg",
+       "P": "abefg", "R": "eg", "S": "afgcd", "T": "fged", "U": "bcdef", "W": "bcdeg", "Y": "bcdfg"}
+
+
+def text(f, x, y, s, w, h, t, value, gap):
+    """Characters of w x h px with strokes t px wide, of that grey, gap px apart, drawn into f."""
+    for k, ch in enumerate(s):
+        gx, hh = x + k * (w + gap), h // 2
+        parts = {"a": (y, y + t, gx, gx + w), "b": (y, y + hh, gx + w - t, gx + w), "c": (y + hh, y + h, gx + w - t, gx + w),
+                 "d": (y + h - t, y + h, gx, gx + w), "e": (y + hh, y + h, gx, gx + t), "f": (y, y + hh, gx, gx + t),
+                 "g": (y + hh - t // 2, y + hh - t // 2 + t, gx, gx + w)}
+        for seg in SEG.get(ch, ""):
+            y0, y1, x0, x1 = parts[seg]
+            f[y0:y1, x0:x1] = value
+    return f
+
+
+def soft(f):
+    g = f.astype(np.float32)
+    g[1:-1, 1:-1] = sum(g[1 + dy:H - 1 + dy, 1 + dx:W - 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)) / 9
+    return np.round(g).astype(np.uint8)
+
+
+def plain():
+    return np.full((H, W, 3), 245, dtype=np.uint8)
+
+
+DAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+CHIP_W, CHIP_H, STRIP_Y = 139, 168, 444          # a day strip's chips, as on a 1080 x 2400 emulator
+
+
+def chip_box(k, y=STRIP_Y, x=53):
+    return (x + CHIP_W * k, y, x + CHIP_W * (k + 1), y + CHIP_H)
+
+
+def chip(f, k, y=STRIP_Y, selected=False, x=53):
+    """Day chip k: a small label above a large number; selected, its strokes are bolder and darker."""
+    x0, y0, _x1, _y1 = chip_box(k, y, x)
+    t, value = (4, 30) if selected else (3, 120)
+    text(f, x0 + 22, y0 + 22, DAYS[k], 18, 26, t, value, 10)
+    return text(f, x0 + 30, y0 + 70, str(9 + k), 30, 60, t + 2, value, 12)
+
+
+def day_screen(strip_y, selected, rows):
+    """A header, the day strip at strip_y with chip `selected` selected, and lines of a list below it."""
+    f = plain()
+    text(f, 60, strip_y - 124, "MON 10 FEB", 24, 40, 4, 40, 12)
+    for k in range(7):
+        chip(f, k, strip_y, selected=(k == selected))
+    for r in range(6):
+        text(f, 60, strip_y + 256 + 160 * r, rows[: (r % 4) + 6], 22, 36, 3, 60, 11)
+    return soft(f)
 
 
 def check(frames, times, box=SWITCH, allowed=(), screen_=False, move=8.0, came=50.0, strip=None):
@@ -106,15 +164,16 @@ class KnownCasesTest(unittest.TestCase):
         self.assertEqual((res["changes"][0]["duration_ms"], res["below_the_hand"]), (33.0, 1))
 
     def test_a_tapped_chip_that_moves_70_px(self):
-        chips = [(60 + 220 * n, 1500, 240 + 220 * n, 1560) for n in range(4)]
-        before = screen()
-        for n, c in enumerate(chips):
-            before = paint(before, c, 120 + 30 * n, halo=False)
-            before[c[1] + 20:c[1] + 40, c[0] + 20:c[0] + 120] = 20            # each chip's label
-        row = (40, 1500, 1000, 1560)
-        mid = shifted(before, row, 35)
-        end = shifted(before, row, 70)
-        res = check([before, mid, end], [24.0, 57.0], box=chips[1])
+        # 0.11.0: chips told apart by their labels; chips that differ by their grey only are lookalikes to
+        # a measure that ignores contrast (see test_a_move_among_identical_chips_cannot_be_placed).
+        before = plain()
+        for k in range(4):
+            chip(before, k, 1500, x=60)
+        before = soft(before)
+        row = (40, 1500, 1000, 1500 + CHIP_H)
+        mid = shifted(before, row, 35, ground=245)
+        end = shifted(before, row, 70, ground=245)
+        res = check([before, mid, end], [24.0, 57.0], box=chip_box(1, 1500, x=60))
         self.assertTrue(res["fails"]["moved"])
         self.assertEqual(res["control"]["shift"], [70, 0])
         self.assertTrue(res["fails"]["slid"])
@@ -291,6 +350,16 @@ class ControlMoveTest(unittest.TestCase):
         after = switch(before.copy(), SWITCHES[1], False)
         return check([before, after], [17.0], box=SWITCHES[1])
 
+    def test_a_switch_alone_whose_knob_slides_did_not_move(self):
+        # 0.11.0: no lookalike to drop. The knob matches 52 px away (0.744), but the part of that place
+        # outside the switch's box is empty: the knob slid inside a switch that stayed.
+        before = screen()
+        switch(before, SWITCHES[1], True)
+        res = check([before, switch(before.copy(), SWITCHES[1], False)], [17.0], box=SWITCHES[1])
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["suspected"], c["shift"], c["arrived"]), (False, False, [-52, 0], False), c)
+        self.assertEqual(c["texture_ahead"][1], 0.0)
+
     def test_a_switch_toggled_among_switches_like_it_did_not_move(self):
         res = self.toggled([SWITCHES[0], SWITCHES[2]])
         self.assertFalse(res["fails"]["moved"], res["control"])
@@ -301,7 +370,10 @@ class ControlMoveTest(unittest.TestCase):
         self.assertFalse(res["fails"]["moved"], res["control"])
         self.assertIsNotNone(res["control"]["already_there"])
 
-    def test_a_move_among_identical_chips_cannot_be_placed(self):
+    def test_a_move_among_identical_chips_is_told_at_the_nearest_place(self):
+        # Up to the first form of 0.11.0 this was "cannot be placed" (a second shift matched as well). The
+        # chips did move: every place that matches lies away from the control's own, and none of them
+        # stood there before the input. 0.11.0 tells the move at the place nearest to it.
         chips = [(60 + 220 * n, 1500, 240 + 220 * n, 1560) for n in range(4)]
         before = screen()
         for c in chips:                                             # all alike: the control's look repeats
@@ -309,7 +381,9 @@ class ControlMoveTest(unittest.TestCase):
             before[c[1] + 20:c[1] + 40, c[0] + 20:c[0] + 120] = 20
         end = shifted(before, (40, 1500, 1000, 1560), 70)
         res = check([before, end], [30.0], box=chips[1])
-        self.assertFalse(res["fails"]["moved"], res["control"])    # a second shift matches as well
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"]), (True, [70, 0]), c)
+        self.assertGreater(c["places"], 1)                          # a second shift matches as well
         self.assertTrue(res["fails"]["still_there"])                # its neighbours are still judged
 
     def test_the_scopes_join_level_reaches_the_check(self):
@@ -319,13 +393,12 @@ class ControlMoveTest(unittest.TestCase):
         self.assertEqual(oc.call_args.kwargs["join_level"], 55)
 
     def test_a_chip_that_moves_70_px_still_moves(self):
-        chips = [(60 + 220 * n, 1500, 240 + 220 * n, 1560) for n in range(4)]
-        before = screen()
-        for n, c in enumerate(chips):
-            before = paint(before, c, 120 + 30 * n, halo=False)
-            before[c[1] + 20:c[1] + 40, c[0] + 20 + 10 * n:c[0] + 120] = 20
-        end = shifted(before, (40, 1500, 1000, 1560), 70)
-        res = check([before, end], [30.0], box=chips[1])
+        before = plain()
+        for k in range(4):
+            chip(before, k, 1500, x=60)
+        before = soft(before)
+        end = shifted(before, (40, 1500, 1000, 1500 + CHIP_H), 70, ground=245)
+        res = check([before, end], [30.0], box=chip_box(1, 1500, x=60))
         self.assertEqual((res["fails"]["moved"], res["control"]["shift"]), (True, [70, 0]))
 
 
@@ -448,11 +521,11 @@ class BoundaryTest(unittest.TestCase):
         self.assertFalse(check([before, on, flip(before)], [16.0, 116.0], came=101)["fails"]["came_back"])
 
     def moved_by(self, dx, move=8.0):
-        before = screen()
+        # 0.11.0: a label of strokes; a plain bar's long straight edges match a few px along themselves
+        # as well, which the correlation's uniqueness rule refuses.
+        before = soft(text(plain(), 320, 1212, "SALE 24", 20, 36, 4, 50, 8))
         box = (300, 1200, 600, 1260)
-        before = paint(before, box, 90, halo=False)
-        before[1215:1245, 320:420] = 10
-        after = shifted(before, (280, 1200, 700, 1260), dx)
+        after = shifted(before, (280, 1200, 700, 1260), dx, ground=245)
         return check([before, after], [30.0], box=box, move=move)
 
     def test_8_px_is_a_move_and_7_is_not(self):
@@ -466,6 +539,374 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual((move_px, came), (4.0, 50))
         _a, _s, move_px, _c = u.scope_geometry({"may_change": [], "move_px_min": 16}, 1080, (0, 2400))
         self.assertEqual(move_px, 16.0)
+
+
+class ControlMoveByCorrelationTest(unittest.TestCase):
+    """0.11.0: the control's move is judged by a correlation that a change of its look leaves high."""
+
+    def strip(self, down=False):
+        """The day strip moves 70 px up (or back down): the tapped chip turns selected and the list below
+        is replaced."""
+        up = (day_screen(STRIP_Y, 6, "TUE 9 PICS"), day_screen(STRIP_Y - 70, 2, "WED 13 SAL"))
+        if down:
+            return check([up[1], up[0]], [30.0], box=chip_box(6, STRIP_Y - 70))
+        return check([up[0], up[1]], [30.0], box=chip_box(2))
+
+    def test_a_day_strip_that_moves_70_px_up_while_the_tapped_chip_turns_bold(self):
+        res = self.strip()
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"], c["judged"]), (True, [0, -70], True), c)
+        self.assertEqual(c["measure"], v.OUTSIDE_MOVE_MEASURE)
+        self.assertGreaterEqual(c["correlation"], v.OUTSIDE_MOVE_CORR_MIN + 0.1)
+        self.assertIn("still_there", [k for k, x in res["fails"].items() if x])       # the list below is still judged
+
+    def test_and_back_down(self):
+        res = self.strip(down=True)
+        self.assertEqual((res["fails"]["moved"], res["control"]["shift"]), (True, [0, 70]), res["control"])
+
+    def test_a_difference_of_grey_levels_cannot_see_it(self):
+        # The measure up to 0.10.0, on the same frames: the bolder chip is no close match anywhere (here
+        # the flat ground under another shift scores better than the true one).
+        a, b = day_screen(STRIP_Y, 6, "TUE 9 PICS"), day_screen(STRIP_Y - 70, 2, "WED 13 SAL")
+        found = v.find_shift(v._grey(a), v._grey(b), chip_box(2), v.OUTSIDE_SEARCH_PX)
+        self.assertFalse(v.moved(found, 8.0), found)
+
+    def test_the_same_chip_turning_bold_in_place_did_not_move(self):
+        res = check([day_screen(STRIP_Y, 6, "TUE 9 PICS"), day_screen(STRIP_Y, 2, "TUE 9 PICS")], [30.0],
+                    box=chip_box(2))
+        self.assertEqual((res["fails"]["moved"], res["control"]["shift"]), (False, [0, 0]), res["control"])
+
+    def button(self, dx, value):
+        f = plain()
+        f[1200:1300, 300:700] = 232                                          # a face a little darker than the ground
+        return soft(text(f, 380 + dx, 1230, "CONFIRM", 24, 40, 4, value, 8))
+
+    def test_a_button_label_that_moves_10_px_and_changes_colour(self):
+        res = check([self.button(0, 60), self.button(10, 150)], [30.0], box=(300, 1200, 700, 1300))
+        self.assertEqual((res["fails"]["moved"], res["control"]["shift"]), (True, [10, 0]), res["control"])
+        res = check([self.button(0, 60), self.button(0, 150)], [30.0], box=(300, 1200, 700, 1300))
+        self.assertEqual((res["fails"]["moved"], res["control"]["shift"]), (False, [0, 0]), res["control"])
+
+    def rows(self, *placed):
+        f = plain()
+        for y, s in placed:
+            text(f, 320, y, s, 20, 36, 4, 50, 8)
+        return soft(f)
+
+    LABEL = (300, 1500, 700, 1560)
+
+    def test_a_move_onto_a_place_where_a_lookalike_stood_before(self):
+        before = self.rows((1510, "SALE 24"), (1440, "SALE 24"))
+        res = check([before, self.rows((1440, "SALE 24"), (1510, "HI"))], [30.0], box=self.LABEL)
+        c = res["control"]
+        self.assertFalse(res["fails"]["moved"], c)
+        found = v.find_move(v._grey(before), v._grey(self.rows((1440, "SALE 24"), (1510, "HI"))), self.LABEL, 300)
+        up = [p for p in found["peaks"] if p["shift"] == [0, -70]][0]          # it was found, and dropped: the
+        self.assertLessEqual(round(up["correlation"] - up["already_there"], 3), v.OUTSIDE_MOVE_MARGIN)  # lookalike
+        self.assertGreaterEqual(c["lookalikes"], 1)
+        alone = check([self.rows((1510, "SALE 24")), self.rows((1440, "SALE 24"), (1510, "HI"))], [30.0],
+                      box=self.LABEL)
+        self.assertEqual((alone["fails"]["moved"], alone["control"]["shift"]), (True, [0, -70]), alone["control"])
+
+    def test_a_copy_that_appears_beside_a_control_that_stayed(self):
+        # A copy 70 px up, the control at its place a little bolder: a place at the control's own.
+        before = self.rows((1510, "SALE 24"))
+        f = plain()
+        text(f, 320, 1440, "SALE 24", 20, 36, 4, 50, 8)
+        text(f, 320, 1510, "SALE 24", 20, 36, 5, 50, 8)
+        res = check([before, soft(f)], [30.0], box=self.LABEL)
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["suspected"], c["shift"]), (False, False, [0, 0]), c)
+
+    def test_two_places_alike_away_from_it_are_a_move_to_the_nearer(self):
+        before = self.rows((1510, "SALE 24"))
+        res = check([before, self.rows((1440, "SALE 24"), (1720, "SALE 24"))], [30.0], box=self.LABEL)
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"], c["places"]), (True, [0, -70], 2), c)
+
+    def test_a_still_icon_over_a_list_that_scrolls_did_not_move(self):
+        # The list's texture inside the icon's box moved 100 px; the icon stayed at its place.
+        words = ["SALE 24", "KEEP 81", "PICS 90", "SEND 13", "HELP 56", "FEED 70", "DATE 11"]
+
+        def scroll(off):
+            g = plain()
+            for r in range(14):
+                text(g, 560, 900 + 70 * r - off, words[r % 7] + " " + words[(r + 3) % 7], 20, 36, 3, 80, 8)
+            return soft(text(g, 945, 1294, "K", 26, 36, 6, 20, 6))
+        res = check([scroll(0), scroll(100)], [30.0], box=(910, 1270, 1010, 1350))
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["suspected"], c["gone"], c["shift"]), (False, False, False, [0, -100]), c)
+        self.assertGreater(c["at_no_shift"], v.OUTSIDE_MOVE_GONE_SHARE * c["best_correlation"])
+        self.assertGreater(round(c["at_no_shift"] - c["no_shift_if_moved"], 3), v.OUTSIDE_MOVE_MARGIN)
+        self.assertGreaterEqual(round(c["best_correlation"] - c["at_no_shift"], 3), v.OUTSIDE_MOVE_MARGIN)
+
+    def test_a_short_move_overlaps_its_old_place_and_is_told(self):
+        # 8 px up: no shift keeps 0.56 of the strokes, as much as the strip's own overlap explains.
+        res = check([day_screen(STRIP_Y, 6, "TUE 9 PICS"), day_screen(STRIP_Y - 8, 2, "TUE 9 PICS")], [30.0],
+                    box=chip_box(2))
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"]), (True, [0, -8]), c)
+        self.assertGreater(c["at_no_shift"], v.OUTSIDE_MOVE_GONE_SHARE * c["best_correlation"])
+
+    def test_a_strip_that_moves_sideways_while_the_chip_turns_bold(self):
+        # Another chip of the strip matches at the pitch plus the move (0.794): it arrived there too.
+        for dx in (8, 20, -70):
+            f = plain()
+            text(f, 60, STRIP_Y - 124, "MON 10 FEB", 24, 40, 4, 40, 12)
+            for k in range(7):
+                chip(f, k, selected=(k == 2), x=53 + dx)
+            res = check([day_screen(STRIP_Y, 6, "TUE 9 PICS"), soft(f)], [30.0], box=chip_box(2))
+            c = res["control"]
+            self.assertEqual((res["fails"]["moved"], c["shift"]), (True, [dx, 0]), (dx, c))
+            self.assertEqual(c["places"], 2, (dx, c))
+
+    def test_a_move_longer_than_the_control_is_read_at_the_new_place(self):
+        # What arrived is read in the part of the new box outside the old one: for a move longer than
+        # the control along its axis, all of the new box, not the gap just past the old box.
+        def icon(x):
+            g = plain()
+            g[1500:1524, x:x + 24] = 60
+            g[1503:1521, x + 3:x + 21] = 245                                 # a 24 px outline
+            return soft(g)
+        for dx in (70, -70):
+            res = check([icon(500), icon(500 + dx)], [30.0], box=(500, 1500, 524, 1524))
+            c = res["control"]
+            self.assertEqual((res["fails"]["moved"], c["shift"], c["arrived"]), (True, [dx, 0], True), (dx, c))
+        for dy in (150, 200, 280, -150, -200, -280):
+            b = self.rows((1510 + dy, "SALE 24"))
+            res = check([self.rows((1510, "SALE 24")), b], [30.0], box=self.LABEL)
+            c = res["control"]
+            self.assertEqual((res["fails"]["moved"], c["shift"], c["arrived"]), (True, [0, dy], True), (dy, c))
+            self.assertGreaterEqual(c["texture_ahead"][1], v.OUTSIDE_MOVE_ARRIVE_SHARE * c["texture_ahead"][0])
+
+    def test_a_chip_against_the_frames_edge_is_no_limit(self):
+        f = plain()
+        for k in range(7):
+            chip(f, k, selected=(k == 0), x=0)
+        res = check([day_screen(STRIP_Y, 6, "TUE 9 PICS"), soft(f)], [30.0], box=chip_box(0))
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"], c["at_search_limit"]), (True, [-53, 0], False), c)
+
+    def test_an_inverted_chip_that_moves_70_px(self):
+        # Light strokes on a dark pill a little larger than the chip: the grey correlates negatively, the
+        # edges correlate fully.
+        def strip_(y, inverted=None):
+            f = plain()
+            text(f, 60, y - 124, "MON 10 FEB", 24, 40, 4, 40, 12)
+            for k in range(7):
+                if k == inverted:
+                    x0, y0, x1, y1 = chip_box(k, y)
+                    f[y0 - 6:y1 + 6, x0 - 6:x1 + 6] = 40
+                    text(f, x0 + 22, y0 + 22, DAYS[k], 18, 26, 3, 245, 10)
+                    text(f, x0 + 30, y0 + 70, str(9 + k), 30, 60, 5, 245, 12)
+                else:
+                    chip(f, k, y)
+            return soft(f)
+        res = check([strip_(STRIP_Y), strip_(STRIP_Y - 70, 2)], [30.0], box=chip_box(2))
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["shift"]), (True, [0, -70]), c)
+        self.assertGreaterEqual(c["best_correlation"], 0.95)
+
+    def test_a_stronger_look_change_is_suspected_and_said(self):
+        # A dark fill under light strokes: the right shift at 0.662, under the minimum.
+        def strip_(y, filled=None):
+            f = plain()
+            text(f, 60, y - 124, "MON 10 FEB", 24, 40, 4, 40, 12)
+            for k in range(7):
+                if k == filled:
+                    x0, y0, x1, y1 = chip_box(k, y)
+                    f[y0 + 6:y1 - 6, x0 + 6:x1 - 6] = 40
+                    text(f, x0 + 22, y0 + 22, DAYS[k], 18, 26, 3, 235, 10)
+                    text(f, x0 + 30, y0 + 70, str(9 + k), 30, 60, 5, 235, 12)
+                else:
+                    chip(f, k, y, selected=(k == 6 and filled is None))
+            return soft(f)
+        res = check([strip_(STRIP_Y), strip_(STRIP_Y - 70, 2)], [30.0], box=chip_box(2))
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["suspected"], c["shift"]), (False, True, [0, -70]), c)
+        self.assertTrue(v.OUTSIDE_MOVE_SUSPECT_MIN <= c["best_correlation"] < v.OUTSIDE_MOVE_CORR_MIN, c)
+
+    def test_a_flat_control_has_no_shift(self):
+        before = plain()
+        before[1500:1560, 300:700] = 200
+        after = shifted(before, (280, 1500, 800, 1560), 70, ground=245)
+        res = check([before, after], [30.0], box=self.LABEL)
+        c = res["control"]
+        self.assertEqual((res["fails"]["moved"], c["flat"], c["shift"], c["correlation"]), (False, True, [0, 0], None))
+
+    def test_the_whole_screen_allowed_is_not_judged(self):
+        a, b = day_screen(STRIP_Y, 6, "TUE 9 PICS"), day_screen(STRIP_Y - 70, 2, "WED 13 SAL")
+        res = check([a, b], [30.0], box=chip_box(2), screen_=True)
+        self.assertEqual((res["control"]["judged"], res["control"]["moved"], res["fails"]["moved"]), (False, False, False))
+        self.assertIn("the whole screen may change", res["control"]["not_judged"])
+        self.assertNotIn("shift", res["control"])
+        self.assertFalse(any(res["fails"].values()), res["fails"])
+
+    @staticmethod
+    def search(peak_px, h=2400, box=(300, 1000, 400, 1060)):
+        """_axis_search over a frame whose grey is its row number, scored best where the patch's mean row
+        lies peak_px below the box's: the search finds peak_px, or the farthest shift it reaches."""
+        g = np.repeat(np.arange(h, dtype=np.float32)[:, None], 1080, axis=1)
+        centre = float(g[box[1]:box[3]:2, 0].mean())
+        return v._axis_search(g, g, box, 300, lambda p, q: -abs(float(q.mean()) - (centre + peak_px)))
+
+    def test_a_shift_at_the_search_limit_is_no_move(self):
+        _s, where, at_limit, f, limits = self.search(400)               # better still beyond the limit
+        self.assertEqual((where, at_limit, f), ((0, 300), True, 2))
+        self.assertIn((0, -300), limits)
+        self.assertEqual(self.search(-400)[1:3], ((0, -300), True))
+        self.assertEqual(self.search(296)[1:3], ((0, 296), False))
+        self.assertEqual(self.search(0)[1:3], ((0, 0), False))
+        c = ControlMoveBoundaryTest.c(shift=[0, 296])
+        self.assertTrue(v.control_moved(c, 8.0))
+        c["peaks"][0]["at_search_limit"] = True
+        self.assertEqual((v.judge_move(c, 8.0)["moved"], v.judge_move(c, 8.0)["suspected"]), (False, False))
+
+    def test_the_frames_edge_is_a_limit_when_the_patch_would_be_cut_off(self):
+        # A box 100 px above the frame's foot: the search stops there. Better still one step on, on the
+        # part left inside: a limit. Worse there: the content lies against the edge, no limit.
+        box = (300, 1060, 400, 1120)
+        self.assertEqual(self.search(400, h=1220, box=box)[1:3], ((0, 100), True))
+        self.assertEqual(self.search(100, h=1220, box=box)[1:3], ((0, 100), False))
+        self.assertEqual(self.search(60, h=1220, box=box)[1:3], ((0, 60), False))
+
+
+class ControlMoveBoundaryTest(unittest.TestCase):
+    """The rule's numbers, on the rounded measures run.json keeps (judge_move)."""
+
+    @staticmethod
+    def c(corr=0.9, z=0.0, shift=(0, -70), already=0.0, echo=0.0, more=()):
+        return {"flat": False, "at_no_shift": z,
+                "peaks": [{"shift": list(shift), "correlation": corr, "already_there": already,
+                           "no_shift_if_moved": echo, "at_search_limit": False}, *more]}
+
+    def judge(self, **kw):
+        j = v.judge_move(self.c(**kw), 8.0)
+        return "moved" if j["moved"] else "suspected" if j["suspected"] else "no"
+
+    def test_the_defaults(self):
+        self.assertEqual((v.OUTSIDE_MOVE_CORR_MIN, v.OUTSIDE_MOVE_MARGIN, v.OUTSIDE_MOVE_GONE_SHARE,
+                          v.OUTSIDE_MOVE_SUSPECT_MIN), (0.7, 0.15, 0.5, 0.4))
+        self.assertEqual(self.judge(), "moved")
+
+    def test_the_minimum_and_the_suspected_band(self):
+        self.assertEqual(self.judge(corr=0.7), "moved")
+        self.assertEqual(self.judge(corr=0.699), "suspected")
+        self.assertEqual(self.judge(corr=0.4), "suspected")
+        self.assertEqual(self.judge(corr=0.399), "no")
+
+    def test_gone_by_the_margin(self):
+        self.assertEqual(self.judge(z=0.75, echo=0.7), "moved")
+        self.assertEqual(self.judge(z=0.751, echo=0.7), "no")
+
+    def test_gone_by_half_of_the_best(self):
+        self.assertEqual(self.judge(z=0.45), "moved")
+        self.assertEqual(self.judge(z=0.451), "no")
+
+    def test_or_by_what_a_move_of_everything_around_would_keep(self):
+        self.assertEqual(self.judge(z=0.6, echo=0.45), "moved")
+        self.assertEqual(self.judge(z=0.6, echo=0.449), "no")
+        self.assertEqual(self.judge(z=0.6, echo=None), "no")
+
+    def test_a_lookalike_already_there_is_dropped(self):
+        self.assertEqual(self.judge(already=0.75), "no")
+        self.assertEqual(self.judge(already=0.749), "moved")
+        near = {"shift": [0, 4], "correlation": 0.85, "already_there": 0.85, "no_shift_if_moved": 0.0,
+                "at_search_limit": False}
+        self.assertEqual(self.judge(z=0.0, more=[near]), "no")              # its own place is never dropped
+
+    def test_places_within_the_margin(self):
+        def other(corr, shift=(0, 4)):
+            return [{"shift": list(shift), "correlation": corr, "already_there": 0.0, "no_shift_if_moved": 0.0,
+                     "at_search_limit": False}]
+        self.assertEqual(self.judge(more=other(0.751)), "no")              # a place nearer than move_px
+        self.assertEqual(self.judge(more=other(0.75)), "moved")            # not within the margin: no place
+        j = v.judge_move(self.c(shift=(0, -140), more=other(0.85, (0, 30))), 8.0)
+        self.assertEqual((j["moved"], j["shift"], j["places"], j["correlation"], j["best_correlation"]),
+                         (True, [0, 30], 2, 0.85, 0.9))
+
+    def test_something_arrived_at_the_new_place(self):
+        def ahead(before, after):
+            c = self.c()
+            c["peaks"][0]["texture_ahead"] = [before, after]
+            j = v.judge_move(c, 8.0)
+            return "moved" if j["moved"] else "no"
+        self.assertEqual(ahead(10.0, 5.0), "moved")
+        self.assertEqual(ahead(10.0, 4.999), "no")
+        self.assertEqual(ahead(0.0, 0.0), "moved")                         # nothing to arrive: no evidence
+
+    def test_the_move_threshold_and_flat(self):
+        self.assertEqual(self.judge(shift=(8, 0)), "moved")
+        self.assertEqual(self.judge(shift=(7, 0)), "no")
+        self.assertEqual(v.judge_move({"flat": True, "at_no_shift": None, "peaks": []}, 8.0)["moved"], False)
+
+
+class SlideAtTheLimitTest(unittest.TestCase):
+    """0.11.0: a slide whose best shift is the farthest searched is not told."""
+
+    def frames(self, came_from):
+        before = plain()
+        y = np.arange(1450, 2300)                                   # a smooth ramp, 0.17 levels a row
+        before[1450:2300, 100:980] = np.round(40 + 0.17 * (y - 1450)).astype(np.uint8)[:, None, None]
+        end = before.copy()
+        end[1900:2050, 100:980] = before[1900 - came_from:2050 - came_from, 100:980]
+        end[1900 - came_from:2050 - came_from, 100:980] = 245       # the source vacated: only the limit holds
+        return before, end
+
+    def test_content_from_beyond_the_search_is_no_slide(self):
+        before, end = self.frames(320)
+        found = v.find_shift(v._grey(end), v._grey(before), [100, 1900, 980, 2050], v.OUTSIDE_SEARCH_PX)
+        self.assertEqual((found["shift"], found["at_search_limit"]), ([0, -300], True), found)
+        # it would pass for a slide but for the limit (its source is gone too)
+        self.assertTrue(v.moved({**found, "at_search_limit": False}, 8.0) and v.unique(found), found)
+        self.assertGreater(v.source_change(v._grey(end), v._grey(before), [100, 1900, 980, 2050], found["shift"]),
+                           min(v.OUTSIDE_MATCH_MAX, v.OUTSIDE_MATCH_RATIO * found["still"]))
+        res = check([before, end], [30.0])
+        self.assertEqual(res["slid"], [])
+        self.assertTrue(res["fails"]["still_there"])                    # the change is still judged
+
+    @staticmethod
+    def field(typed, count):
+        f = plain()
+        f[1200:1260, 300:700] = 235                                          # a text field, the control
+        text(f, 310, 1212, typed, 16, 30, 3, 60, 6)
+        return soft(text(f, 800, 1300, count, 18, 36, 4, 60, 8))           # a counter beside it, "0 24"
+
+    def test_a_digit_that_turns_into_a_copy_of_one_that_stayed_is_no_slide(self):
+        # The counter's "0" turns "2": a copy of the "2" of "24", 52 px to its right, which never moved.
+        before, end = self.field("", "0 24"), self.field("HI", "2 24")
+        res = check([before, end], [30.0], box=(300, 1200, 700, 1260))
+        self.assertEqual(res["slid"], [])
+        self.assertEqual(res["fails"], {"moved": False, "still_there": True, "slid": False, "came_back": False})
+        (c,) = res["changes"]
+        found = v.find_shift(v._grey(end), v._grey(before), c["box_px"], v.OUTSIDE_SEARCH_PX)
+        self.assertEqual(found["shift"], [52, 0])                    # the backward search does find the "2"
+        self.assertTrue(v.moved(found, 8.0) and v.unique(found), found)
+        self.assertEqual(v.source_change(v._grey(end), v._grey(before), c["box_px"], found["shift"]), 0.0)
+
+    def test_a_band_that_slides_leaves_its_source(self):
+        def band(d, over=False):
+            f = plain()
+            text(f, 100, 1600 + d, "SALE 24 KEEP 81 PICS", 20, 36, 4, 50, 8)
+            text(f, 100, 1660 + d, "SEND 13 HELP 56", 20, 36, 4, 50, 8)
+            if over:
+                text(f, 100, 1600, "DATE 11 FEED 70 BIKE", 20, 36, 4, 50, 8)
+            return soft(f)
+        for d, over in ((10, False), (70, False), (174, False), (174, True)):
+            res = check([band(0), band(d, over)], [30.0])
+            self.assertTrue(res["slid"], (d, over))
+            self.assertEqual({tuple(sl["shift_px"]) for sl in res["slid"]}, {(0, d)}, (d, over))
+            self.assertTrue(all(sl["source_change"] > 4.0 for sl in res["slid"]), (d, res["slid"]))
+
+    def test_a_slide_within_the_search_is_told(self):
+        before = plain()
+        for k in range(4):
+            chip(before, k, 1500, x=60)
+        before = soft(before)
+        end = shifted(before, (40, 1500, 1000, 1500 + CHIP_H), 70, ground=245)
+        res = check([before, end], [30.0], box=chip_box(1, 1500, x=60))
+        self.assertTrue(res["slid"])
+        self.assertTrue(all(sl["shift_px"] == [-70, 0] or abs(sl["shift_px"][0]) >= 8 for sl in res["slid"]))
 
 
 # --------------------------------------------------------------------------------------------
@@ -682,6 +1123,22 @@ class GateTest(unittest.TestCase):
                          [("outside", "moved"), ("outside", "came_back"), ("outside", "still_there"), ("outside", "slid")])
         self.assertIn("the control moved: its content shifted by [70, 0] px", res["violations"][0]["message"])
         self.assertIn("came back after 77 ms (the limit is 50 ms)", res["violations"][1]["message"])
+        o = outside(moved=True)
+        o["control"].update({"correlation": 0.897, "at_no_shift": 0.094})
+        self.assertIn("correlation 0.897 there, 0.094 at its place", self.gate(o)["violations"][0]["message"])
+
+    def test_a_suspected_move_is_a_note(self):
+        o = outside()
+        o["control"].update({"shift": [0, -70], "suspected": True, "best_correlation": 0.662})
+        res = self.gate(o)
+        self.assertEqual(res["verdict"], "PASS")
+        self.assertTrue(any("the control may have moved by [0, -70] px (correlation 0.662, under the minimum of 0.7 "
+                            "for a failure)" in n for n in res["notes"]), res["notes"])
+
+    def test_a_move_not_judged_under_screen_passes(self):
+        o = outside()
+        o["control"] = {"judged": False, "moved": False, "not_judged": "the whole screen may change"}
+        self.assertEqual(self.gate(o)["verdict"], "PASS")
 
     def test_a_clean_step_passes_and_below_the_hand_is_a_note(self):
         o = outside()
@@ -745,11 +1202,26 @@ class DocsTest(unittest.TestCase):
         self.assertIn("## 0.10.0", (root / "CHANGELOG.md").read_text())
         self.assertIn("### Validation, 0.10.0", (root / "PROVENANCE.md").read_text())
         self.assertIn("ui-probe 0.10.0", (root.parent.parent / "CHANGELOG.md").read_text())
-        # the plugin's own version only; the marketplace's is never pinned here
-        self.assertEqual(u.VERSION, "0.10.0")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.10.0")
+        # the plugin's version is pinned by the newest release's test (test_phone_0110), the marketplace's never
         self.assertEqual((v.OUTSIDE_MOVE_PX, v.OUTSIDE_CAME_BACK_MS, v.OUTSIDE_SEARCH_PX, u.CONTROL_AREA_MAX),
                          (8, 50, 300, 0.25))
+
+    def test_documented_0110(self):
+        root = Path(u.HERE).parent
+        readme = " ".join((root / "README.md").read_text().split())
+        for phrase in ("cross-correlation of the gradient magnitude", "reaches 0.7", "`places`", "`suspected`",
+                       "`best_correlation`", "`texture_ahead`", "`no_shift_if_moved`", "`at_no_shift`",
+                       "`already_there`", "`at_search_limit`", "`lookalikes`", "`not_judged`",
+                       "a day strip on an Android 14 emulator whose tapped chip moves 70 px and changes its look",
+                       "the farthest searched (300 px, or the frame's edge where the patch would be cut off)",
+                       "the control may have moved by"):
+            self.assertIn(phrase, readme, phrase)
+        changelog = (root / "CHANGELOG.md").read_text()
+        self.assertIn("rule (a): the control's move is judged by the zero-mean normalised",
+                      " ".join(changelog.split("## 0.10.0")[0].split()))
+        self.assertIn("### Validation, 0.11.0: the control's move", (root / "PROVENANCE.md").read_text())
+        self.assertIn("### Validation, 0.11.0: the control's move, second review", (root / "PROVENANCE.md").read_text())
+        self.assertIn("suspected", " ".join(changelog.split("## 0.10.0")[0].split()))
 
 
 if __name__ == "__main__":

@@ -647,39 +647,110 @@ A tap, url, text or key step can say what it may change:
   10 made them one group, joining only those over 30 left none larger than 27 px. A real redraw
   changes its pixels by far more than 30. Pixels inside the control's box
   widened by one block (24/1080 of the width), inside a `may_change` region widened by 3 px, or in
-  the system bars, are left out; with `"screen"` everything is left out but the control's own move.
+  the system bars, are left out; with `"screen"` everything is left out, and the control's own move
+  is not judged either (a navigation takes the control with it).
 - It fails (check `outside`, one line per rule) when:
-  - (a) the control moved: the content of its box, between the frame before the input and the
-    step's end, lies `move_px_min` or more away (searched vertically and horizontally up to 300 px;
-    the shift that matches must leave a mean change of at most 4 levels and at most half of the
-    change with no shift, and a plain box, whose grey spreads less than 4 levels, has no shift to
-    find). The match must be unique (no other shift within that tolerance), the content must be gone
-    from its old place, and it must not have been at the new place already before the input: a
-    switch that changed its own look among switches like it did not move;
+  - (a) the control moved: its content left its place for another `move_px_min` or more away,
+    found by the zero-mean normalised cross-correlation of the gradient magnitude of its grey patch,
+    which stays high when a tapped control changes its own look (bolder, darker, another colour,
+    inverted) where a difference of grey levels does not. Every vertical and horizontal shift up to
+    300 px is searched; each local best is a place. A place `move_px_min` or more away whose content
+    already stood there before the input (correlating then within 0.15 of now) is a lookalike that
+    did not arrive and is dropped: a switch flipped among switches like it. The places left within
+    0.15 of the best are where the control may be, and the shift told is the one nearest to its old
+    place. It moved when the best reaches 0.7; no place lies nearer than `move_px_min` to the old
+    place; the old place is gone (it correlates 0.15 or more under the best, and at most half of the
+    best or at most 0.15 over what it would keep had everything around moved by the shift too: a
+    short move of a strip overlaps its old place, a still icon over a list that scrolls stays at it);
+    something arrived at the new place (the part of the new box outside the old one, all of it for a
+    move longer than the control, holds at least half the edge spread the control's leading part
+    had, as deep: a knob that slides inside a still switch leaves that part empty); and the shift is not the farthest searched (300 px, or the frame's edge where the
+    patch would be cut off; content that lies against the edge is no limit). With all of that and a
+    best from 0.4 up to 0.7 the move is suspected: no failure, a note, "the control may have moved
+    by [dx, dy] px (correlation ..., under the minimum of 0.7 for a failure): look at
+    sheets/outside-<step>.png". A plain box, whose grey spreads less than 4 levels, has no shift to
+    find. With `"screen"` in `may_change` the move is not judged;
   - (b) a change outside is still there at the step's end;
   - (c) a band outside slid at any point by `move_px_min` or more (where the changed content came
     from in the frame before, by the same search, for the three largest groups of each frame). A
     slide is reported only when its match is unique: when another shift, more than two search steps
     away, also comes within the tolerance (content that repeats), no slide is told and the change is
-    judged by the other rules;
+    judged by the other rules. A slide whose best shift is the farthest searched (300 px, or the
+    frame's edge where the patch would be cut off) is not told either: the search cannot see whether
+    a farther shift matches better. Nor is one whose source still holds what it held: the place the
+    content came from must differ, in the frame where the slide is found, from itself in the frame
+    before by more than the tolerance (a slide vacates its source, overwrites it with what follows,
+    or, when short, moves its content on); a digit typed into a counter that turns into a copy of a
+    digit beside it, which stayed, is a change, not a slide (`slid` records `source_change`, levels). Two cases this rule cannot tell apart, and in both the step still
+    fails by (b): when the lookalike beside the changed content changes in the same step, a slide
+    is told (a counter turning from "0 24" into "2 34" read as a slide of 52 px); and a real slide
+    is not told when an identical copy of its content stays at its source (a banner sliding out
+    from under an identical banner);
   - (d) a change outside came back after lasting `came_back_ms_min` or more. On an Android 14
     emulator, a settings screen redrew the two rows beside a flipped switch for one frame, lasting
-    17 to 54 ms, and the check reported it every time, below the hand or failing at 54 ms. Its duration runs from
+    17 to 62 ms in live runs on one host and 84 to 144 ms in saved clips of the same act from
+    another, and the check reported it every time: below the hand under 50 ms, failing from 50 ms on. Its duration runs from
     the first frame that shows it to the first that no longer does, by the frames' own times: a
     recording on Android holds a frame only when the screen changes (a 150 s rest held 164 frames),
     so frame counts are not durations. One that came back sooner is reported in a note, "below the
     hand".
 - Where the defaults come from: 50 ms (three frames at 60 a second, the shortest a person sees
   reliably), 8 px at 1080 wide and the 25 % cap were set by this release's design; none was measured
-  for this release. The level of 10 and the minimum of 3e-5 are release 1's, measured on one phone
+  for this release. The control's move, from 0.11.0, was set from a day strip on an Android 14
+  emulator whose tapped chip moves 70 px and changes its look (18 steps: 0.866 to 0.901 at the move,
+  one place each, no shift -0.050 to 0.128, the new place before the input -0.040 to 0.102) and a
+  switch flipped among identical switches on an Android 14 emulator (8 steps: its neighbours
+  171 px away correlate 0.987 or 0.728, as much as they did there before the input, and are
+  dropped; the best left is at no shift, 0.727 to 0.728). 0.7 lies 0.166 under the weakest move;
+  0.15 lies 0.15 over the neighbours' gap (0 to 0.001) and 0.162 under the gap of 0.312 the weakest
+  move left to its next local best. The half for "gone"
+  costs nothing there (no shift keeps at most 0.146 of the best), and on synthetic strips it keeps
+  a still icon over a list scrolled 100 px from being told (0.501 at no shift against 0.708, 0.233
+  expected from the list alone); a strip moved 8 to 11 px keeps 0.559 to 0.572 at no shift, 0.601
+  to 0.624 expected, and is told. The suspected band's floor, 0.4, holds every stronger look change
+  measured on synthetic strips (a dark fill under light strokes 0.662, with bold 0.599, a 3 px
+  outline 0.561, the label 1.25 x 0.495, 0.8 x 0.445) and a diagonal move of (10, -10) (0.572); a
+  knob that slid inside a switch left 11.5 of edge spread before and 0.0 after, every move 0.93 or
+  more of it. Up to 0.10.0 a mean difference of grey levels judged the move and missed all 18 real
+  ones: a chip is mostly flat ground with small glyphs, so a shift onto flat ground scored about as
+  well as the true shift with a changed look. The level of 10 and the minimum of 3e-5 are release 1's, measured on one phone
   capture; the block is the block map's. A project that measures otherwise sets `came_back_ms_min`
   and `move_px_min` per step.
 - `run.json` holds per step with `scope` (key `outside`): the box and its source, the frame before
   and the last, each change outside with its box, start, duration and how it ended, the control's
-  search, the bands that slid, and the four verdicts. `sheets/outside-<step>.png` shows the frame
+  search, the bands that slid, and the four verdicts. The control's search (key `control`) holds
+  `measure` (in words), `peaks` (each local best of at least 0.2: `shift`, `correlation`,
+  `already_there`, `no_shift_if_moved`, `texture_ahead`, `at_search_limit`), `at_no_shift`, and the
+  judgement: `shift` (the place told, nearest to the old place), `correlation` (there),
+  `best_correlation` (the best place's, which the minimum and the band judge), `places` (how many
+  places within 0.15 of the best), `lookalikes` (peaks dropped as already there), `already_there`,
+  `no_shift_if_moved` and `texture_ahead` (`[before, after]`) at the shift, `at_search_limit`,
+  `gone`, `arrived`, `flat`, `judged`, `moved` and `suspected`; with `"screen"` allowed it holds
+  `judged: false`, `moved: false`, `suspected: false` and `not_judged`, the reason in words. `sheets/outside-<step>.png` shows the frame
   before the input, the frame with the most change outside and the last frame, with the box drawn.
 - Limits: the box comes from the tree the lookup read before the step, so a control that resizes
-  itself is judged by its old box. A change inside the widened box of the control is never seen,
+  itself is judged by its old box. Rule (a) misses or misreads, measured on synthetic frames: a
+  look change stronger than the suspected band (under 0.4) is neither told nor said; a diagonal
+  move is searched on one axis only ((10, -10): 0.572, said as suspected; (20, -20): 0.303;
+  (40, -40): no place over 0.2); a control over a photo or other busy ground that stays still (best
+  0.538, 0.472 at no shift: a place at its old one); text fainter than the texture floor (strokes
+  6 to 20 levels from the ground read as flat); a part that moves inside the control's own box is
+  told as the control's move when its edges carry the box (a label 10 px inside a button face:
+  0.999, and 0.873 with an outline that stays), and not when the part of the new place outside the
+  box is empty (a switch's knob); a part that moves inside the box beside a still edge on its
+  leading side is not told either, and no other rule sees a change inside the box (a label moved 20
+  or 40 px right beside a divider at the box's right edge: 0.924, nothing arrived outside the box);
+  a control that vanishes while a lookalike appears elsewhere is told as moved to the nearer one, by
+  design, since the control is no longer where it was (two copies 70 px up and 200 px down: told at
+  [0, -70]); a carousel that advances by two pitches while the tapped chip turns bold is missed, the
+  chip two along now standing in the old place (0.792 there against 0.901, so the old place is not
+  gone), where one pitch is told; a move of exactly 300 px or more, or to a cut-off edge. A control
+  told from its neighbours by its fill alone is a lookalike to it, and a box of a few long straight
+  edges cannot be placed along them. Only the frame before the input and the step's last frame are
+  compared: a control that moves and comes back is not seen by rule (a). In each case the step
+  still fails by another rule when what moved lands outside the control's widened box and the
+  allowed regions: a change still there, or a slide (the strip moved 70 px with a dark fill: still
+  there and slid; with the whole screen allowed: nothing). A change inside the widened box of the control is never seen,
   however large. A change outside smaller than the minimum group, or fainter than 10 levels, is not
   seen. A change between 10 and `join_level` levels (grey text on a grey background) is grouped
   without the closing, so thin strokes that faint stay under the minimum and are not seen: strokes
@@ -697,6 +768,143 @@ A tap, url, text or key step can say what it may change:
   than the closing (6 px) join, so two pieces of noise next to each other can reach the minimum
   together. On the iOS
   Simulator the times run from the recording's start, a moment before the input.
+
+## Recording a cabled iPhone: `ui-probe phone`
+
+A physical iPhone cabled to a Mac offers the Mac its screen, the way a Mac's movie recording of a
+phone reads it. `ui-probe phone` records that picture, on its owner's go, for `ui-probe film` to read
+(see "A film no run made").
+
+```sh
+ui-probe doctor --phone
+ui-probe phone list
+ui-probe phone record --seconds 120 --out <dir> --go "<the owner's words, or when they said go>" \
+    --build "<repository> <revision> <configuration>" [--device <id-prefix>]
+```
+
+- `record`, in order: (1) the lock in `<dir>`; (2) the recorder compiled, or taken from its cache;
+  (3) ONE recorder process started as `phone-screen record <seconds> <dir>/screen.mov`, which waits
+  for a phone up to 60 s by the clock and prints the devices it found as one line on stdout,
+  `{"offered": [{"id": ..., "name": ..., "model": ...}, ...]}`; (4) the choice, by the same rules as
+  before (the one phone, or the one device `--device` names); (5) `<dir>/film.json` created; (6) the
+  notice posted; (7) only then the chosen id written to the recorder's stdin as one line; (8) the
+  recording, its sound check, and `film.json` completed. A refusal at (4) or a notice that fails at
+  (6) closes the recorder's stdin instead: it stops without recording or writing anything (exit 11,
+  "no device chosen: nothing was recorded"), and no id is ever sent. After the id, `ui-probe` keeps
+  the recorder's stdin open until the recorder has ended, and the recorder watches it while it
+  records: if `ui-probe` ends first (killed, say), the end of input stops the recording at once; the
+  film is finalised and checked as on any other path, and the recorder exits 12 ("the program that
+  started the recording ended: the recording was stopped"). Bytes on its stdin during the recording
+  are ignored. The recorder waits for its
+  line at most 60 s; `ui-probe` waits for the offered line at most 135 s (macOS's camera prompt, at
+  most 60 s, then the wait for a phone, at most 60 s), and a recorder told to stop is killed if it
+  has not exited 10 s later. A recorder that offers nothing in time, offers a line that is not that
+  JSON object, or exits before offering is refused before anything is chosen, so no `film.json` is
+  written (the go has not been acted on) and the folder is left empty for the next run.
+- Why one process: once a process that saw a phone exits, the phone is not offered to the next
+  process for about 11 to 32 s (measured on one iPhone and one Mac, macOS 26, on 2026-11-13: five
+  listings back to back found the phone, then none, none, the phone again 32 s after the first ended,
+  then none; earlier the same day it came back 11 s after a listing ended). The first live run
+  listed in one process and recorded in a second, and the second found no phone (exit 4, nothing
+  recorded). So `record` never lists in one process and records in another; and when it finds no
+  phone at first it says once, on stderr, that a phone looked at a moment ago (by `ui-probe phone
+  list`, say) is offered again only after up to about half a minute. `list` waits up to 8 s and
+  says the same when it finds no phone.
+- `record` first takes a lock in `<dir>`: a file created only if it does not exist
+  (`<dir>/.ui-probe-phone.lock`, removed at the end), after which the folder must hold nothing but
+  that lock. A run that finds a lock or any other file refuses and writes nothing; a lock left by a
+  run that ended without removing it means a new folder. Compiling and listing come after the lock,
+  so no other run can fill the folder meanwhile. `record` then creates `<dir>/film.json` (only if it
+  does not exist, so another run's record is never replaced) before the recording starts (the go,
+  the build, the seconds asked, this tool's version, the device chosen, the recorder's SHA-256) and
+  completes it afterwards (the device's name and model, the start and stop in UTC, the seconds
+  recorded, the media types of the ports the phone offered, the exit status, and the status), and
+  the film to `<dir>/screen.mov`. Every rewrite of `film.json` goes to a temporary file beside it
+  and is renamed over it, so a full disk never leaves it empty. `film.json` always holds
+  `sound_checked` (true only when the recorder counted the film's tracks and reported a whole
+  number), `film_on_disk` (whether `screen.mov` exists at the end) and, when known, `tracks` (every
+  track's media type, such as `["vide"]`). The status is `done` only for a film checked and found to
+  hold no sound, whose `tracks` hold a picture track (`vide`) and no track that can hold sound (`soun`,
+  or `muxx` for a muxed one); any other film on disk counts as not checked; otherwise `failed: the film holds sound` (recorder exit 8), `failed: the film could
+  not be checked for sound` (exit 9), `failed: the film was not finalised` (exit 10), `failed: the
+  recorder's summary could not be read`, `failed: the recorder did not end within N s`, `failed`,
+  `not recorded` (no notice), `interrupted before recording: nothing was recorded` (Ctrl-C while the
+  notice is posted) or `interrupted` (Ctrl-C or a signal while recording, or after the recorder
+  returned and before `film.json` was completed; a final status already written is kept as it is), or
+  `failed: the recording was stopped: the recorder's input ended before the recording did` (exit 12,
+  seen only when `ui-probe` is alive to see it). A `film.json` that still says `recording` while no
+  recorder runs means `ui-probe` itself was killed (the lock is left too): the film on disk was not
+  checked by `ui-probe`, and whoever finds it should delete it. Exits 8, 9 and 10 are
+  mapped even when the recorder's summary is missing or cut short. Whenever a film is on disk that
+  holds sound or was not checked, the command says that whoever ran it should delete it; ui-probe
+  deletes no film.
+- When a recording starts the Mac posts a notification (`osascript -e 'display notification ...'`),
+  so the owner sees every recording begin. The text and the title reach AppleScript as arguments of a
+  run handler, never inside the script, so the owner's words (curly quotes, a dash) arrive as they
+  are. If the notice cannot be posted, nothing is recorded. A Ctrl-C that reaches `ui-probe` alone
+  while the notice is being posted can still let the notice appear although nothing is recorded. osascript returning 0 does not prove the
+  notice was shown: Focus, or notifications turned off for the program that runs osascript, hides it
+  without an error.
+  `list` and `record` print that the phone's status bar reads 9:41 while the Mac records it: the
+  clock in the film is not the time of day. Both are owner rulings.
+- The recorder is `scripts/phone_screen.swift`, compiled with `swiftc` on first use into
+  `${XDG_CACHE_HOME:-~/.cache}/ui-probe/phone/<SHA-256 of the source>/`; no binary ships, and the
+  installer only copies the source. `built.ok` beside the binary holds the SHA-256 of the source and
+  of the binary compiled from it; before every run the binary's SHA-256 is checked against it, a
+  binary that changed is compiled again (or the run refused if that fails), and it is never run.
+  `doctor --phone` checks for macOS and `swiftc`. macOS asks once
+  for camera access for the program that runs the recorder (a cabled phone's screen is a capture
+  device to the Mac).
+- What it never does, each held in code and by a test:
+  - the picture only: the phone is added with no connections and only its video ports are
+    connected, or its muxed ports when it offers no video port, as the recorder that first filmed a
+    phone for 113 s did; an audio port is never connected (connecting the sound makes the phone
+    treat the Mac as an audio accessory). `film.json` says which port types the phone offered and
+    which were connected ("video", or "muxed (no video port offered)"), so the first recording of a
+    phone answers what it offers. If the phone asks what kind of accessory the Mac is during a
+    recording, the picture-only rule failed on that phone: stop and report it. After each recording,
+    once the movie output has reported the film finished (a film it has not reported within 10 s
+    is never checked and fails with exit 10), the recorder opens the film, lists all its tracks and
+    counts as sound every track of type audio, every muxed track (a muxed port is the combined
+    stream) and every track with the audible characteristic; other tracks, such as timecode, are
+    listed and hold none. A film with no picture track could not be checked either (exit 9, "the film
+    holds no picture track"). The count waits at most 20 s by the clock, turning the run loop
+    meanwhile (each turn first waits on the count itself, so the time passes even on a run loop with
+    no source); unanswered, or on a film it cannot read, the film could not be checked (exit 9). `film.json` keeps the count
+    as `audio_tracks`. When the film holds sound, the run fails ("failed: the film holds sound") and
+    says so: the person who ran it deletes the film, since the tool deletes nothing; a film that
+    could not be checked fails as well. Only the whole number 0 is no sound (`false` or `0.0` are
+    not);
+  - no input, no install, no launch: the Swift source imports only AVFoundation, CoreMediaIO and
+    Foundation and names none of the calls that start a process, load code or drive another app
+    (Process, NSTask, posix_spawn, the exec and fork calls, system, dlopen, dlsym, NSAppleScript,
+    OSAScript, NSUserUnixTask, NSWorkspace); the Python module imports nothing of the rest of
+    ui-probe, its only process calls are three `subprocess.run` (swiftc, the recorder's `list`,
+    osascript) and one `subprocess.Popen` (the recorder's `record`, held from its offer to the end
+    of the recording), and no other verb calls it;
+  - no watch mode, no start on connect, nothing left running: one recording per command;
+  - `--go` and `--build` are required on the command line and never read from the environment or a
+    file; `--go` holds at least one letter or digit of any script, and `--build` at least three words
+    that each hold one (by Unicode category; an invisible character, such as a zero-width space or a
+    Hangul filler, is neither). This check refuses a statement with nothing a person can read in
+    it; it cannot tell a true statement from a false one, and that is the responsibility of whoever
+    runs the command;
+  - a recording lasts more than 0 and at most 300 s, in the Python module and again in the recorder;
+    no flag raises it ("anything longer needs a second go");
+  - with more than one phone offered it refuses without `--device` (the start of the id, matching
+    exactly one); with none it refuses; a device that is not an iPhone or iPad (by its model or
+    name: a camera, say) is recorded only when `--device` names it;
+  - an output that exists is refused, never replaced: `<dir>` must not exist or be empty (checked
+    again once the lock is held), `film.json` is created only if it does not exist, and the recorder
+    refuses an existing film;
+  - any system but macOS is refused.
+- The device is chosen by `ui-probe` from the recorder's offer and handed to the same process by its
+  whole id on its stdin; the recorder records exactly that device or nothing.
+- The first live run (macOS 26, an iPhone on a cable, unlocked) listed the phone in 0.8 s and found
+  the handover above; no recording has run yet. Unknown until one does: which port types a phone
+  offers (the first recording writes them into `film.json`), and whether the phone must be
+  unlocked. A phone that offers neither a video nor a muxed port is refused
+  ("the phone offers no picture port").
 
 ## A film no run made: `ui-probe film`
 

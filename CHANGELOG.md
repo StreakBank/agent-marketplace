@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.0 (2026-11-13)
+
+- ui-probe 0.11.0: `ui-probe phone list` and `phone record`, the recorder of a cabled iPhone's
+  screen, on its owner's go: a `film.json` written before the recording and completed after it, a
+  notice on the Mac when a recording starts, the picture only, a hard cap of 300 s, and a Swift
+  source compiled on first use. See `plugins/ui-probe/CHANGELOG.md`.
+- ui-probe 0.11.0, fixed: the check `outside` judges the control's move by a correlation of its
+  edges that survives the control's change of look (a tapped chip that moves 70 px and turns bold was
+  never told before), drops lookalikes that were already there, says a likely move under the
+  minimum as a note, does not judge the move when the whole screen may change, and tells no slide
+  at the edge of its search or from a source that stayed.
+
 ## 0.15.0 (2026-11-13)
 
 - ui-probe 0.10.0: `scope` on a tap, url, text or key step, and the gate's check `outside`: a step

@@ -26,7 +26,7 @@ Three kinds of result, three rules:
   statistical every duration, and any count that time or the network drives: report the
               distribution, never gate on an emulator or simulator.
 
-Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, film, proxy, tls-front, http-front, doctor.
+Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, film, phone, proxy, tls-front, http-front, doctor.
 See README.md.
 Exit codes: 0 success, 1 a gate failed, 2 an error the tool reports itself, 3 an unexpected error.
 """
@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -3604,9 +3604,16 @@ def gate_outside(fail, notes: list, sid: str, step: dict, s: dict) -> None:
     look = f" (sheets/outside-{sid}.png)" if o.get("strip") else ""
     if o["fails"]["moved"]:
         c = o["control"]
+        corr = (f"; correlation {c['correlation']:.3f} there, {c['at_no_shift']:.3f} at its place"
+                if c.get("correlation") is not None and c.get("at_no_shift") is not None else "")
         fail("outside", sid, f"the control moved: its content shifted by {c['shift']} px between the frame before the "
-             f"input and the step's end ({o['box_source']}; the limit is {o['move_px']:g} px)" + look,
+             f"input and the step's end ({o['box_source']}; the limit is {o['move_px']:g} px{corr})" + look,
              rule="moved", observed=c["shift"])
+    elif o["control"].get("suspected"):
+        c = o["control"]
+        notes.append(f"{sid}: the control may have moved by {c['shift']} px (correlation {c['best_correlation']:.3f}, "
+                     f"under the minimum of {_ui_video().OUTSIDE_MOVE_CORR_MIN:g} for a failure): look at "
+                     f"sheets/outside-{sid}.png")
     for c in o["changes"]:
         if c["ended"] != "came back":
             fail("outside", sid, f"a change outside the control is still there at the step's end: {c['box_px']} px, "
@@ -6247,7 +6254,7 @@ def ffmpeg_version(text: str) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def doctor(serial: str | None, simulator: str | None = None) -> dict:
+def doctor(serial: str | None, simulator: str | None = None, phone: bool = False) -> dict:
     checks = []
 
     def add(name, ok, detail, required=True, warning=False):
@@ -6263,8 +6270,8 @@ def doctor(serial: str | None, simulator: str | None = None) -> dict:
     add("python", sys.version_info >= (3, 9), sys.version.split()[0])
     tools = (("adb", ["adb", "version"]), ("ffmpeg", ["ffmpeg", "-version"]), ("ffprobe", ["ffprobe", "-version"]))
     for tool, cmd in tools:
-        if tool == "adb" and simulator:
-            continue            # a simulator run needs no adb
+        if tool == "adb" and (simulator or phone):
+            continue            # a simulator run, and the phone recorder, need no adb
         found = shutil.which(tool)
         detail = version_of(cmd) if found else "not on PATH"
         add(tool, bool(found), detail)
@@ -6330,6 +6337,12 @@ def doctor(serial: str | None, simulator: str | None = None) -> dict:
         else:
             add("input agent built for this Xcode", False, "xcodebuild is not on PATH (Xcode); a tap or a swipe on a "
                 "simulator needs it", required=False, warning=True)
+    if phone:
+        # What `ui-probe phone` needs. Checked here without importing the recorder or running it.
+        add("macOS", sys.platform == "darwin", sys.platform if sys.platform != "darwin" else "yes")
+        found = shutil.which("swiftc")
+        add("swiftc", bool(found), (version_of(["swiftc", "--version"]) or found) if found else
+            "not on PATH (Xcode or its command-line tools); the recorder is compiled on first use")
     ok = all(c["ok"] for c in checks if c["required"])
     return {"tool": {"name": "ui-probe", "version": VERSION}, "ok": ok, "checks": checks}
 
@@ -6425,10 +6438,13 @@ def main(argv: list[str] | None = None) -> int:
                    add_help=False)
     sub.add_parser("http-front", help="a plain front for a plain local backend, for an app on an Android emulator; "
                                       "with --log it logs the requests it pipes", add_help=False)
+    sub.add_parser("phone", help="record the screen of an iPhone cabled to this Mac, on its owner's go (list, record)",
+                   add_help=False)
     d = sub.add_parser("doctor", help="check the host tools, and a device if --serial or --simulator is given")
     dt = d.add_mutually_exclusive_group()
     dt.add_argument("--serial", default=None)
     dt.add_argument("--simulator", default=None, metavar="UDID")
+    dt.add_argument("--phone", action="store_true", help="check what `ui-probe phone` needs: macOS and swiftc")
 
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
@@ -6436,6 +6452,11 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, str(HERE))
             import tlsfront
             return tlsfront.main(argv[1:])
+        if argv[:1] == ["phone"]:
+            # The only caller of the phone recorder: no other verb imports it.
+            sys.path.insert(0, str(HERE))
+            import phone
+            return phone.main(argv[1:], VERSION)
         if argv[:1] == ["http-front"]:
             sys.path.insert(0, str(HERE))
             import httpfront
@@ -6648,7 +6669,7 @@ def _dispatch(args) -> int:
         for flag, value in (("--serial", args.serial), ("--simulator", args.simulator)):
             if value is not None and not value.strip():
                 raise ProbeError(f"{flag} needs a value; an empty one names no device")
-        out = doctor(args.serial or None, args.simulator or None)
+        out = doctor(args.serial or None, args.simulator or None, **({"phone": True} if args.phone else {}))
         for chk in out["checks"]:
             state = "ok  " if chk["ok"] else ("WARN" if chk.get("warning") else ("MISS" if chk["required"] else "none"))
             print(f"{state} {chk['check']}: {chk['detail']}")

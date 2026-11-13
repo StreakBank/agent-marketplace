@@ -32,7 +32,7 @@ DATA="${XDG_DATA_HOME:-$HOME/.local/share}/ui-probe/$VERSION"
 BIN="${PREFIX:-$HOME/.local/bin}"
 LAUNCHER="$BIN/ui-probe"
 MARK="# ui-probe launcher (written by the plugin's install.sh)"
-FILES="ui_probe.py ui_video.py pftrace.py shapeproxy.py tlsfront.py httppipe.py httpfront.py"
+FILES="ui_probe.py ui_video.py pftrace.py shapeproxy.py tlsfront.py httppipe.py httpfront.py phone.py phone_screen.swift"
 # The input agent for the iOS Simulator, copied beside the scripts (built on first use, into a cache).
 AGENT_FILES="ios-agent/Agent.xcodeproj/project.pbxproj ios-agent/Agent.xcodeproj/xcshareddata/xcschemes/Agent.xcscheme ios-agent/AgentUITests/AgentUITests.swift"
 AGENT_SRC="$HERE/.."
