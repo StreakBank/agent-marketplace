@@ -5,7 +5,6 @@ import sys
 
 sys.dont_write_bytecode = True
 
-import json
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -94,6 +93,7 @@ class StaleAlertOrderTest(t060.RehearsalBase):
 
 class DocsTest(unittest.TestCase):
     def test_documented(self):
+        # the plugin's version is pinned by the newest release's test (test_film_090), the marketplace's never
         root = Path(u.HERE).parent
         readme = " ".join((root / "README.md").read_text().split())
         for phrase in ("the largest of the app-side counts", "passes with a note on its step",
@@ -101,9 +101,6 @@ class DocsTest(unittest.TestCase):
             self.assertIn(phrase, readme, phrase)
         self.assertIn("## 0.8.2", (root / "CHANGELOG.md").read_text())
         self.assertIn("### Validation, 0.8.2", (root / "PROVENANCE.md").read_text())
-        # the plugin's own version only; the marketplace's is never pinned here (another plugin's bump moves it)
-        self.assertEqual(u.VERSION, "0.8.2")
-        self.assertEqual(json.loads((root / ".claude-plugin" / "plugin.json").read_text())["version"], "0.8.2")
         self.assertIn("ui-probe 0.8.2", (root.parent.parent / "CHANGELOG.md").read_text())
 
 

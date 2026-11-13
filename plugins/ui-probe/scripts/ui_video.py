@@ -21,12 +21,21 @@ Burst classes, from the frames alone:
                          marked "judge": "state" in the scenario is classed like a tap instead
   s   system only        only the status or navigation bar changed
   n   noise              a difference below the encoder-noise floor; counted, never part of a signature
+
+Shared with region allowances, `film` and `sheet --full`: full-resolution frames decoded on demand
+(iter_frames), a block map of what changed (blocks of BLOCK_OF_WIDTH of the width), places of a
+change as boxes in the app's area, and regions given as fractions of that area. analyze_film reads a
+film no run made, recorded at a constant frame rate: a frame of it changed only where it holds a
+connected group of changed pixels at least FILM_GROUP_SHARE of the picture.
 """
 from __future__ import annotations
 
 import json
+import math
+import shutil
 import struct
 import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +58,34 @@ FLAT_RANGE = 8          # a pixel whose 5x5 neighbourhood in the previous frame 
 FLAT_CHECK_ABOVE = 32   # the flat-area count is taken only for frames whose largest change is at most this
 ALIGN_TOL_S = 0.020
 MATCH_WINDOW_S = 0.070    # a video frame is matched to an app frame completed at most this long before it
+
+# The block map, at full resolution. A block's side is a fraction of the picture's width (24 px of
+# 1080), so one rule serves any resolution. A pixel counts above BLOCK_PIXEL_LEVEL levels on any
+# colour channel; a block counts when BLOCK_SHARE of its pixels count. Decisions use the change
+# measures; blocks say where a change is.
+BLOCK_OF_WIDTH = 24 / 1080
+BLOCK_PIXEL_LEVEL = 10
+BLOCK_SHARE = 0.40
+# A film no run made (`ui-probe film`). Measured on one phone capture (H.264, 60 a second, 1206 x
+# 2622): no two consecutive frames are bit-identical; at rest an ordinary frame has about 13 pixels
+# over 10 levels (up to 135), a key frame (every 30 frames, two changed pairs each) 730 to 1,340,
+# scattered, with no block at 40 %. The largest 8-connected group of such pixels was 32 px on an
+# ordinary frame and 36 px on a key frame (48 px at 6 levels); a real swipe put 690,000 to 780,000
+# pixels over the level. So a film's frame changed only where a connected group of pixels over the
+# level reaches FILM_GROUP_SHARE of the picture (96 px there, twice the noise's largest group at 6
+# levels); anything smaller is scattered, and the recording's.
+FILM_LEVEL = 10               # a pixel of a film counts above this many levels on any colour channel
+FILM_GROUP_SHARE = 3e-5       # the smallest 8-connected group of such pixels that is a change, of the picture
+FILM_CAUTION = 0.7            # a scattered group this large against the minimum earns a caution
+FILM_STEADY_SHARE = 0.25      # pixels over the level in this share of a window's frames are reported as places
+# A change slower than the minimum a frame (a fade of a few levels a frame, a bar that grows a few
+# pixels a frame) never shows between neighbours, so each frame is also compared with the frame
+# FILM_SLOW_S earlier (30 frames at 60 a second, half a key-frame interval apart or more), and each
+# window's last frame with its first, by the same group rule.
+FILM_SLOW_S = 0.5
+FILM_EXPLAIN_PX = 3           # a slow change within this many pixels of a counted change is that change
+PER_PAGE = 24                 # frames on one page of a distinct sheet
+PAGE_COLS = 6
 
 
 class VideoError(RuntimeError):
@@ -270,7 +307,11 @@ def sheet(path: Path, files: list[Path], frames: list[dict], title: str, cols: i
     img.save(path)
 
 
-def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dict, facts: dict) -> dict:
+def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dict, facts: dict,
+            locate: str = "real") -> dict:
+    """locate: which frames of a rest with `allow.regions` are placed in its regions, "real" (the
+    frames that count as the app changing its area: Android) or "changed" (every frame that changed
+    anything: the iOS Simulator, where each of them counts)."""
     pts = probe_pts(video)
     files = extract(video, out / "frames")
     n = min(len(pts), len(files))
@@ -343,6 +384,8 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
         order.append((s["id"], kind, marks.get(f"{s['id']}.start"), marks.get(f"{s['id']}.end")))
     (out / "sheets").mkdir(exist_ok=True)
     steps_out = []
+    by_step = {s["id"]: s for s in scn["steps"]}
+    to_place = []       # (step record, declared regions, [(frame index, ms since the step's start)])
     for sid, kind, start, end in order:
         if start is None or end is None:
             continue
@@ -367,7 +410,10 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
         real_idx = {f["i"] for b, info in zip(bursts, infos) if info["class"] not in ("s", "n") for f in b}
         real_frames = [f for f in app_frames if f["i"] in real_idx]
         steps_out.append({
-            "id": sid, "kind": kind, "video_frames": len(inside), "app_region_frames": len(app_frames),
+            "id": sid, "kind": kind, "start_s": start,
+            # the recording's frames in the window, by index (for `sheet --full`)
+            "first_frame": inside[0]["i"] if inside else None, "last_frame": inside[-1]["i"] if inside else None,
+            "video_frames": len(inside), "app_region_frames": len(app_frames),
             "identical_frames": sum(1 for f in inside if f["identical"]),
             "bursts": len([x for x in infos if x["class"] in MAJOR]),
             "signature": " ".join(x["class"] for x in infos if x["class"] in MAJOR) or "-",
@@ -390,6 +436,12 @@ def analyze(video: Path, out: Path, hwui_rows: list[dict], marks: dict, scn: dic
         })
         sheet(out / "sheets" / f"{sid}.png", files, inside,
               f"{scn['name']} / step {sid} ({kind}) - {len(inside)} video frames, signature: {steps_out[-1]['signature']}")
+        regions = ((by_step.get(sid) or {}).get("allow") or {}).get("regions")
+        if kind == "rest" and regions:
+            located = real_frames if locate == "real" else [f for f in inside if not f["identical"]]
+            to_place.append((steps_out[-1], regions, [(f["i"], round(f["rel_ms"], 1)) for f in located]))
+    if to_place:
+        place_regions(video, to_place, facts)
     (out / "video-frames.json").write_text(json.dumps(frames, indent=0))
     matched = sum(1 for f in frames if "hwui_ms" in f)
     lat = sorted(f["completed_to_composed_ms"] for f in frames if "completed_to_composed_ms" in f)
@@ -439,3 +491,783 @@ def zoom(video: Path, a: int, b: int, out: Path, margin: int = 24, scale: int = 
     strip.save(out)
     return {"changed_pixels": int(changed.sum()), "box_px": list(box), "frame_px": [ga.shape[1], ga.shape[0]],
             "max_delta": float(diff.max()), "image": str(out)}
+
+
+# --------------------------------------------------------------------------------------------
+# Full-resolution frames, the block map and region masks (shared by region allowances, `film` and
+# `sheet --full`)
+# --------------------------------------------------------------------------------------------
+
+def probe_size(video: Path) -> tuple[int, int]:
+    """The width and height of the recording's frames as stored (no rotation applied)."""
+    out = _run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                "-of", "csv=p=0", str(video)])
+    parts = out.strip().splitlines()[0].split(",") if out.strip() else []
+    try:
+        width, height = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        raise VideoError(f"ffprobe gave no frame size for {video}: {out.strip()[:120]!r}") from None
+    if width <= 0 or height <= 0:
+        raise VideoError(f"ffprobe gave a frame size of {width} x {height} for {video}")
+    return width, height
+
+
+def probe_header_frames(video: Path) -> int | None:
+    """The frame count the container's header states, or None when it states none. Not trusted: a
+    film's decoded frames are counted, and a header that differs is reported."""
+    out = _run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=nb_frames",
+                "-of", "csv=p=0", str(video)])
+    text = out.strip().splitlines()[0].strip().rstrip(",") if out.strip() else ""
+    return int(text) if text.isdigit() else None
+
+
+def frame_ranges(indices) -> list[tuple[int, int]]:
+    """Sorted frame indices as inclusive runs [(a, b), ...]."""
+    out: list[list[int]] = []
+    for i in sorted(set(indices)):
+        if out and i == out[-1][1] + 1:
+            out[-1][1] = i
+        else:
+            out.append([i, i])
+    return [(a, b) for a, b in out]
+
+
+def _select(indices) -> str:
+    return "select='" + "+".join(f"between(n\\,{a}\\,{b})" for a, b in frame_ranges(indices)) + "'"
+
+
+def iter_frames(video: Path, indices, size: tuple[int, int]):
+    """The recording's frames at the given indices, decoded at full resolution and in order: yields
+    (index, a height x width x 3 array of uint8). Raises VideoError when the decoder gives another
+    number of frames than was asked for, after the last one it gave."""
+    want = sorted(set(indices))
+    if not want:
+        return
+    width, height = size
+    nbytes = width * height * 3
+    cmd = ["ffmpeg", "-v", "error", "-noautorotate", "-i", str(video), "-vf", _select(want), "-fps_mode", "passthrough",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    with tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        except OSError as exc:
+            raise VideoError(f"cannot run ffmpeg: {exc.strerror or exc}") from exc
+        got, extra = 0, b""
+        try:
+            for i in want:
+                buf = proc.stdout.read(nbytes)
+                if len(buf) < nbytes:
+                    break
+                got += 1
+                yield i, np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 3)
+            if got == len(want):
+                extra = proc.stdout.read(nbytes)
+        finally:
+            if proc.poll() is None and got < len(want):
+                proc.kill()
+            proc.stdout.close()
+            proc.wait()
+        if proc.returncode not in (0, None) and got < len(want):
+            err.seek(0)
+            detail = (err.read().decode(errors="replace").strip().splitlines()[-1:] or ["no message"])[0][:300]
+            raise VideoError(f"ffmpeg failed with status {proc.returncode} while decoding frames: {detail}")
+        if got != len(want) or extra:
+            raise VideoError(f"the decoder gave {'more than ' if extra else ''}{got} of the {len(want)} frames asked for "
+                             f"(frames {want[0]} to {want[-1]} of {video.name}); the recording and its frame list disagree")
+
+
+def channel_delta(prev: np.ndarray, cur: np.ndarray) -> np.ndarray:
+    """Per pixel, the largest change on any colour channel (0 to 255), as uint8."""
+    return (np.maximum(prev, cur) - np.minimum(prev, cur)).max(axis=2)
+
+
+def block_side(width: int) -> int:
+    """A block's side in pixels: BLOCK_OF_WIDTH of the picture's width (24 of 1080)."""
+    return max(1, int(round(width * BLOCK_OF_WIDTH)))
+
+
+def app_rows(height: int, top: float, bottom: float) -> tuple[int, int]:
+    """The rows of the app's area at a frame height: top and bottom are the system bars' heights as
+    fractions of the height (the run's own insets, or the simulator's bands)."""
+    a, b = int(round(top * height)), height - int(round(bottom * height))
+    if not 0 <= a < b <= height:
+        raise VideoError(f"the system bars ({top:.3f} and {bottom:.3f} of the height) leave no app area")
+    return a, b
+
+
+def block_map(delta: np.ndarray, rows: tuple[int, int], level: int = BLOCK_PIXEL_LEVEL) -> dict:
+    """The app's area (rows) cut into square blocks of block_side(width): for each block the share of
+    its pixels that changed by more than level ('share'), and whether that share reaches BLOCK_SHARE
+    ('changed'). A block at the right or bottom edge is measured over the pixels it holds."""
+    top, bottom = rows
+    area = delta[top:bottom] > level
+    h, w = area.shape
+    side = block_side(delta.shape[1])
+    nr, nc = -(-h // side), -(-w // side)
+    pad = np.zeros((nr * side, nc * side), dtype=np.int32)
+    pad[:h, :w] = area
+    ones = np.zeros_like(pad)
+    ones[:h, :w] = 1
+    share = pad.reshape(nr, side, nc, side).sum(axis=(1, 3)) / ones.reshape(nr, side, nc, side).sum(axis=(1, 3))
+    return {"side": side, "rows": [top, bottom], "share": share, "changed": share >= BLOCK_SHARE}
+
+
+def _groups(grid: np.ndarray) -> list[list[tuple[int, int]]]:
+    """Cells of a boolean grid in groups that touch, corners included."""
+    seen = np.zeros_like(grid, dtype=bool)
+    groups = []
+    for r, c in zip(*np.nonzero(grid)):
+        if seen[r, c]:
+            continue
+        seen[r, c] = True
+        stack, cells = [(int(r), int(c))], []
+        while stack:
+            y, x = stack.pop()
+            cells.append((y, x))
+            for yy in range(max(0, y - 1), min(grid.shape[0], y + 2)):
+                for xx in range(max(0, x - 1), min(grid.shape[1], x + 2)):
+                    if grid[yy, xx] and not seen[yy, xx]:
+                        seen[yy, xx] = True
+                        stack.append((yy, xx))
+        groups.append(cells)
+    return groups
+
+
+def _box(mask: np.ndarray) -> list[int] | None:
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return None
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+
+
+def change_places(delta: np.ndarray, rows: tuple[int, int], level: int = BLOCK_PIXEL_LEVEL) -> list[list[int]]:
+    """Where a frame changed the app's area, as boxes [x0, y0, x1, y1] in pixels of that area (y from
+    its top row, end exclusive): one box per group of touching changed blocks, around the pixels above
+    level inside the group and the blocks next to it (a change's edge often lies in a block it covers
+    less than BLOCK_SHARE of), and one more box for each connected group of pixels above level outside
+    those groups that reaches film_min_group() of the picture (smaller pieces are left out).
+    A change too small for any block to reach BLOCK_SHARE is one box around every pixel above level,
+    or else around every pixel that changed at all. [] when nothing changed."""
+    bm = block_map(delta, rows, level)
+    top, bottom = rows
+    area = delta[top:bottom]
+    above = area > level
+    side = bm["side"]
+    nr, nc = bm["changed"].shape
+    boxes = []
+    covered = np.zeros((nr, nc), dtype=bool)
+    for cells in _groups(bm["changed"]):
+        grown = np.zeros((nr, nc), dtype=bool)
+        for r, c in cells:
+            grown[max(0, r - 1):r + 2, max(0, c - 1):c + 2] = True
+        covered |= grown
+        r0, c0 = min(r for r, _ in cells), min(c for _, c in cells)
+        r0, c0 = max(0, r0 - 1), max(0, c0 - 1)
+        r1 = min(nr, max(r for r, _ in cells) + 2)
+        c1 = min(nc, max(c for _, c in cells) + 2)
+        sel = np.kron(grown[r0:r1, c0:c1], np.ones((side, side), dtype=bool))
+        sub = above[r0 * side:r1 * side, c0 * side:c1 * side]
+        box = _box(sub & sel[:sub.shape[0], :sub.shape[1]])
+        boxes.append([box[0] + c0 * side, box[1] + r0 * side, box[2] + c0 * side, box[3] + r0 * side])
+    if boxes:
+        # Pixels over the level outside every grown group are held to a film's rule: each connected
+        # group of them at the minimum (3e-5 of the picture: a glyph redrawn in a label) is one more
+        # change with its own box; smaller pieces (scattered encoder noise) are left out.
+        rest = above & ~np.kron(covered, np.ones((side, side), dtype=bool))[:above.shape[0], :above.shape[1]]
+        least = film_min_group(delta.shape[1], delta.shape[0])
+        boxes += [box for size, box in pixel_groups(rest) if size >= least] if rest.any() else []
+        return boxes
+    for mask in (above, area > 0):
+        box = _box(mask)
+        if box is not None:
+            return [box]
+    return []
+
+
+def region_box(region, width: int, height: int) -> list[int]:
+    """A region given as fractions [x0, y0, x1, y1] of the app's area, in pixels of an area of that
+    size, widened to whole pixels."""
+    x0, y0, x1, y1 = region
+    return [int(math.floor(x0 * width)), int(math.floor(y0 * height)),
+            int(math.ceil(x1 * width)), int(math.ceil(y1 * height))]
+
+
+def as_fractions(box, width: int, height: int) -> list[float]:
+    return [round(box[0] / width, 4), round(box[1] / height, 4), round(box[2] / width, 4), round(box[3] / height, 4)]
+
+
+def _inside(box, rbox) -> bool:
+    return rbox[0] <= box[0] and rbox[1] <= box[1] and box[2] <= rbox[2] and box[3] <= rbox[3]
+
+
+def account_regions(changes: list[dict], regions: list[dict], width: int, height: int) -> tuple[list[int], list[dict]]:
+    """Which changes count against a rest and which against its regions. changes: one per frame that
+    counts as a change, in time order, {"i": frame index, "t_ms": ms since the step's start, "boxes":
+    change_places(...)}; width and height: the app's area in pixels. A change wholly inside a region
+    counts against that region; a change that crosses a region's edge, lies outside every region, or
+    could not be placed counts against the rest. A frame with changes of both kinds counts against
+    both. Returns (the frame indices counted against the rest, a report per declared region)."""
+    rboxes = [region_box(r["region"], width, height) for r in regions]
+    rest, held = [], [[] for _ in regions]
+    for ch in changes:
+        homes = [next((k for k, rb in enumerate(rboxes) if _inside(b, rb)), None) for b in ch["boxes"]]
+        if not homes or None in homes:
+            rest.append(ch["i"])
+        for k in sorted({h for h in homes if h is not None}):
+            boxes = [b for b, h in zip(ch["boxes"], homes) if h == k]
+            held[k].append({"i": ch["i"], "t_ms": ch["t_ms"],
+                            "box": as_fractions([min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                                 max(b[2] for b in boxes), max(b[3] for b in boxes)], width, height)})
+    reports = []
+    for reg, frames in zip(regions, held):
+        bursts = []
+        for f in frames:
+            if bursts and f["t_ms"] - bursts[-1]["end_ms"] <= BURST_GAP_S * 1000:
+                bursts[-1]["end_ms"] = f["t_ms"]
+                bursts[-1]["frames"] += 1
+            else:
+                bursts.append({"start_ms": f["t_ms"], "end_ms": f["t_ms"], "frames": 1})
+        starts = [b["start_ms"] for b in bursts]
+        gaps = sorted(b - a for a, b in zip(starts, starts[1:]))
+        where = None
+        if frames:
+            where = [min(f["box"][0] for f in frames), min(f["box"][1] for f in frames),
+                     max(f["box"][2] for f in frames), max(f["box"][3] for f in frames)]
+        reports.append({
+            "region": list(reg["region"]), "reason": reg.get("reason"), "changed_frames_max": reg.get("changed_frames_max"),
+            "changed_frames": len(frames),
+            "first_ms": frames[0]["t_ms"] if frames else None, "last_ms": frames[-1]["t_ms"] if frames else None,
+            "where": where, "times": len(bursts),
+            "longest_ms": max((round(b["end_ms"] - b["start_ms"], 1) for b in bursts), default=None),
+            "median_interval_ms": round(gaps[len(gaps) // 2], 1) if gaps else None,
+            "bursts": bursts, "frames": frames,
+        })
+    return rest, reports
+
+
+def place_regions(video: Path, to_place: list, facts: dict) -> None:
+    """For each rest with `allow.regions` in a recording analysed by analyze(): place the frames it
+    counts in its regions at full resolution and write the result into the step's record ('regions',
+    'rest_changed_frames'), or the reason it could not ('regions_error'). The app's area comes from the
+    run's own system-bar insets ('stable_insets_top_bottom' over 'height'), never from fixed rows."""
+    insets = facts.get("stable_insets_top_bottom")
+    if not insets or not facts.get("height"):
+        for rec, _regions, _frames in to_place:
+            rec["regions_error"] = "the run holds no system-bar insets, so the app's area and its regions cannot be placed"
+        return
+    width, height = probe_size(video)
+    rows = app_rows(height, insets[0] / facts["height"], insets[1] / facts["height"])
+    targets = {i for _rec, _reg, frames in to_place for i, _t in frames}
+    need = {j for i in targets for j in (i - 1, i) if j >= 0}
+    places, prev, prev_i = {}, None, None
+    for i, frame in iter_frames(video, need, (width, height)):
+        if i in targets and prev is not None and prev_i == i - 1:
+            places[i] = change_places(channel_delta(prev, frame), rows)
+        prev, prev_i = frame, i
+    for rec, regions, frames in to_place:
+        changes = [{"i": i, "t_ms": t, "boxes": places.get(i, [])} for i, t in frames]
+        rest, reports = account_regions(changes, regions, width, rows[1] - rows[0])
+        rec["regions"] = reports
+        rec["rest_changed_frames"] = len(rest)
+        rec["rest_changed_frame_indices"] = rest
+
+
+# --------------------------------------------------------------------------------------------
+# Sheets of distinct frames, and full-resolution frames on disk
+# --------------------------------------------------------------------------------------------
+
+def thumbnail(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    return img.convert("RGB").resize((THUMB_W, max(1, round(h * THUMB_W / w))), Image.BILINEAR)
+
+
+def distinct_pages(tiles: list[tuple[Image.Image, str]], dest: Path, stem: str, title: str) -> list[str]:
+    """Pages of PER_PAGE labelled thumbnails, sheets <stem>-distinct-01.png, -02.png, ... in dest.
+    Earlier pages of the same stem are removed first. Returns the page names."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for old in dest.glob(f"{stem}-distinct-*.png"):
+        old.unlink()
+    pages = []
+    total = (len(tiles) + PER_PAGE - 1) // PER_PAGE
+    for p in range(total):
+        chunk = [(thumbnail(img), label) for img, label in tiles[p * PER_PAGE:(p + 1) * PER_PAGE]]
+        tw = THUMB_W
+        th = max(t.size[1] for t, _ in chunk)
+        pad = 18
+        rows = (len(chunk) + PAGE_COLS - 1) // PAGE_COLS
+        page = Image.new("RGB", (PAGE_COLS * (tw + 6), rows * (th + pad) + 22), "white")
+        d = ImageDraw.Draw(page)
+        d.text((4, 4), f"{title} - page {p + 1} of {total}", fill="black")
+        for n, (t, label) in enumerate(chunk):
+            x = (n % PAGE_COLS) * (tw + 6)
+            y = 22 + (n // PAGE_COLS) * (th + pad)
+            page.paste(t, (x, y + pad))
+            d.text((x + 2, y + 3), label, fill="black")
+        name = f"{stem}-distinct-{p + 1:02d}.png"
+        page.save(dest / name)
+        pages.append(name)
+    return pages
+
+
+def extract_full(video: Path, indices: list[int], dest: Path) -> list[Path]:
+    """The recording's frames at the given indices (one run a to b) at full resolution, written as
+    f<index>.png into dest (emptied of earlier frames first). Raises VideoError when ffmpeg wrote
+    another number of frames than the indices name."""
+    a, b = min(indices), max(indices)
+    if sorted(set(indices)) != list(range(a, b + 1)):
+        raise ValueError("extract_full takes one run of consecutive indices")
+    dest.mkdir(parents=True, exist_ok=True)
+    for old in dest.glob("f*.png"):
+        old.unlink()
+    tmp = dest / ".extract"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    tmp.mkdir()
+    try:
+        _run(["ffmpeg", "-v", "error", "-i", str(video), "-vf", _select(range(a, b + 1)),
+              "-fps_mode", "passthrough", str(tmp / "x%06d.png")])
+        files = sorted(tmp.glob("x*.png"))
+        if len(files) != b - a + 1:
+            raise VideoError(f"{len(files)} frames were extracted where the recording's own list has {b - a + 1} "
+                             f"(frames {a} to {b} of {video.name})")
+        out = []
+        for n, f in enumerate(files):
+            target = dest / f"f{a + n:06d}.png"
+            f.replace(target)
+            out.append(target)
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------------------------
+# A film no run made: windows of a recording at a constant frame rate
+# --------------------------------------------------------------------------------------------
+
+def _label(mask: np.ndarray):
+    """The runs of True pixels along the rows of a 2-D mask, joined into 8-connected groups: (row,
+    first column, end column, group of each run, size of each group by its index), or None."""
+    ys, xs = np.nonzero(mask)
+    if not len(ys):
+        return None
+    brk = np.flatnonzero((np.diff(ys) != 0) | (np.diff(xs) != 1)) + 1
+    starts = np.concatenate(([0], brk))
+    ends = np.concatenate((brk, [len(ys)]))
+    ry = ys[starts]
+    rx0 = xs[starts]
+    rx1 = xs[ends - 1] + 1
+    n = len(starts)
+    parent = np.arange(n)
+
+    def find(a):
+        root = a
+        while parent[root] != root:
+            root = parent[root]
+        while parent[a] != root:
+            parent[a], a = root, parent[a]
+        return root
+
+    rows, first = np.unique(ry, return_index=True)
+    bounds = list(first) + [n]
+    for k in range(1, len(rows)):
+        if rows[k] != rows[k - 1] + 1:
+            continue
+        i, i1 = bounds[k - 1], bounds[k]
+        j, j1 = bounds[k], bounds[k + 1]
+        while i < i1 and j < j1:
+            if rx0[i] <= rx1[j] and rx0[j] <= rx1[i]:          # touching, diagonals included
+                a, b = find(i), find(j)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+            if rx1[i] <= rx1[j]:
+                i += 1
+            else:
+                j += 1
+    roots = np.array([find(k) for k in range(n)])
+    size = np.bincount(roots, weights=rx1 - rx0, minlength=n)
+    return ry, rx0, rx1, roots, size
+
+
+def pixel_groups(mask: np.ndarray) -> list[tuple[int, list[int]]]:
+    """The 8-connected groups of True pixels in a 2-D mask: (size, [x0, y0, x1, y1]) for each, the
+    box end-exclusive. Labelled by runs along the rows, joined where runs of adjacent rows touch,
+    diagonals included."""
+    lab = _label(mask)
+    if lab is None:
+        return []
+    ry, rx0, rx1, roots, size = lab
+    n = len(ry)
+    x0 = np.full(n, np.iinfo(np.int64).max)
+    y0 = np.full(n, np.iinfo(np.int64).max)
+    x1 = np.zeros(n, dtype=np.int64)
+    y1 = np.zeros(n, dtype=np.int64)
+    np.minimum.at(x0, roots, rx0)
+    np.minimum.at(y0, roots, ry)
+    np.maximum.at(x1, roots, rx1)
+    np.maximum.at(y1, roots, ry + 1)
+    return [(int(size[r]), [int(x0[r]), int(y0[r]), int(x1[r]), int(y1[r])]) for r in np.unique(roots)]
+
+
+def group_pixels(mask: np.ndarray, least: int) -> np.ndarray:
+    """The pixels of the 8-connected groups of mask of at least `least` pixels, as a mask."""
+    out = np.zeros(mask.shape, dtype=bool)
+    lab = _label(mask)
+    if lab is None:
+        return out
+    ry, rx0, rx1, roots, size = lab
+    keep = size[roots] >= least
+    if not keep.any():
+        return out
+    ry, rx0, rx1 = ry[keep], rx0[keep], rx1[keep]
+    lengths = rx1 - rx0
+    offsets = np.repeat(np.cumsum(lengths) - lengths, lengths)
+    out[np.repeat(ry, lengths), np.arange(lengths.sum()) - offsets + np.repeat(rx0, lengths)] = True
+    return out
+
+
+def _dilate(mask: np.ndarray, r: int) -> np.ndarray:
+    """mask grown by r pixels in every direction, diagonals included (a square of side 2r + 1)."""
+    out = mask.copy()
+    for d in range(1, r + 1):
+        out[:, d:] |= mask[:, :-d]
+        out[:, :-d] |= mask[:, d:]
+    rows = out.copy()
+    for d in range(1, r + 1):
+        out[d:, :] |= rows[:-d, :]
+        out[:-d, :] |= rows[d:, :]
+    return out
+
+
+def unexplained(pixels: np.ndarray, last: np.ndarray, since: int, r: int, excused: np.ndarray | None) -> np.ndarray:
+    """The pixels of `pixels` that are not within r pixels of a pixel counted as changed in frame
+    `since` or later (last: per pixel, the last frame it was part of a counted change; -1 never), and
+    not in `excused` (the window's regions). Worked out on the box around `pixels`, widened by r."""
+    ys, xs = np.nonzero(pixels)
+    out = np.zeros(pixels.shape, dtype=bool)
+    if not len(ys):
+        return out
+    h, w = pixels.shape
+    y0, y1 = max(0, int(ys.min()) - r), min(h, int(ys.max()) + 1 + r)
+    x0, x1 = max(0, int(xs.min()) - r), min(w, int(xs.max()) + 1 + r)
+    zone = _dilate(last[y0:y1, x0:x1] >= since, r)
+    if excused is not None:
+        zone |= excused[y0:y1, x0:x1]
+    out[y0:y1, x0:x1] = pixels[y0:y1, x0:x1] & ~zone
+    return out
+
+
+def _grey_thumb(frame: np.ndarray) -> np.ndarray:
+    return np.asarray(thumbnail(Image.fromarray(frame)).convert("L"), dtype=np.float32)
+
+
+def film_min_group(width: int, height: int) -> int:
+    """The smallest connected group of pixels over FILM_LEVEL that is a change in a film this size."""
+    return max(1, math.ceil(FILM_GROUP_SHARE * width * height))
+
+
+def steady_places(counts: np.ndarray, frames: int, width: int) -> list[dict]:
+    """Where pixels went over the level in at least FILM_STEADY_SHARE of a window's frames: boxes of
+    touching blocks holding such pixels, with how many pixels each holds. For information only."""
+    if frames <= 0:
+        return []
+    hot = counts >= max(1, math.ceil(FILM_STEADY_SHARE * frames))
+    if not hot.any():
+        return []
+    side = block_side(width)
+    h, w = hot.shape
+    nr, nc = -(-h // side), -(-w // side)
+    pad = np.zeros((nr * side, nc * side), dtype=bool)
+    pad[:h, :w] = hot
+    grid = pad.reshape(nr, side, nc, side).any(axis=(1, 3))
+    places = []
+    for cells in _groups(grid)[:20]:
+        sel = np.zeros_like(pad)
+        for r, c in cells:
+            sel[r * side:(r + 1) * side, c * side:(c + 1) * side] = True
+        part = pad & sel
+        places.append({"box": as_fractions(_box(part), w, h), "box_px": _box(part), "pixels": int(part.sum())})
+    return places
+
+
+def _over(a: np.ndarray, b: np.ndarray, rows: tuple[int, int]) -> tuple[np.ndarray, int, list]:
+    """The pixels over FILM_LEVEL between two frames in the app's rows, their 8-connected groups and
+    the size of the largest (0 when none)."""
+    app = (channel_delta(a, b) > FILM_LEVEL)[rows[0]:rows[1]]
+    groups = pixel_groups(app) if app.any() else []
+    return app, max((g[0] for g in groups), default=0), groups
+
+
+def analyze_film(video: Path, out: Path, windows: list[dict], insets_px: list[int], title: str,
+                 pictures: bool = True, slow_frames: int | None = None, slow_min_group: int | None = None,
+                 explain_px: int | None = None) -> dict:
+    """The recording analysis for a film that no run made (a phone's screen filmed by another
+    machine): one entry per window {"id", "start_s", "end_s", "regions"?}, judged as a rest.
+
+    Such a film is recorded at a constant frame rate, and no two of its frames need be bit-identical:
+    the encoder leaves scattered pixels changed in every frame, more on its key frames, and some
+    pixels flicker in place. A frame of the film changed the app's area only where it holds an
+    8-connected group of pixels over FILM_LEVEL of at least film_min_group() pixels; every smaller
+    group is scattered, the recording's, and left out. Per window the record says how many frames
+    held only scattered changes, the largest scattered group against the minimum, and the places
+    where pixels went over the level in FILM_STEADY_SHARE of the frames. insets_px: the system bars
+    in the film's own pixels [top, bottom]; [0, 0] takes the whole picture as the app's area.
+    pictures False writes no picture of any kind into out (no frames-full/, no sheets): every number is
+    kept, and the thumbnails the bursts are classed from stay in memory.
+
+    A change too slow to show between neighbours is caught by two more comparisons under the same
+    rule, with slow_min_group (default: the same minimum): each frame against the frame slow_frames
+    earlier (default: the frames in FILM_SLOW_S) when that frame lies in the window or is the one
+    before it, and the window's last frame against its first. Explained means the same pixels: per
+    pixel the analysis keeps the last frame in which it was part of a counted change. Of a slow group
+    of frame i, the pixels within explain_px (default FILM_EXPLAIN_PX) of a pixel counted in frames
+    i - k to i of the window, or inside one of its regions, are explained; what is left is grouped
+    again, and a group at the minimum counts (so a change made once is counted once). The ends work
+    the same way against every pixel counted in the window, and a group left over at the minimum is
+    unexplained: the gate fails it. A slow group is explained only by changes counted between
+    neighbours, never by a slow change counted earlier; the ends by both. A frame counts as changed when either
+    of its comparisons holds a group at its minimum; the ends are reported per window, and the gate
+    fails a window whose ends differ though no frame counted."""
+    pts = probe_pts(video)
+    n = len(pts)
+    if n == 0:
+        raise UnusableRecording("the film holds no video frames")
+    width, height = probe_size(video)
+    header = probe_header_frames(video)
+    top, bottom = int(insets_px[0]), int(insets_px[1])
+    if top < 0 or bottom < 0 or top + bottom >= height:
+        raise VideoError(f"the insets {insets_px} leave no app area in a film {height} px high")
+    rows = (top, height - bottom)
+    app_h = rows[1] - rows[0]
+    min_group = film_min_group(width, height)
+    gaps = sorted(b - a for a, b in zip(pts, pts[1:]) if b > a)
+    interval = gaps[len(gaps) // 2] if gaps else 0.0
+    k = slow_frames or (max(1, int(round(FILM_SLOW_S / interval))) if interval > 0 else 30)
+    slow_min = slow_min_group or min_group
+    r = FILM_EXPLAIN_PX if explain_px is None else explain_px
+    plan = []
+    for w in windows:
+        for key in ("start_s", "end_s"):
+            if w[key] > pts[-1] + interval + 1e-6:
+                raise VideoError(f"window '{w['id']}' {'starts' if key == 'start_s' else 'ends'} at {w[key]:g} s, "
+                                 f"beyond the film's last frame at {pts[-1]:.3f} s by more than one frame interval "
+                                 f"({interval * 1000:.1f} ms)")
+        idx = [i for i, p in enumerate(pts) if w["start_s"] <= p < w["end_s"]]
+        if len(idx) < 2:
+            raise VideoError(f"window '{w['id']}' ({w['start_s']:g} to {w['end_s']:g} s) holds {len(idx)} frame"
+                             f"{'' if len(idx) == 1 else 's'} of the film, which has {n} frames from {pts[0]:.3f} to "
+                             f"{pts[-1]:.3f} s")
+        base = idx[0] - 1 if idx[0] > 0 else idx[0]
+        plan.append({**w, "base": base, "judged": [i for i in idx if i > base]})
+    app_h_ = (height - bottom) - top
+    for p in plan:
+        p["rboxes"] = [region_box(reg["region"], width, app_h_) for reg in p.get("regions") or []]
+        p["excused"] = None
+        if p["rboxes"]:
+            p["excused"] = np.zeros((app_h_, width), dtype=bool)
+            for x0, y0, x1, y1 in p["rboxes"]:
+                p["excused"][max(0, y0 - r):y1 + r, max(0, x0 - r):x1 + r] = True
+    owner = {i: p["id"] for p in plan for i in p["judged"]}
+    ends = {i for p in plan for i in (p["judged"][0], p["judged"][-1])}
+    need = sorted({i for p in plan for i in range(p["base"], p["judged"][-1] + 1)})
+    full_dir = out / "frames-full"
+    for p in plan if pictures else []:
+        d_ = full_dir / p["id"]
+        d_.mkdir(parents=True, exist_ok=True)
+        for old in d_.glob("f*.png"):
+            old.unlink()
+
+    counts = {p["id"]: np.zeros((app_h, width), dtype=np.uint32) for p in plan}
+    window_of = {i: p for p in plan for i in p["judged"]}
+    kinds, info, thumbs, firsts, ends_seen = {}, {}, {}, {}, {}
+    # Per pixel, the last frame it was part of a change counted between neighbours (-1: never), and the
+    # pixels of the slow changes counted in the current window (for its ends only).
+    last = np.full((app_h, width), -1, dtype=np.int32)
+    slow_seen = np.zeros((app_h, width), dtype=bool)
+    prev = prev_i = None
+    # The frame k earlier comes from a second decoder that runs k frames behind the first, so that no
+    # more than two frames are held at a time.
+    lag = iter_frames(video, need, (width, height))
+    lag_i, lag_frame = -1, None
+    try:
+        for i, frame in iter_frames(video, need, (width, height)):
+            p = window_of.get(i)
+            if p is not None and i == p["judged"][0]:
+                firsts[p["id"]] = frame
+                slow_seen[:] = False
+            if p is not None and prev is not None and prev_i == i - 1:
+                over = channel_delta(prev, frame) > FILM_LEVEL
+                app = over[rows[0]:rows[1]]
+                counts[p["id"]] += app
+                count = int(app.sum())
+                rec = {"over_px": count, "largest_group_px": 0, "boxes": []}
+                if count:
+                    groups = pixel_groups(app)
+                    rec["largest_group_px"] = max(g[0] for g in groups)
+                    rec["boxes"] = [box for size, box in groups if size >= min_group]
+                    if rec["boxes"]:
+                        last[group_pixels(app, min_group)] = i
+                if i - k >= p["base"]:
+                    while lag_i < i - k:
+                        lag_i, lag_frame = next(lag)
+                    slow_px, largest, groups = _over(lag_frame, frame, rows)
+                    rec["slow_largest_group_px"] = largest
+                    rec["slow_boxes"] = []
+                    if largest >= slow_min:
+                        # The pixels within r of a change counted in these k frames of the window, or in a
+                        # region, are that change seen again; what is left is grouped again.
+                        big = group_pixels(slow_px, slow_min)
+                        left = unexplained(big, last, max(i - k, p["judged"][0]), r, p["excused"])
+                        left = group_pixels(left, slow_min)
+                        rec["slow_explained_px"] = int(big.sum() - left.sum())
+                        if left.any():
+                            # Not written into `last`: a slow change never explains a later slow group, so a
+                            # fade is counted in every frame it shows. It does explain the window's ends.
+                            rec["slow_boxes"] = [box for size, box in pixel_groups(left)]
+                            slow_seen |= left
+                by_frame, by_slow = bool(rec["boxes"]), bool(rec.get("slow_boxes"))
+                if by_frame or by_slow:
+                    kind = "changed"
+                    rec["by"] = "both" if by_frame and by_slow else ("frame" if by_frame else "slow")
+                else:
+                    kind = "scattered" if count else "still"
+                    if top or bottom:
+                        bars = np.concatenate((over[:rows[0]], over[rows[1]:]))
+                        if bars.sum() >= min_group and max(g[0] for g in pixel_groups(bars)) >= min_group:
+                            kind = "bars"
+                if kind == "changed":
+                    thumbs[i] = _grey_thumb(frame)
+                    thumbs.setdefault(i - 1, _grey_thumb(prev))
+                kinds[i], info[i] = kind, rec
+            if p is not None and i == p["judged"][-1]:
+                ends_px, largest, groups = _over(firsts[p["id"]], frame, rows)
+                left = []
+                if largest >= slow_min:
+                    counted = np.where(slow_seen, p["judged"][0], last)
+                    rest = unexplained(group_pixels(ends_px, slow_min), counted, p["judged"][0], r, p["excused"])
+                    left = [box for size, box in pixel_groups(rest) if size >= slow_min]
+                ends_seen[p["id"]] = (largest, [box for size, box in groups if size >= slow_min], left)
+            if pictures and p is not None and (i in ends or kinds.get(i) == "changed"):
+                Image.fromarray(frame).save(full_dir / p["id"] / f"f{i:06d}.png")
+            prev, prev_i = frame, i
+    finally:
+        lag.close()
+
+    steps = []
+    largest_scattered_all = 0
+    if pictures:
+        (out / "sheets").mkdir(parents=True, exist_ok=True)
+    for p in plan:
+        sid, start = p["id"], p["start_s"]
+        judged = p["judged"]
+        rel = lambda i: round((pts[i] - start) * 1000, 1)       # noqa: E731
+        changed = [i for i in judged if kinds.get(i) == "changed"]
+        scattered = [i for i in judged if kinds.get(i) == "scattered"]
+        largest_scattered = max((info[i]["largest_group_px"] for i in judged if i in info
+                                 and info[i]["largest_group_px"] < min_group), default=0)
+        largest_scattered_all = max(largest_scattered_all, largest_scattered)
+        slow_scattered = max((info[i].get("slow_largest_group_px", 0) for i in judged if i in info
+                              and info[i].get("slow_largest_group_px", 0) < slow_min), default=0)
+        ends_largest, ends_boxes, ends_unexplained = ends_seen[sid]
+        rboxes = [region_box(r["region"], width, app_h) for r in p.get("regions") or []]
+        ends_outside = [b for b in ends_boxes if not any(_inside(b, rb) for rb in rboxes)]
+        # Bursts are formed from the frames that changed; the rest are no change at all.
+        app_list, frames = [], []
+        for i in changed:
+            app_list.append(thumbs[i])
+            frames.append({"i": len(app_list) - 1, "t": pts[i], "app_changed": True, "film_i": i})
+        bursts, cur = [], []
+        for f in frames:
+            if cur and f["t"] - cur[-1]["t"] > BURST_GAP_S:
+                bursts.append(cur)
+                cur = []
+            cur.append(f)
+        if cur:
+            bursts.append(cur)
+        infos = []
+        for b in bursts:
+            infos.append(classify_burst("rest", b, thumbs[b[0]["film_i"] - 1], app_list))
+            infos[-1]["frames"] = [f["film_i"] for f in b]
+        rec = {
+            "frames": len(judged), "changed_app": len(changed), "scattered": len(scattered),
+            "still": sum(1 for i in judged if kinds.get(i) == "still"),
+            "bars_only": sum(1 for i in judged if kinds.get(i) == "bars"),
+            "min_group_px": min_group, "largest_scattered_group_px": largest_scattered,
+            "caution": largest_scattered >= FILM_CAUTION * min_group,
+            "steady_places": steady_places(counts[sid], len(judged), width),
+            "scattered_frames": scattered,
+            "signature": " ".join(x["class"] for x in infos if x["class"] in MAJOR) or "-",
+            "bursts": len(infos), "burst_detail": infos,
+            "largest_change_group_px": max((info[i]["largest_group_px"] for i in changed), default=0),
+            "most_changed_px": max((info[i]["over_px"] for i in changed), default=0),
+            "first_change_ms": rel(changed[0]) if changed else None,
+            "last_change_ms": rel(changed[-1]) if changed else None,
+            "drawing_frames": [{"i": i, "t_ms": rel(i), "by": info[i]["by"], "largest_group_px": info[i]["largest_group_px"],
+                                "slow_largest_group_px": info[i].get("slow_largest_group_px"),
+                                "boxes": [as_fractions(b, width, app_h) for b in info[i]["boxes"]],
+                                "slow_boxes": [as_fractions(b, width, app_h) for b in info[i].get("slow_boxes", [])]}
+                               for i in changed],
+            "changed_by_slow_only": sum(1 for i in changed if info[i]["by"] == "slow"),
+            "slow": {"frames_apart": k, "seconds_apart": round(k * interval, 3), "min_group_px": slow_min,
+                     "explain_px": r,
+                     "compared": sum(1 for i in judged if "slow_largest_group_px" in info.get(i, {})),
+                     "largest_scattered_group_px": slow_scattered, "caution": slow_scattered >= FILM_CAUTION * slow_min},
+            "ends": {"first_frame": judged[0], "last_frame": judged[-1], "differ": bool(ends_boxes),
+                     "differ_outside_regions": bool(ends_outside), "differ_unexplained": bool(ends_unexplained),
+                     "unexplained_boxes": [as_fractions(b, width, app_h) for b in ends_unexplained],
+                     "largest_group_px": ends_largest,
+                     "min_group_px": slow_min, "boxes": [as_fractions(b, width, app_h) for b in ends_boxes],
+                     "caution": not ends_boxes and ends_largest >= FILM_CAUTION * slow_min},
+            "base_frame": p["base"], "first_frame": judged[0], "last_frame": judged[-1],
+            "frames_full": f"frames-full/{sid}" if pictures else None,
+        }
+        if p.get("regions"):
+            # A frame is placed by its changes between neighbours and by those of its slow comparison
+            # that lie outside every region; a slow change inside a region counts against nothing (the
+            # region's limit counts frames that changed between neighbours).
+            changes, slow_inside = [], 0
+            for i in changed:
+                boxes = info[i]["boxes"] + [b for b in info[i].get("slow_boxes", [])
+                                            if not any(_inside(b, rb) for rb in rboxes)]
+                if boxes:
+                    changes.append({"i": i, "t_ms": rel(i), "boxes": boxes})
+                else:
+                    slow_inside += 1
+            rec["slow_inside_regions"] = slow_inside
+            rest, reports = account_regions(changes, p["regions"], width, app_h)
+            rec["regions"] = reports
+            rec["rest_changed_frames"] = len(rest)
+            rec["rest_changed_frame_indices"] = rest
+        if not pictures:
+            rec["sheet"], rec["distinct_sheets"] = None, []
+            steps.append({"id": sid, "kind": "rest", "start_s": start, "end_s": p["end_s"],
+                          "window_s": round(p["end_s"] - start, 3), "recording": rec})
+            continue
+        tiles = [(Image.open(full_dir / sid / f"f{i:06d}.png"), f"#{i} +{rel(i) / 1000:.3f} s") for i in changed]
+        pages = distinct_pages(tiles, out / "sheets", sid,
+                               f"{title} / window {sid} - {len(changed)} frames changed the app's area")
+        overview = out / "sheets" / f"{sid}.png"
+        if pages:
+            shutil.copyfile(out / "sheets" / pages[0], overview)
+        else:
+            img = thumbnail(Image.open(full_dir / sid / f"f{judged[0]:06d}.png"))
+            page = Image.new("RGB", (img.size[0], img.size[1] + 40), "white")
+            page.paste(img, (0, 40))
+            ImageDraw.Draw(page).text((4, 4), f"{sid}: no frame changed the app's area\n#{judged[0]}, the window's "
+                                      "first frame", fill="black")
+            page.save(overview)
+        rec["sheet"] = f"sheets/{sid}.png"
+        rec["distinct_sheets"] = [f"sheets/{x}" for x in pages]
+        steps.append({"id": sid, "kind": "rest", "start_s": start, "end_s": p["end_s"],
+                      "window_s": round(p["end_s"] - start, 3), "recording": rec})
+    floor = {"level": FILM_LEVEL, "min_group_share": FILM_GROUP_SHARE, "min_group_px": min_group,
+             "slow_frames": k, "slow_min_group_px": slow_min,
+             "largest_scattered_group_px": largest_scattered_all,
+             "caution": largest_scattered_all >= FILM_CAUTION * min_group,
+             "why": f"a frame changed the app's area only where an 8-connected group of pixels changed by more than "
+                    f"{FILM_LEVEL} levels holds at least {min_group} px ({FILM_GROUP_SHARE:g} of the picture); "
+                    "smaller groups are scattered, the recording's",
+             "decoded_frames": n, "header_frames": header}
+    return {"frames": n, "header_frames": header, "size": [width, height], "duration_s": round(pts[-1] - pts[0], 3),
+            "frame_interval_ms_median": round(interval * 1000, 2) if gaps else None,
+            "insets_px": [top, bottom], "app_rows": list(rows), "block_px": block_side(width),
+            "recording_floor": floor, "steps": steps}

@@ -26,7 +26,7 @@ Three kinds of result, three rules:
   statistical every duration, and any count that time or the network drives: report the
               distribution, never gate on an emulator or simulator.
 
-Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, proxy, tls-front, http-front, doctor.
+Commands: run, rehearse, analyze, summary, gate, compare, sheet, zoom, film, proxy, tls-front, http-front, doctor.
 See README.md.
 Exit codes: 0 success, 1 a gate failed, 2 an error the tool reports itself, 3 an unexpected error.
 """
@@ -54,7 +54,7 @@ import time
 import traceback
 from pathlib import Path
 
-VERSION = "0.8.2"
+VERSION = "0.9.0"
 HERE = Path(__file__).resolve().parent
 DEV_DIR = "/data/local/tmp/uiprobe"
 RECORD_LIMIT_S = 180          # screenrecord's documented maximum
@@ -75,9 +75,9 @@ LAUNCH_ENV_NAME_RE = re.compile(r"[A-Z][A-Z0-9_]*")
 LAUNCH_ENV_MAX = 20
 LAUNCH_ENV_VALUE_MAX = 200
 TOP_KEYS = {"name", "package", "activity", "launch_url", "until_quiet", "quiet", "launch_settle_ms", "launch_env", "count_signposts", "steps",
-            "count_sections", "gate", "launch_requests_max"}
+            "count_sections", "gate", "launch_requests_max", "watch_min_ms"}
 STEP_KEYS = {
-    "rest": {"ms", "meminfo", "background", "allow"},
+    "rest": {"ms", "meminfo", "background", "allow", "watch"},
     "tap": {"x", "y", "find", "find_settle_ms", "settle_ms", "until_quiet", "quiet"},
     "swipe": {"from", "to", "ms", "judge", "settle_ms", "until_quiet", "quiet"},
     "key": {"code", "settle_ms", "until_quiet", "quiet"},
@@ -91,6 +91,23 @@ QUIET_DEFAULTS = {"ms": 800, "max_ms": 15000}
 # recorded frames that changed nothing pass up to a number (some carets compose them); without it
 # that check stays at zero, and it is what catches an invisible animation.
 ALLOW_LIMITS = ("frames_max", "changed_frames_max", "cpu_pct_max", "updates_max", "unchanged_frames_max", "requests_max")
+# allow.regions: parts of the app's area (fractions [x0, y0, x1, y1]) where a change counts against the
+# region's own limit and not against the rest. Each carries its limit and its reason.
+REGION_KEYS = ("region", "changed_frames_max", "reason")
+REGIONS_MAX = 16
+# A rest marked "watch": true is one a person or an agent watches for a change made rarely; it lasts at
+# least this long (a window of exactly one minute can miss a change made once a minute). A scenario may
+# set its own minimum with a top-level "watch_min_ms".
+WATCH_MIN_MS = 70000
+WATCH_MIN_FLOOR_MS = 10000    # the least a scenario's watch_min_ms may be
+# A film no run made (`ui-probe film`): its scenario is built from the windows file and marked
+# "film": true; every step is a rest with "start_s" and "end_s" in the film's own seconds.
+FILM_PLATFORM = "film"
+FILM_TOP_KEYS = {"film", "name", "steps", "watch_min_ms"}
+FILM_STEP_KEYS = {"id", "do", "start_s", "end_s", "watch", "allow"}
+FILM_ALLOW_KEYS = ("changed_frames_max", "regions", "reason")
+FILM_NOT_CHECKED = ("frames by any count", "CPU", "requests", "the app's process", "which app is in front")
+FILM_CAUTION_PCT = 70         # ui_video.FILM_CAUTION, as a percentage for messages
 FIND_KEYS = {"text", "desc", "nth", "timeout_ms", "package", "scroll"}
 # find.scroll: swipes made while a read shows no acceptable match. max is required; from and to are
 # screen fractions like a swipe step's; the swipe must move at least SCROLL_MIN_TRAVEL of the screen
@@ -301,6 +318,12 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
     unit = lambda v: number(v) and 0 <= v <= 1
 
     need(isinstance(scn, dict), "must be a JSON object")
+    if scn.get("film") is True or platform == FILM_PLATFORM:
+        need(platform in (FILM_PLATFORM, "any"), "it is a film's windows (\"film\": true), which no device runs; "
+                                                 "`ui-probe film` reads a film by them")
+        need(scn.get("film") is True, "a film's run holds a scenario not marked \"film\": true; gate it with its own")
+        validate_film_scenario(scn, need)
+        return
     unknown = sorted(k for k in scn if k not in TOP_KEYS and not _is_comment(k))
     need(not unknown, f"unknown keys {unknown}")
     need(isinstance(scn.get("name"), str) and scn["name"], "'name' is required")
@@ -337,6 +360,7 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
         need(problem is None, problem)
     if "until_quiet" in scn:
         need(isinstance(scn["until_quiet"], bool), "'until_quiet' must be true or false")
+    check_watch_min(need, scn)
     steps = scn.get("steps")
     need(isinstance(steps, list) and steps, "'steps' must be a non-empty list")
     need(number(scn.get("launch_settle_ms", 0)) and scn.get("launch_settle_ms", 0) >= 0, "'launch_settle_ms' must be a number >= 0")
@@ -427,15 +451,21 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
             for k in ("meminfo", "background"):
                 if k in step:
                     need(isinstance(step[k], bool), f"step '{sid}': '{k}' must be true or false")
+            check_watch(need, scn, step, step["ms"])
             if "allow" in step:
                 allow = step["allow"]
                 need(isinstance(allow, dict), f"step '{sid}': 'allow' must be an object")
-                unknown = sorted(k for k in allow if k not in ALLOW_LIMITS + ("reason",))
-                need(not unknown, f"step '{sid}': unknown 'allow' keys {unknown}; known: {', '.join(ALLOW_LIMITS)}, reason")
-                need(isinstance(allow.get("reason"), str) and allow["reason"].strip(),
-                     f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
-                need(any(k in allow for k in ALLOW_LIMITS),
-                     f"step '{sid}': 'allow' needs at least one of {', '.join(ALLOW_LIMITS)}")
+                unknown = sorted(k for k in allow if k not in ALLOW_LIMITS + ("regions", "reason"))
+                need(not unknown, f"step '{sid}': unknown 'allow' keys {unknown}; known: {', '.join(ALLOW_LIMITS)}, "
+                                  "regions, reason")
+                need(any(k in allow for k in ALLOW_LIMITS) or "regions" in allow,
+                     f"step '{sid}': 'allow' needs at least one of {', '.join(ALLOW_LIMITS)} or 'regions'")
+                # Each region carries its own reason; the step's reason covers its limits.
+                if any(k in allow for k in ALLOW_LIMITS) or "reason" in allow:
+                    need(isinstance(allow.get("reason"), str) and allow["reason"].strip(),
+                         f"step '{sid}': 'allow.reason' is required: say why this screen is never still")
+                if "regions" in allow:
+                    check_regions(need, allow["regions"], f"step '{sid}'")
                 for k in ("frames_max", "changed_frames_max", "updates_max", "requests_max"):
                     if k in allow:
                         need(count(allow[k]), f"step '{sid}': 'allow.{k}' must be an integer >= 0")
@@ -561,6 +591,102 @@ def validate_scenario(scn: dict, platform: str = ANDROID, sim_mode: str = "run")
     fixed = scenario_duration_s(scn, worst_case=False)
     need(fixed <= RECORD_LIMIT_S - 10,
          f"fixed waits add up to about {fixed} s; the screen recorder stops at {RECORD_LIMIT_S} s. Split the scenario")
+
+
+def check_watch_min(need, scn: dict) -> None:
+    if "watch_min_ms" in scn:
+        v = scn["watch_min_ms"]
+        need(isinstance(v, (int, float)) and not isinstance(v, bool) and v >= WATCH_MIN_FLOOR_MS,
+             f"'watch_min_ms' must be a number of milliseconds of at least {WATCH_MIN_FLOOR_MS}")
+
+
+def watch_min_ms(scn: dict) -> float:
+    return scn.get("watch_min_ms", WATCH_MIN_MS)
+
+
+def check_watch(need, scn: dict, step: dict, ms: float) -> None:
+    """A rest marked "watch": true lasts at least the scenario's watch_min_ms (default WATCH_MIN_MS)."""
+    sid = step["id"]
+    if "watch" not in step:
+        return
+    need(isinstance(step["watch"], bool), f"step '{sid}': 'watch' must be true or false")
+    if step["watch"]:
+        least = watch_min_ms(scn)
+        need(ms >= least, f"step '{sid}': a watched rest lasts at least {least:g} ms ("
+                          + ("the scenario's 'watch_min_ms'" if "watch_min_ms" in scn else
+                             "a window of exactly one minute can miss a change made once a minute")
+                          + f"); this one lasts {ms:g} ms")
+
+
+def check_regions(need, regions, where: str) -> None:
+    """allow.regions: a list of {"region": [x0, y0, x1, y1] (fractions of the app's area, x0 < x1,
+    y0 < y1), "changed_frames_max": a whole number, "reason": why that part of the screen changes}."""
+    unit = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1   # noqa: E731
+    need(isinstance(regions, list) and 1 <= len(regions) <= REGIONS_MAX,
+         f"{where}: 'allow.regions' must be a list of 1 to {REGIONS_MAX} regions")
+    for n, reg in enumerate(regions, 1):
+        at = f"{where}: 'allow.regions' item {n}"
+        need(isinstance(reg, dict), f"{at} must be an object")
+        unknown = sorted(k for k in reg if k not in REGION_KEYS and not _is_comment(k))
+        need(not unknown, f"{at}: unknown keys {unknown}; known: {', '.join(REGION_KEYS)}")
+        box = reg.get("region")
+        need(isinstance(box, list) and len(box) == 4 and all(unit(v) for v in box) and box[0] < box[2] and box[1] < box[3],
+             f"{at}: 'region' must be [x0, y0, x1, y1], fractions of the app's area between 0 and 1 with x0 < x1 "
+             "and y0 < y1")
+        v = reg.get("changed_frames_max")
+        need(isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+             f"{at}: 'changed_frames_max' is required, a whole number of at least 0")
+        need(isinstance(reg.get("reason"), str) and reg["reason"].strip(),
+             f"{at}: 'reason' is required: say why this part of the screen changes")
+
+
+def validate_film_scenario(scn: dict, need) -> None:
+    """A film's windows, as `ui-probe film` stores them: {"film": true, "name", "steps": [{"id", "do":
+    "rest", "start_s", "end_s", "watch"?, "allow"?}], "watch_min_ms"?}. Windows do not overlap."""
+    number = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)     # noqa: E731
+    unknown = sorted(k for k in scn if k not in FILM_TOP_KEYS and not _is_comment(k))
+    need(not unknown, f"unknown keys {unknown} in a film's windows; known: {', '.join(sorted(FILM_TOP_KEYS))}")
+    need(isinstance(scn.get("name"), str) and scn["name"], "'name' is required")
+    check_watch_min(need, scn)
+    steps = scn.get("steps")
+    need(isinstance(steps, list) and steps, "a film needs at least one window")
+    seen, spans = set(), []
+    for n, step in enumerate(steps):
+        need(isinstance(step, dict), f"window {n + 1} must be an object")
+        sid = step.get("id")
+        need(isinstance(sid, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", sid or ""),
+             f"window {n + 1}: 'id' must be letters, digits, '-' or '_'")
+        need(sid not in RESERVED_IDS, f"window {n + 1}: id '{sid}' is reserved")
+        need(sid not in seen, f"window {n + 1}: id '{sid}' is used twice")
+        seen.add(sid)
+        unknown = sorted(k for k in step if k not in FILM_STEP_KEYS and not _is_comment(k))
+        need(not unknown, f"window '{sid}': keys {unknown} do not apply to a film's window; known: "
+                          f"{', '.join(sorted(FILM_STEP_KEYS - {'do'}))}")
+        need(step.get("do") == "rest", f"window '{sid}': a film's window is a rest ('do': 'rest')")
+        start, end = step.get("start_s"), step.get("end_s")
+        need(number(start) and number(end) and 0 <= start < end,
+             f"window '{sid}': 'start_s' and 'end_s' are seconds of the film, 0 <= start_s < end_s")
+        spans.append((start, end, sid))
+        check_watch(need, scn, step, (end - start) * 1000)
+        if "allow" in step:
+            allow = step["allow"]
+            need(isinstance(allow, dict), f"window '{sid}': 'allow' must be an object")
+            unknown = sorted(k for k in allow if k not in FILM_ALLOW_KEYS)
+            need(not unknown, f"window '{sid}': 'allow' keys {unknown} do not apply to a film, which holds only the "
+                              f"picture; known: {', '.join(FILM_ALLOW_KEYS)}")
+            need("changed_frames_max" in allow or "regions" in allow,
+                 f"window '{sid}': 'allow' needs 'changed_frames_max' or 'regions'")
+            if "changed_frames_max" in allow:
+                v = allow["changed_frames_max"]
+                need(isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+                     f"window '{sid}': 'allow.changed_frames_max' must be an integer >= 0")
+                need(isinstance(allow.get("reason"), str) and allow["reason"].strip(),
+                     f"window '{sid}': 'allow.reason' is required: say why this screen is never still")
+            if "regions" in allow:
+                check_regions(need, allow["regions"], f"window '{sid}'")
+    spans.sort()
+    for (a0, a1, aid), (b0, b1, bid) in zip(spans, spans[1:]):
+        need(b0 >= a1, f"windows '{aid}' and '{bid}' overlap ({a0:g} to {a1:g} s and {b0:g} to {b1:g} s)")
 
 
 # What a scenario for the iOS Simulator may hold: there is no input from a command line, no
@@ -3189,12 +3315,16 @@ def sim_recording_counts(mp4: Path, workdir: Path, step: dict | str, name: str) 
     mini_step = {"id": sid, "do": step["do"], "ms": 1}
     if "judge" in step:
         mini_step["judge"] = step["judge"]
+    regions = (step.get("allow") or {}).get("regions") if step["do"] == "rest" else None
+    if regions:
+        mini_step["allow"] = {"regions": regions}
     mini = {"name": name, "steps": [mini_step]}
     # The recording has no per-frame device clock: its own frame times are used, placed from 0.
     marks = {"T0": -0.3, f"{sid}.start": -1e12, f"{sid}.end": 1e12}
     facts = {"height": 1000, "stable_insets_top_bottom": list(SIM_BARS_PERMILLE)}
     try:
-        res = ui_video.analyze(mp4, workdir, [], marks, mini, facts)
+        # Every frame that changed anything counts on a simulator, so those are the ones placed in regions.
+        res = ui_video.analyze(mp4, workdir, [], marks, mini, facts, **({"locate": "changed"} if regions else {}))
     except ui_video.UnusableRecording as exc:
         return {"error": str(exc)}
     except ui_video.VideoError as exc:
@@ -3207,7 +3337,9 @@ def sim_recording_counts(mp4: Path, workdir: Path, step: dict | str, name: str) 
             "bars_only": max(0, frames - region - identical), "signature": seg["signature"],
             "largest_change": seg.get("largest_change"), "most_changed_px": seg.get("most_changed_px"),
             "most_flat_changed_px": seg.get("most_flat_changed_px"),
-            "sheet": str(sheet.relative_to(workdir.parent.parent)) if sheet.exists() else None}
+            "sheet": str(sheet.relative_to(workdir.parent.parent)) if sheet.exists() else None,
+            **{k: seg[k] for k in ("regions", "rest_changed_frames", "rest_changed_frame_indices", "regions_error")
+               if k in seg}}
 
 
 def analyze_sim(out: Path, scn: dict, cap: dict) -> dict:
@@ -3478,6 +3610,16 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
             # whatever its class. The classes are named for the reader; they decide nothing.
             total = rec["frames"]
             changed = total - rec["identical"]
+            regions = allow.get("regions")
+            in_regions = 0
+            if regions:
+                # A frame whose every change lies inside the step's regions counts against those
+                # regions, not against the rest: neither as a frame recorded nor as a frame changed.
+                rest_n, _why = region_counts(regions, rec)
+                if rest_n is not None:
+                    in_regions = max(0, changed - rest_n)
+                gate_regions(fail, notes, sid, regions, rec)
+                total, changed = total - in_regions, changed - in_regions
             classes = (f"{rec['changed_app']} changed the app's area, {rec['changed_app_noise']} changed it by "
                        f"encoder noise only, {rec['bars_only']} changed only the system bars, {rec['identical']} "
                        "changed nothing")
@@ -3500,6 +3642,8 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
                                  f"sheets/{sid}.png and with `ui-probe zoom <run-dir> <a> <b> --step {sid}`")
                 total = changed = 0
                 rec = {**rec, "identical": 0}
+            if in_regions:
+                classes += f"; {in_regions} more changed only inside the step's regions"
             if total > frames_max:
                 fail("rest-frames", sid, f"{total} frames recorded at rest ({classes}), allowed {frames_max}"
                      + by("frames_max"), observed=total, allowed=frames_max, source="recording", **extra("frames_max"))
@@ -3544,6 +3688,50 @@ def gate_sim_run(r: dict, scn: dict, opts: dict) -> dict:
             notes.append(f"{sid}: in the run but not in the scenario; not checked")
     notes.extend(request_notes(r))
     return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
+
+
+def region_counts(declared: list | None, rec: dict | None) -> tuple[int | None, str | None]:
+    """For a rest with allow.regions: (the frames its record counts against the rest, None) when the
+    record's region report was made for these regions, else (None, why it cannot be used)."""
+    if not declared:
+        return None, None
+    rec = rec or {}
+    if rec.get("regions_error"):
+        return None, rec["regions_error"]
+    report = rec.get("regions")
+    if report is None or "rest_changed_frames" not in rec:
+        return None, "the run holds no report of its regions (an analysis from before 0.9.0, or one made with " \
+                     "another scenario): run `ui-probe analyze` with this scenario"
+    if [list(r.get("region") or []) for r in report] != [list(r["region"]) for r in declared]:
+        return None, "the run's region report was made for other regions: run `ui-probe analyze --scenario` with " \
+                     "this scenario"
+    return rec["rest_changed_frames"], None
+
+
+def gate_regions(fail, notes: list, sid: str, declared: list, rec: dict, aligned: bool = True,
+                 what: str = "recorded frames") -> None:
+    """Each declared region against its own limit (check 'rest-region'). A region with no usable report
+    fails; region_counts says why."""
+    _rest, why = region_counts(declared, rec)
+    if why is not None:
+        fail("rest-region", sid, f"the step's regions could not be checked: {why}")
+        return
+    for k, (reg, rep) in enumerate(zip(declared, rec["regions"]), 1):
+        got, limit = rep["changed_frames"], reg["changed_frames_max"]
+        where = "[" + ", ".join(f"{v:g}" for v in reg["region"]) + "]"
+        when = ("" if not got else f"; from {rep['first_ms']:.0f} to {rep['last_ms']:.0f} ms after the step's start, "
+                f"{rep['times']} time{'s' if rep['times'] != 1 else ''}, the longest {rep['longest_ms']:.0f} ms")
+        if got > limit:
+            message = (f"region {k} {where} changed in {got} {what}, allowed {limit} by the region's allowance "
+                       f"({reg['reason']}){when}")
+            if aligned:
+                fail("rest-region", sid, message, observed=got, allowed=limit, region=reg["region"])
+            else:
+                notes.append(f"{sid}: {message} (the recording is not aligned with the step marks, so this is not a "
+                             "violation)")
+        elif got:
+            notes.append(f"{sid}: region {k} {where} changed in {got} {what}, within its allowance of {limit} "
+                         f"({reg['reason']}){when}")
 
 
 def gate_signposts(fail, sid: str, s: dict, expect: dict, spec: dict | None, store: dict) -> None:
@@ -3640,12 +3828,16 @@ def analyze_run(out: Path, scn: dict | None = None) -> dict:
         raise ProbeError(f"{out}: the capture holds no scenario; pass --scenario")
     platform = cap.get("platform", ANDROID)
     validate_scenario(scn, platform)
+    if platform == FILM_PLATFORM:
+        film_source(out, cap)       # a film that moved or changed is refused before anything is removed
     # A failed analysis must not leave an earlier result standing for gate, summary and compare.
     result_path = out / "run.json"
     if result_path.exists():
         result_path.unlink()
     if platform == SIM_PLATFORM:
         return analyze_sim(out, scn, cap)
+    if platform == FILM_PLATFORM:
+        return analyze_film_run(out, scn, cap)
     facts, trace, video = cap["device"], cap["trace"], cap["video"]
     raw = out / "raw"
     marks_text = _read_raw(raw, "marks.txt")
@@ -4838,6 +5030,8 @@ def load_runs(dirs: list[str]) -> tuple[list[tuple[str, dict]], list[dict]]:
 def run_row(path: str, r: dict) -> dict:
     if r.get("platform") == SIM_PLATFORM:
         return sim_run_row(path, r)
+    if r.get("platform") == FILM_PLATFORM:
+        return film_run_row(path, r)
     row = {"run": Path(path).name, "host_load1": r["host"]["load1_before"],
            "launch_total_time_ms": r["launch"]["total_time_ms"]}
     for s in r["steps"]:
@@ -5091,6 +5285,8 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                 within_allowance(counted, frames_otherwise, frames_max, f"frames drawn at rest ({source} count)")
             elif counted is None and usable:
                 notes.append(f"{sid}: no platform frame count for this app; only the recording was checked")
+            if allow.get("regions") and (vid is None or not shows_app):
+                notes.append(f"{sid}: the step's regions were not checked: there is no recording of the app for it")
             if vid is not None and not shows_app:
                 notes.append(f"{sid}: another app was in front, so the recording shows that app; it was not used for this step")
             elif vid is not None:
@@ -5107,6 +5303,15 @@ def gate_run(r: dict, scn: dict, opts: dict) -> dict:
                                   and not s.get("frames_compositor"))
                 identical = vid["identical_frames"]
                 real = vid.get("app_changed_frames_real", vid["app_region_frames"])
+                regions = allow.get("regions")
+                if regions:
+                    # A change inside one of the step's regions counts against that region's own limit,
+                    # not against the rest; one that crosses a region's edge counts against the rest.
+                    rest_n, _why = region_counts(regions, vid)
+                    if rest_n is not None:
+                        real = rest_n
+                    gate_regions(fail, notes, sid, regions, vid, aligned=aligned,
+                                 what="recorded frames in the app's area")
                 quiet_identical = identical > 0 and presented_none
                 quiet_change = real > 0 and presented_none and not changed_allowed
                 # A recorded frame that changed nothing is held against the app only as far as the app's own
@@ -5266,7 +5471,16 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
         opts = dict(GATE_DEFAULTS)
         opts.update(scn.get("gate") or {})
         opts.update({k: v for k, v in overrides.items() if v is not None})
-        res = gate_sim_run(r, scn, opts) if platform == SIM_PLATFORM else gate_run(r, scn, opts)
+        if platform == SIM_PLATFORM:
+            res = gate_sim_run(r, scn, opts)
+        elif platform == FILM_PLATFORM:
+            res = gate_film_run(r, scn, opts)
+        else:
+            res = gate_run(r, scn, opts)
+        if watch_min_ms(scn) < WATCH_MIN_MS:
+            res["notes"].append(f"the scenario's watch_min_ms is {watch_min_ms(scn):g} ms, below the default of "
+                                f"{WATCH_MIN_MS} ms: its watched rests may be too short to see a change made once a "
+                                "minute")
         allowances = {s["id"]: s["allow"] for s in scn["steps"] if "allow" in s}
         out["runs"].append({"run": str(path), "scenario": scn["name"], "frame_sources": r.get("frame_sources") or [],
                             "limits": opts, "allowances": allowances,
@@ -5277,6 +5491,342 @@ def gate(dirs: list[str], overrides: dict, scenario: dict | None = None) -> dict
     if unfinished:
         out["notes"] = unfinished
     return out
+
+
+# --------------------------------------------------------------------------------------------
+# a film no run made: `ui-probe film <video> --windows <json> --out <dir>`
+# --------------------------------------------------------------------------------------------
+
+WINDOWS_FILE_KEYS = {"windows", "name", "insets_px", "watch_min_ms", "slow_frames", "slow_min_group", "explain_px"}
+
+
+def load_windows(path: str, default_name: str) -> tuple[dict, list[int], dict]:
+    """A windows file: a list of windows, or {"windows": [...], "name"?, "insets_px"? [top, bottom] in the
+    film's pixels, "watch_min_ms"?}. A window: {"id", "start_s", "end_s", "watch"?, "allow"?}, the
+    untouched stretches of the film to judge as rests. slow_frames and slow_min_group (whole numbers of
+    at least 1) replace the slow comparisons' defaults. Returns the film's scenario, its insets and
+    those options."""
+    data = read_json(Path(path))
+    if isinstance(data, list):
+        data = {"windows": data}
+    if not isinstance(data, dict):
+        raise ProbeError(f"{path}: a windows file is a list of windows or an object with 'windows'")
+    unknown = sorted(k for k in data if k not in WINDOWS_FILE_KEYS and not _is_comment(k))
+    if unknown:
+        raise ProbeError(f"{path}: unknown keys {unknown}; known: {', '.join(sorted(WINDOWS_FILE_KEYS))}")
+    windows = data.get("windows")
+    if not isinstance(windows, list) or not all(isinstance(w, dict) for w in windows):
+        raise ProbeError(f"{path}: 'windows' must be a list of objects with 'id', 'start_s' and 'end_s'")
+    insets = data.get("insets_px", [0, 0])
+    if not (isinstance(insets, list) and len(insets) == 2
+            and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in insets)):
+        raise ProbeError(f"{path}: 'insets_px' must be [top, bottom], whole numbers of the film's pixels, 0 or more")
+    options = {}
+    for key, least in (("slow_frames", 1), ("slow_min_group", 1), ("explain_px", 0)):
+        if key in data:
+            v = data[key]
+            if not (isinstance(v, int) and not isinstance(v, bool) and v >= least):
+                raise ProbeError(f"{path}: '{key}' must be a whole number of at least {least}")
+            options[key] = v
+    scn = {"film": True, "name": data.get("name", default_name),
+           "steps": [{"do": "rest", **w} for w in windows]}
+    if "watch_min_ms" in data:
+        scn["watch_min_ms"] = data["watch_min_ms"]
+    try:
+        validate_scenario(scn, FILM_PLATFORM)
+    except ProbeError as exc:
+        raise ProbeError(f"{path}: {exc}") from exc
+    return scn, insets, options
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def film_run(video: Path, windows_path: str, out: Path, name: str | None = None, pictures: bool = True) -> dict:
+    """Judge the untouched windows of a film no run made, as rests, into a run folder that `gate` and
+    `summary` read: capture.json (the film named by its path, size and SHA-256; the film is never
+    copied), run.json, and, unless pictures is False, frames-full/ and sheets/ (then `zoom` and `sheet`
+    read it too, from the film at its path)."""
+    if not video.is_file():
+        raise ProbeError(f"{video} is not a file")
+    scn, insets, options = load_windows(windows_path, name or video.stem)
+    if name:
+        scn["name"] = name
+    refuse_used(out)
+    refuse_rehearsal_folder(out)
+    out.mkdir(parents=True, exist_ok=True)
+    try:
+        source = video.resolve()
+        (out / "capture.json").write_text(json.dumps({
+            "tool": {"name": "ui-probe", "version": VERSION}, "platform": FILM_PLATFORM, "scenario": scn,
+            "film": {"path": str(source), "bytes": source.stat().st_size, "sha256": file_sha256(source)},
+            "pictures": pictures, "insets_px": insets, **options, "trace": False, "video": True, "sections": False,
+        }, indent=1))
+        return analyze_run(out)
+    except BaseException as exc:
+        write_failed(out, exc, scn["name"])
+        raise
+
+
+def film_source(run: Path, cap: dict) -> Path:
+    """The film a film run was made from, at the path its capture names, checked against the size and
+    SHA-256 recorded there: the film is never copied into the run folder."""
+    film = cap.get("film") or {}
+    path = Path(film.get("path") or "")
+    if not film.get("path") or not path.is_file():
+        raise ProbeError(f"{run}: the film {film.get('path')} named by capture.json is not there; a film run keeps "
+                         "no copy of it")
+    if path.stat().st_size != film.get("bytes") or file_sha256(path) != film.get("sha256"):
+        raise ProbeError(f"{run}: the file at {path} is not the film this run was made from (its size or SHA-256 "
+                         "differs from capture.json)")
+    return path
+
+
+def refuse_no_pictures(run: Path, cap: dict, verb: str) -> None:
+    if cap.get("platform") == FILM_PLATFORM and cap.get("pictures") is False:
+        raise ProbeError(f"{verb}: {run} was made with --no-pictures and holds no picture; {verb} would make one")
+
+
+def analyze_film_run(out: Path, scn: dict, cap: dict) -> dict:
+    sys.path.insert(0, str(HERE))
+    import ui_video
+    film = cap.get("film") or {}
+    video = film_source(out, cap)
+    pictures = cap.get("pictures", True) is not False
+    windows = [{"id": st["id"], "start_s": st["start_s"], "end_s": st["end_s"],
+                "regions": (st.get("allow") or {}).get("regions")} for st in scn["steps"]]
+    try:
+        res = ui_video.analyze_film(video, out, windows, cap.get("insets_px") or [0, 0], scn["name"], pictures,
+                                    cap.get("slow_frames"), cap.get("slow_min_group"), cap.get("explain_px"))
+    except ui_video.VideoError as exc:
+        raise ProbeError(f"the film cannot be analysed: {exc}") from exc
+    by_id = {st["id"]: st for st in scn["steps"]}
+    result = {
+        "tool": cap.get("tool", {"name": "ui-probe", "version": VERSION}), "platform": FILM_PLATFORM,
+        "scenario": scn["name"], "package": None, "pictures": pictures,
+        "film": {"path": film.get("path"), "bytes": film.get("bytes"), "sha256": film.get("sha256"),
+                 **{k: res[k] for k in ("frames", "header_frames", "size", "duration_s", "frame_interval_ms_median",
+                                        "insets_px", "app_rows", "block_px")}},
+        "recording_floor": res["recording_floor"],
+        "steps": [{**st, "watch": bool(by_id[st["id"]].get("watch"))} for st in res["steps"]],
+        "frame_sources": ["film"], "video_requested": True, "trace_requested": False,
+        "not_checked": list(FILM_NOT_CHECKED),
+    }
+    tmp = out / "run.json.tmp"
+    tmp.write_text(json.dumps(result, indent=1))
+    tmp.replace(out / "run.json")
+    return result
+
+
+def film_floor_lines(r: dict) -> list[str]:
+    """What the film's analysis left out as the recording's own, and why, in sentences: the rule, the
+    header's frame count when it differs, and per window the frames with only scattered changes, the
+    largest scattered group beside the minimum (with a caution near it) and the steady places."""
+    floor = r.get("recording_floor")
+    if not floor:
+        return ["the run holds no measure of the recording's floor"]
+    lines = [floor["why"]]
+    if floor.get("header_frames") is not None and floor["header_frames"] != floor.get("decoded_frames"):
+        lines.append(f"the film's header states {floor['header_frames']} frames, but {floor['decoded_frames']} were "
+                     "decoded; the decoded frames are the ones counted")
+    for st in r.get("steps", []):
+        rec = st.get("recording") or {}
+        if "scattered" not in rec:
+            continue
+        sid = st["id"]
+        lines.append(f"{sid}: {rec['scattered']} of {rec['frames']} frames held only scattered changes and were left "
+                     f"out; the largest scattered group was {rec['largest_scattered_group_px']} px, the minimum for a "
+                     f"change {rec['min_group_px']} px")
+        if rec.get("caution"):
+            lines.append(f"{sid}: caution: a scattered group of {rec['largest_scattered_group_px']} px reached "
+                         f"{int(FILM_CAUTION_PCT)} % of the minimum or more; a small change of the app's may be near the "
+                         "line, so look at the frames")
+        slow = rec.get("slow") or {}
+        if slow:
+            lines.append(f"{sid}: each frame was also compared with the one {slow['frames_apart']} frames "
+                         f"({slow['seconds_apart']:g} s) earlier, {slow['compared']} times: "
+                         f"{rec.get('changed_by_slow_only', 0)} frames counted only by that comparison; its largest "
+                         f"scattered group was {slow['largest_scattered_group_px']} px, the minimum "
+                         f"{slow['min_group_px']} px")
+            if slow.get("caution"):
+                lines.append(f"{sid}: caution: in the comparison {slow['frames_apart']} frames apart a scattered group "
+                             f"of {slow['largest_scattered_group_px']} px reached {int(FILM_CAUTION_PCT)} % of the "
+                             "minimum or more")
+        ends = rec.get("ends") or {}
+        if ends:
+            lines.append(f"{sid}: the window's last frame (#{ends['last_frame']}) against its first "
+                         f"(#{ends['first_frame']}): " + ("they differ" if ends["differ"] else "they do not differ")
+                         + f", the largest group {ends['largest_group_px']} px, the minimum {ends['min_group_px']} px")
+            if ends.get("caution"):
+                lines.append(f"{sid}: caution: between the window's ends a scattered group of "
+                             f"{ends['largest_group_px']} px reached {int(FILM_CAUTION_PCT)} % of the minimum or more")
+        for place in rec.get("steady_places") or []:
+            lines.append(f"{sid}: pixels went over the level in at least a quarter of the frames at {place['box_px']} "
+                         f"({place['pixels']} px; x0, y0, x1, y1 in the app's area), for information")
+    return lines
+
+
+def gate_film_run(r: dict, scn: dict, opts: dict) -> dict:
+    """A film no run made: each window is a rest judged by the picture alone. A frame that changed the
+    app's area (a connected group of changed pixels at the film's minimum; scattered pixels are the
+    recording's) counts against the rest (check 'rest-video') or against the region it lies in (check
+    'rest-region')."""
+    violations, notes = [], []
+
+    def fail(check, sid, message, **extra):
+        violations.append({"check": check, "step": sid, "message": message, **extra})
+
+    notes.append("a film no run made holds only the picture: " + ", ".join(FILM_NOT_CHECKED) + " are not checked")
+    if r.get("pictures") is False:
+        notes.append("made with --no-pictures: the run folder holds no picture and no copy of the film")
+    film = r.get("film") or {}
+    if list(film.get("insets_px") or [0, 0]) == [0, 0]:
+        notes.append("the film's system bars were not given (insets_px), so the whole picture was taken as the app's area")
+    notes.extend(film_floor_lines(r))
+    records = {s["id"]: s for s in r.get("steps", [])}
+    for step in scn["steps"]:
+        sid = step["id"]
+        s = records.get(sid)
+        if s is None:
+            fail("missing-step", sid, f"the run holds no record of window '{sid}'")
+            continue
+        rec = s.get("recording")
+        if not rec or rec.get("error"):
+            fail("recording", sid, "the window could not be read from the film" + (f": {rec['error']}" if rec else ""))
+            continue
+        allow = step.get("allow") or {}
+        changed_max = allow.get("changed_frames_max", 0)
+        drawing = rec["changed_app"]
+        regions = allow.get("regions")
+        if regions:
+            rest_n, _why = region_counts(regions, rec)
+            if rest_n is not None:
+                drawing = rest_n
+            gate_regions(fail, notes, sid, regions, rec, what="frames of the film")
+        granted = "changed_frames_max" in allow
+        look = (f"; look at sheets/{sid}-distinct-01.png and frames-full/{sid}/" if r.get("pictures", True) is not False
+                else "; the run holds no picture (--no-pictures): run.json gives each frame's time and boxes")
+        if drawing > changed_max:
+            fail("rest-video", sid, f"the screen changed at rest: {drawing} frames of the film changed the app's area"
+                 + (f", allowed {changed_max} by the step's allowance ({allow['reason']})" if granted else "") + look,
+                 observed=drawing, **({"allowed": changed_max, "limit_from": "allowance"} if granted else {}))
+        elif granted and drawing:
+            notes.append(f"{sid}: {drawing} frames of the film changed the app's area at rest, above the limit of 0 that "
+                         f"would otherwise apply; passed on the step's allowance of {changed_max} ({allow['reason']})")
+        ends = rec.get("ends") or {}
+        if ends.get("differ_unexplained"):
+            fail("rest-video", sid, f"the window's last frame (#{ends['last_frame']}) differs from its first "
+                 f"(#{ends['first_frame']}) by a group of {ends['largest_group_px']} px (the minimum is "
+                 f"{ends['min_group_px']} px) that lies outside every change counted in the window and every "
+                 "region: a slow change" + look, observed=ends["largest_group_px"])
+    for sid in records:
+        if sid not in {st["id"] for st in scn["steps"]}:
+            notes.append(f"{sid}: in the run but not in the scenario; not checked")
+    return {"verdict": "FAIL" if violations else "PASS", "violations": violations, "notes": notes}
+
+
+def film_run_row(path: str, r: dict) -> dict:
+    row = {"run": Path(path).name}
+    for s in r["steps"]:
+        sid, rec = s["id"], s.get("recording") or {}
+        row[f"{sid}.film_frames"] = rec.get("frames")
+        row[f"{sid}.film_still_frames"] = rec.get("still")
+        row[f"{sid}.film_changed_app_frames"] = rec.get("changed_app")
+        row[f"{sid}.film_scattered_frames"] = rec.get("scattered")
+        row[f"{sid}.film_largest_scattered_group_px"] = rec.get("largest_scattered_group_px")
+        row[f"{sid}.film_slow_only_frames"] = rec.get("changed_by_slow_only")
+        row[f"{sid}.film_slow_largest_scattered_group_px"] = (rec.get("slow") or {}).get("largest_scattered_group_px")
+        row[f"{sid}.film_ends_largest_group_px"] = (rec.get("ends") or {}).get("largest_group_px")
+        row[f"{sid}.film_bars_only_frames"] = rec.get("bars_only")
+        row[f"{sid}.film_signature"] = rec.get("signature")
+        if "rest_changed_frames" in rec:
+            row[f"{sid}.film_rest_changed_frames"] = rec["rest_changed_frames"]
+        for k, reg in enumerate(rec.get("regions") or [], 1):
+            row[f"{sid}.film_region{k}_changed_frames"] = reg["changed_frames"]
+    return row
+
+
+# --------------------------------------------------------------------------------------------
+# sheet --full --distinct: full-resolution frames of each step's window, and sheets of the frames
+# that changed the app's area
+# --------------------------------------------------------------------------------------------
+
+def sheet_extras(run: Path, full: bool, distinct: bool) -> list[str]:
+    """After `sheet` has redone a run's analysis: with full, frames-full/<step>/f<index>.png for every
+    recorded frame of each step's window and the last one before it; with distinct, sheets
+    sheets/<step>-distinct-NN.png of only the frames that changed the app's area, PER_PAGE to a page,
+    each labelled with its index and its time since the step's start. Refuses (ProbeError) when the
+    recording's own frame count differs from the count the analysis read, or from the count extracted."""
+    sys.path.insert(0, str(HERE))
+    import ui_video
+    from PIL import Image
+    cap = read_json(run / "capture.json")
+    r = read_json(run / "run.json")
+    platform = cap.get("platform", ANDROID)
+    if platform == FILM_PLATFORM:
+        return ["a film's analysis writes frames-full/<window>/ (the frames that changed the app's area and the "
+                "window's first and last frames) and sheets/<window>-distinct-NN.png itself; --full and --distinct add "
+                "nothing"]
+    jobs = []      # (step id, recording, frame list, first, last, base or None, seconds since the step's start, thumbs)
+    if platform == SIM_PLATFORM:
+        for s in r.get("steps", []):
+            rec = s.get("recording")
+            if s["kind"] == "launch" or not rec or rec.get("error"):
+                continue
+            sid = s["id"]
+            frames = read_json(run / "video" / sid / "video-frames.json")
+            if len(frames) < 2:
+                continue
+            t0 = frames[0]["pts"]
+            jobs.append((sid, run / "raw" / f"rec-{sid}.mp4", frames, 1, len(frames) - 1, 0,
+                         (lambda f0: (lambda i, fr: fr[i]["pts"] - f0))(t0), run / "video" / sid / "frames"))
+    else:
+        v = r.get("video")
+        if not v:
+            raise ProbeError(f"{run}: the run has no analysed recording, so there are no frames to write")
+        frames = read_json(run / "video-frames.json")
+        for seg in v["steps"]:
+            if seg.get("first_frame") is None:
+                continue
+            a = seg["first_frame"]
+            jobs.append((seg["id"], run / "raw" / "screen.mp4", frames, a, seg["last_frame"], a - 1 if a > 0 else None,
+                         (lambda st: (lambda i, fr: fr[i]["t"] - st))(seg["start_s"]), run / "frames"))
+    lines, counted = [], {}
+    for sid, video, frames, a, b, base, since, thumbs in jobs:
+        if video not in counted:
+            try:
+                own = len(ui_video.probe_pts(video))
+            except ui_video.VideoError as exc:
+                raise ProbeError(f"{video}: {exc}") from exc
+            if own != len(frames):
+                raise ProbeError(f"{video}: the recording's own list holds {own} frames but the analysis read "
+                                 f"{len(frames)}; frames by index would not match the analysis, so nothing is written")
+            counted[video] = own
+        lo = a if base is None else base
+        if full:
+            try:
+                written = ui_video.extract_full(video, list(range(lo, b + 1)), run / "frames-full" / sid)
+            except ui_video.VideoError as exc:
+                raise ProbeError(f"{sid}: {exc}") from exc
+            lines.append(f"{sid}: {len(written)} full-resolution frames in frames-full/{sid}/ (frames {lo} to {b}"
+                         + (f"; #{base} is the last frame before the step" if base is not None else "") + ")")
+        if distinct:
+            changed = [i for i in range(a, b + 1) if frames[i].get("app_changed")]
+            thumb_files = sorted(thumbs.glob("f*.png"))
+            tiles = []
+            for i in changed:
+                src = run / "frames-full" / sid / f"f{i:06d}.png" if full else thumb_files[i]
+                tiles.append((Image.open(src), f"#{i} +{since(i, frames):.3f} s"))
+            pages = ui_video.distinct_pages(tiles, run / "sheets", sid,
+                                            f"{r.get('scenario')} / step {sid} - {len(changed)} frames changed the app's area")
+            lines.append(f"{sid}: {len(changed)} frames changed the app's area: "
+                         + (", ".join(f"sheets/{p}" for p in pages) if pages else "no sheet"))
+    return lines
 
 
 # --------------------------------------------------------------------------------------------
@@ -5561,6 +6111,19 @@ def main(argv: list[str] | None = None) -> int:
     t = sub.add_parser("sheet", help="redo the analysis of one saved run: rewrites run.json, video-frames.json, "
                                      "frames/ and the contact sheets")
     t.add_argument("run_dir")
+    t.add_argument("--full", action="store_true", help="also write every recorded frame of each step's window, and the "
+                                                       "last one before it, at full resolution under frames-full/<step>/")
+    t.add_argument("--distinct", action="store_true", help="also write sheets of only the frames that changed the "
+                                                           "app's area, 24 to a page: sheets/<step>-distinct-NN.png")
+    f = sub.add_parser("film", help="judge the untouched windows of a film no run made (a phone filmed by another "
+                                    "machine) as rests, into a run folder gate, summary and zoom read")
+    f.add_argument("video")
+    f.add_argument("--windows", required=True, help="a JSON file: the windows (id, start_s, end_s) to judge")
+    f.add_argument("--out", required=True, help="a directory that does not yet hold a run")
+    f.add_argument("--name", default=None, help="the name the run carries (default: the windows file's name, else the "
+                                                "film's file name)")
+    f.add_argument("--no-pictures", action="store_true", help="write no picture of any kind into the run folder (no "
+                                                              "frames, no sheets); every number is kept")
     z = sub.add_parser("zoom", help="full-resolution before/after/difference of two recorded frames")
     z.add_argument("run_dir")
     z.add_argument("a", type=int, help="frame index as printed on a sheet (#N)")
@@ -5693,12 +6256,31 @@ def _dispatch(args) -> int:
         found = [cap.parent for d in dirs for cap in sorted(Path(d).glob("**/capture.json"))]
         if not found:
             raise ProbeError("no capture.json found under " + ", ".join(dirs))
+        if args.cmd == "sheet":
+            for run in found:
+                refuse_no_pictures(run, read_json(run / "capture.json"), "sheet")
         for run in found:
             try:
                 analyze_run(run, scn)
             except ProbeError as exc:
                 raise ProbeError(f"{run}: analysis failed: {exc}") from exc
             print("analysed", run if args.cmd == "analyze" else run / "sheets")
+            if args.cmd == "sheet" and (args.full or args.distinct):
+                for line in sheet_extras(run, args.full, args.distinct):
+                    print(line)
+    elif args.cmd == "film":
+        res = film_run(Path(args.video), args.windows, Path(args.out), args.name, pictures=not args.no_pictures)
+        for st in res["steps"]:
+            rec = st["recording"]
+            print(json.dumps({"window": st["id"], "seconds": st["window_s"], "frames": rec["frames"],
+                              "changed_app": rec["changed_app"], "scattered": rec["scattered"], "still": rec["still"],
+                              "bars_only": rec["bars_only"], "largest_scattered_group_px": rec["largest_scattered_group_px"],
+                              "min_group_px": rec["min_group_px"], "signature": rec["signature"],
+                              **({"rest_changed": rec["rest_changed_frames"],
+                                  "regions": [x["changed_frames"] for x in rec["regions"]]} if "regions" in rec else {})}))
+        for line in film_floor_lines(res):
+            print(f"left out: {line}")
+        print(f"film: {args.out} (gate it with `ui-probe gate {args.out}`)")
     elif args.cmd == "summary":
         out = summary(args.dirs)
         for x in out["incomplete"]:
@@ -5728,7 +6310,11 @@ def _dispatch(args) -> int:
                 if run.get("allowances_from") == "--scenario" else ""
             for sid, allow in (run.get("allowances") or {}).items():
                 granted = ", ".join(f"{k} {allow[k]}" for k in ALLOW_LIMITS if k in allow)
-                print(f"  allowance: {sid}: {granted} ({allow['reason']}){source}")
+                if granted:
+                    print(f"  allowance: {sid}: {granted} ({allow['reason']}){source}")
+                for k, reg in enumerate(allow.get("regions") or [], 1):
+                    print(f"  allowance: {sid}: region {k} {reg['region']}: changed_frames_max {reg['changed_frames_max']} "
+                          f"({reg['reason']}){source}")
         for n in out.get("notes") or []:
             print(f"note: {n}")
         print(f"gate: {out['verdict']}" + (" (advisory)" if args.advisory and out["verdict"] == "FAIL" else ""))
@@ -5751,13 +6337,16 @@ def _dispatch(args) -> int:
         sys.path.insert(0, str(HERE))
         import ui_video
         run = Path(args.run_dir)
-        sim = (read_json(run / "capture.json").get("platform") == SIM_PLATFORM) if (run / "capture.json").exists() else False
+        cap = read_json(run / "capture.json") if (run / "capture.json").exists() else {}
+        sim = cap.get("platform") == SIM_PLATFORM
+        film = cap.get("platform") == FILM_PLATFORM
+        refuse_no_pictures(run, cap, "zoom")
         if sim and not args.step:
             raise ProbeError("zoom: a simulator run has one recording per rest step; pass --step <id> (the frame "
                              "numbers are those on sheets/<id>.png)")
         if args.step and not sim:
             raise ProbeError("zoom: --step applies only to a simulator run; this run has one recording")
-        video = run / "raw" / (f"rec-{args.step}.mp4" if sim else "screen.mp4")
+        video = film_source(run, cap) if film else run / "raw" / (f"rec-{args.step}.mp4" if sim else "screen.mp4")
         out = Path(args.out) if args.out else run / "sheets" / (f"zoom-{args.step}-{args.a}-{args.b}.png" if sim
                                                                 else f"zoom-{args.a}-{args.b}.png")
         try:

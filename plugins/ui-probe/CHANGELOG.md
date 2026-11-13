@@ -1,5 +1,65 @@
 # Changelog — ui-probe
 
+## 0.9.0 (2026-11-12)
+
+Reading a film frame by frame, rests watched long enough to see a change made once a minute, parts
+of a screen allowed to change on their own, and a film of a phone that no run made.
+
+- `sheet <run-dir> --full --distinct`. `--full` writes every recorded frame of each step's window and
+  the last frame before it at full resolution, as `frames-full/<step>/f<index>.png` by the
+  recording's own frame index (on the iOS Simulator, each step's whole recording). `--distinct`
+  writes sheets of only the frames that changed the app's area, 24 to a page
+  (`sheets/<step>-distinct-NN.png`), each labelled with its index and its time since the step's
+  start. Both refuse (exit 2) when ffprobe's frame list holds another number of frames than the
+  analysis read, or when ffmpeg writes another number for a window than the list names. The
+  Android analysis now records each step's first and last frame and its start (`first_frame`,
+  `last_frame`, `start_s` in `run.json`'s video steps); nothing else in it changes.
+- Watched rests: `"watch": true` on a rest. A watched rest lasts at least 70 s (a window of exactly
+  one minute can miss a change made once a minute) and the scenario check refuses a shorter one.
+  `watch_min_ms` at the top level of a scenario replaces the minimum; it is at least 10,000 ms, and
+  the gate notes every run of a scenario whose minimum is below 70,000 ms, with both numbers.
+- Region allowances on a rest: `allow.regions`, a list of up to 16 `{"region": [x0, y0, x1, y1],
+  "changed_frames_max": n, "reason": "..."}`, fractions of the app's area, all three keys required.
+  An `allow` that holds only `regions` needs no `reason` of its own. Each recorded frame that counts
+  as a change at rest is placed at full resolution on a block map (blocks of 24/1080 of the width, a
+  pixel above 10 levels, a block at 40 % of its pixels), and the pixels over the level outside every
+  group of changed blocks are one more change with a box of their own when they form a connected group
+  of at least 3e-5 of the picture; smaller pieces are left out. A change wholly inside a region counts
+  against that region and not against the rest; one that crosses a region's edge or lies outside
+  every region counts against the rest. `run.json` gets a report per region: how many frames, when
+  (first and last), where (the box of its changes), for how long (bursts and the longest) and how
+  often (bursts and the median time between them). The gate fails the new check `rest-region` when
+  a region is over its limit or the run holds no report for its regions. The system bars come from
+  the run's own insets on Android (a run with none cannot place regions and fails the check) and
+  from the simulator's bands on the iOS Simulator. On a simulator a frame whose every change lies
+  inside the regions also leaves the step's count of recorded frames. The frame counts are not
+  placed: a region that draws still needs `frames_max`.
+- `film <video> --windows <json> --out <dir>`: the untouched windows of a film no run made, judged
+  as rests by the picture alone, into a run folder (`capture.json` marked `film`, a copy of the film
+  in `raw/`, `run.json`, `frames-full/`, the sheets) that `gate`, `summary`, `zoom` and `sheet` read.
+  A frame changed the app's area only when it holds an 8-connected group of pixels changed by more
+  than 10 levels of at least 3e-5 of the picture (78 px at 1080 x 2400); smaller groups are
+  scattered, the recording's. The rule rests on one phone capture (H.264, 60 a second): no two of its
+  frames were bit-identical, its largest scattered group at rest was 36 px (48 px at 6 levels). Per
+  window and in `run.json` the verb says how many frames held only scattered changes, the largest
+  scattered group beside the minimum (a caution at 70 % of it) and where pixels went over the level
+  in a quarter of the frames. A change too slow to show between neighbours is caught by comparing
+  each frame also with the frame 0.5 s earlier and each window's last frame with its first, under the
+  same rule (`slow_frames` and `slow_min_group` in the windows file). Of a slow group, the pixels
+  within 3 px (`explain_px`) of a pixel counted between neighbours in the same half second, or in a
+  region, are explained, and a group of what is left at the minimum counts; a window's ends fail, with
+  any allowance, when what is left of their difference after the pixels counted in the window and
+  the regions makes a group at the minimum; and the slow comparisons are reported apart. `frames-full/` holds only the frames that changed and each window's
+  first and last. The film is never copied: `capture.json` names it by path, size and SHA-256, and
+  `analyze`, `sheet` and `zoom` check those before reading it again. `--no-pictures` writes no picture
+  of any kind (only `capture.json` and `run.json`, every number kept); `gate` and `summary` read such
+  a folder, and `zoom` and `sheet` refuse it. A header frame count that differs from the frames decoded is reported. A window
+  beyond the film's last frame by more than one frame interval is refused. Windows take `watch` and
+  an `allow` with `changed_frames_max` and `regions`; nothing else, since a film holds only the
+  picture. The first form of this verb (bit-identity, a fixed point of at most 4 px, a key-frame
+  period) counted every frame of a real capture as a change and was replaced before release.
+- Scenarios that use none of these keys are checked, analysed and gated as in 0.8.2.
+
 ## 0.8.2 — 2026-11-12
 
 - Android: the app's account of its frames, for the rule of 0.8.1, is the largest of the app-side

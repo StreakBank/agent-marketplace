@@ -10,7 +10,8 @@ on the iOS Simulator) and records what the platform and the screen did, without 
   flicker that leaves a state and returns to it.
 
 It knows a package name, screen coordinates and, for a tap that names its target, the target's
-text or content description. It names no app, screen, endpoint or UI framework.
+text or content description. It names no app, screen, endpoint or UI framework. A film of a phone's
+screen that no run made can be judged too, by its picture alone (see "A film no run made").
 
 ## Three kinds of result, three rules
 
@@ -133,6 +134,9 @@ with different files is not replaced without `--force`. The scripts can also be 
   the launch step's request count, gated as `expect.requests_max` is on a step. A cold start is the
   budget most worth holding.
 - Fixed waits must add up to less than the recorder's 180 s limit. Split longer scenarios.
+- `"watch": true` on a rest marks it as one watched for a change made rarely; it must last at least
+  70 s (see "Watched rests"). `watch_min_ms` at the top level replaces that minimum for the
+  scenario.
 
 More keys, one example each:
 
@@ -188,7 +192,8 @@ More keys, one example each:
 - `quiet` on a tap, swipe, key or text step replaces the scenario's `quiet` values for that step
   (a key it leaves out comes from the scenario). It applies only to a step that waits for quiet.
 - `allow` on a rest step raises its limits on purpose, with a reason. See "Screens that are never
-  still".
+  still". `allow.regions` lets parts of the screen change on their own limits (see "Regions that
+  change on their own").
 
 The file is checked strictly before anything runs, because a key the tool ignored would silently
 change what is gated:
@@ -215,7 +220,12 @@ change what is gated:
   requests").
 - `allow` takes `frames_max` and `changed_frames_max` (integers), `cpu_pct_max` (a number),
   `unchanged_frames_max` (an integer of at least 1), `updates_max` (an integer; the iOS Simulator
-  only), `requests_max` (an integer) and `reason` (required), and at least one of the limits. `find` takes `text` or `desc` (a
+  only), `requests_max` (an integer), `regions` (a list of 1 to 16 regions) and `reason`, and at
+  least one of the limits or `regions`. `reason` is required whenever a limit is given; an `allow`
+  that holds only `regions` needs none, since each region carries its own. A region takes `region`
+  (`[x0, y0, x1, y1]`, fractions of the app's area between 0 and 1 with `x0 < x1` and `y0 < y1`),
+  `changed_frames_max` (an integer of at least 0) and `reason` (a non-empty string), all three
+  required. `watch` is `true` or `false`; `watch_min_ms` is a number of at least 10000. `find` takes `text` or `desc` (a
   non-empty string of at most 200 characters on one line, with no tab, no other control
   character, no surrogate and no character outside the Basic Multilingual Plane: the window-tree
   dump never writes those as they are, so they could never match; the error names the character),
@@ -244,7 +254,9 @@ tick short of the default limit. A rest on such a screen takes an allowance for 
 - `frames_max` replaces the frames-at-rest limit and `cpu_pct_max` the CPU-at-rest limit for that
   step; `changed_frames_max` is how many recorded frames may change the app's area (otherwise
   none). A step's allowance wins over the command line and the scenario's `gate` block for that
-  step, and applies to no other step.
+  step, and applies to no other step. Within the step it is a budget that any change may spend:
+  frames allowed for a caret also cover another element that changes as often. To allow one
+  element only, give it a region (`allow.regions`, below).
 - Whether a caret's blink counts as a change in the app's area depends on how large the caret
   is in the recording. On a display 1080 px wide it did not (0 changed frames in 20 windows); on
   one 720 px wide the caret of a tall code field did, in 10 of 10 frames. Give such a rest
@@ -269,6 +281,61 @@ tick short of the default limit. A rest on such a screen takes an allowance for 
   does not help: the poll that watches for quiet takes about as long as the gap between two
   blinks. Measured on an emulator, a 400 ms window timed out on 2 of 2 such steps while the
   caret blinked every 500 ms.
+
+## Regions that change on their own
+
+A screen can be still except for one part that changes by design: a countdown, a clock, a live
+score. A rest can allow that part its own changes without allowing them anywhere else:
+
+```json
+{"id": "rest-countdown", "do": "rest", "ms": 70000, "watch": true,
+ "allow": {"regions": [{"region": [0.6, 0.0, 1.0, 0.12], "changed_frames_max": 80,
+                        "reason": "the countdown ticks once a second"}]}}
+```
+
+- A region is given as fractions of the app's area (the screen without its system bars), so one
+  file serves any resolution. The bars come from the run's own insets on Android
+  (`stable_insets_top_bottom`) and from the simulator's bands (70 and 45 thousandths of the height)
+  on the iOS Simulator, never from fixed rows. On Android a run whose device gave no insets cannot
+  place its regions, and each such rest fails `rest-region`.
+- Each recorded frame that counts as a change at rest (on Android a frame that changed the app's
+  area by more than encoder noise; on a simulator every frame that changed anything) is placed at
+  full resolution. The recording is decoded again for those frames and the one before each, and
+  what changed is found on a block map: blocks of 24/1080 of the width, a pixel counting above 10
+  levels on any colour channel, a block counting when 40 % of its pixels do. Touching changed
+  blocks make one change, whose box is the box of the changed pixels in those blocks and the blocks
+  next to them. Outside those groups the pixels over the level are held to the film's rule (see "A
+  film no run made"): each connected group of them of at least 3e-5 of the picture (a glyph redrawn
+  in a label) is one more change with a box of its own, and smaller pieces (scattered encoder noise)
+  are left out. A change too small for any block to count is placed by its changed pixels.
+- A change wholly inside a region counts against that region's `changed_frames_max` and not
+  against the rest. A change that crosses a region's edge, or lies outside every region, counts
+  against the rest as before (`changed_frames_max` of the step's `allow`, default none). A frame
+  with both counts against both. On the iOS Simulator a frame whose every change lies inside the
+  regions also leaves the step's count of recorded frames.
+- `run.json` holds a report per region under the step's recording record (`regions`): how many
+  frames changed inside it, when (the first and last, in ms after the step's start), where (the box
+  of every change inside it, as fractions of the app's area), for how long (bursts of changes less
+  than 350 ms apart, and the longest) and how often (the number of bursts and the median time
+  between their starts), with each frame's index and box. `rest_changed_frames` is what counts
+  against the rest.
+- The gate fails `rest-region` when a region changed in more frames than its limit, or when the run
+  holds no report for the step's regions (an analysis from before 0.9.0, or one made for other
+  regions: run `ui-probe analyze` with the scenario). A region within its limit gets a note with its
+  count, when it changed and how often.
+- A region allowance covers the recording only. The frame counts (the platform's, the compositor's,
+  a simulator's log store) do not say where a frame was drawn, so a rest whose countdown draws
+  frames still needs `frames_max` (and `updates_max` on a simulator) for them.
+
+## Watched rests
+
+A change made once a minute is missed by a rest of a few seconds, and by a window of exactly one
+minute that starts just after it. A rest marked `"watch": true` is the one an agent or a person
+watches for such changes, and it must last at least 70 s: the scenario check refuses a shorter one
+(`a watched rest lasts at least 70000 ms`). `watch_min_ms` at the top level of a scenario (or of a
+film's windows file) replaces the 70 s for that scenario; it is at least 10,000 ms, and the gate adds a
+note to every run of a scenario whose minimum is below 70,000 ms, naming both numbers. On Android a watched rest still counts
+toward the recorder's 180 s limit, so a scenario holds at most two of them with little else.
 
 ## Tap targets found on the device
 
@@ -362,6 +429,12 @@ keeps `failed.json`, and `gate` fails the run (see "Runs that did not complete")
   frames/               one thumbnail per recorded frame
   sheets/<step>.png     one contact sheet per step
   sheets/zoom-<a>-<b>.png and sheets/zoom-<a>-<b>-zoomtmp/   written by `zoom`
+  frames-full/<step>/   written by `sheet --full`: every recorded frame of the step's window and the
+                        last one before it, at full resolution, named f<index>.png by the recording's
+                        own frame index
+  sheets/<step>-distinct-NN.png   written by `sheet --distinct`: only the frames that changed the
+                        app's area, 24 to a page, each labelled with its index and its time since the
+                        step's start
 ```
 
 `analyze`, `gate`, `summary` and `compare` read only these files. No device is needed to redo
@@ -379,6 +452,17 @@ never passes on the two before it, and a folder holding only such runs fails the
 does the same for one run. Both rewrite `run.json`, `video-frames.json`, `frames/` and the sheets
 from the raw files, and remove the old `run.json` first, so a failed analysis never leaves an
 earlier result standing.
+
+`sheet <run-dir> --full --distinct` also writes what an agent needs to read a step's window frame
+by frame. `--full` writes every recorded frame of each step's window and the last frame before it
+at full resolution under `frames-full/<step>/` (on a simulator, each step's whole recording, its
+first frame being the screen as recording began). `--distinct` writes sheets of only the frames
+that changed the app's area, 24 to a page, labelled with the frame's index and its time since the
+step's start (from `frames-full/` with `--full`, else from the thumbnails). Either refuses (exit 2)
+when the recording's own frame list (ffprobe's) holds another number of frames than the analysis
+read, or when ffmpeg writes another number of frames for a window than the list names, since frames
+by index would then not match the analysis. On a film (see "A film no run made") the analysis writes
+both itself, and the two flags add nothing.
 
 ## Signatures
 
@@ -420,6 +504,7 @@ exits 1 on a violation.
 | Expectations | a step's `expect` is not met, or cannot be checked (no aligned recording for a signature, a section the app never emitted, a trace that lost data) |
 | Missing step, scenario | a step of the scenario has no record in the run, or its kind differs |
 | Analysis | a capture has no `run.json`, or one older than the capture: run `ui-probe analyze` |
+| Region at rest (`rest-region`) | a region of a rest's `allow.regions` changed in more recorded frames than its `changed_frames_max`, or the run holds no usable report of the step's regions (see "Regions that change on their own") |
 
 A clean app's frames at rest are zero; its CPU at rest is not always. On a real app three of 80
 still rest windows read 6 to 9 ticks in 5 s from background threads (the runtime's profile saver,
@@ -509,6 +594,103 @@ then the defaults. `--advisory` reports the same violations and exits 0. `gate -
 gates with a revised copy of the run's own scenario (a limit, an allowance): it refuses (exit 2) a
 scenario whose `name` differs from the one stored with the run, and each `allowance:` line then
 says that it came from `--scenario`.
+
+## A film no run made: `ui-probe film`
+
+A phone's screen can be filmed by another machine while a person uses it, with no run, no step
+marks and no counts. `ui-probe film <video> --windows <windows.json> --out <dir>` judges the
+stretches of such a film that nobody touched as rests, by the picture alone, into a run folder that
+`gate`, `summary`, `zoom` and `sheet` read.
+
+```json
+{"name": "evening-sit", "insets_px": [140, 100], "windows": [
+  {"id": "sit-home", "start_s": 4.0, "end_s": 76.0, "watch": true},
+  {"id": "sit-countdown", "start_s": 90.0, "end_s": 110.0,
+   "allow": {"regions": [{"region": [0.6, 0.0, 1.0, 0.12], "changed_frames_max": 25, "reason": "a countdown"}]}}
+]}
+```
+
+- The windows file is a list of windows, or an object with `windows` and optionally `slow_frames` and
+  `slow_min_group` (whole numbers of at least 1) and `explain_px` (a whole number of at least 0; see
+  below), `name` (else
+  `--name`, else the film's file name), `insets_px` (the system bars' heights in the film's own
+  pixels, `[top, bottom]`; without it the whole picture is taken as the app's area, and the gate
+  says so; a connected change only in the bars counts as `bars_only`) and `watch_min_ms`. A window has an `id`, `start_s` and `end_s` in the film's own seconds
+  (`0 <= start_s < end_s`), and may have `watch` and an `allow` with `changed_frames_max` (with a
+  `reason`) and `regions`. Windows may not overlap. Nothing else is accepted: a film holds only the
+  picture, so frame counts, CPU, requests and the app's process are not checked.
+- The film is never copied into the run folder. `capture.json` holds the windows as a scenario
+  marked `"film": true` and names the film by its absolute path, its size and its SHA-256; `analyze`,
+  `sheet` and `zoom` read the film at that path again and refuse (exit 2) when it is gone or its size
+  or SHA-256 differs. Keep the film where it was, or the run's numbers stand but cannot be redone.
+- Without `--no-pictures` the folder also holds `frames-full/<window>/` (at full resolution: the
+  frames that changed the app's area and the window's first and last frames, nothing else),
+  `sheets/<window>-distinct-NN.png` (the frames that changed, 24 to a page, labelled with the film's
+  frame index and the time since the window's start) and `sheets/<window>.png` (the first page, or the
+  window's first frame when nothing changed). `zoom <dir> <a> <b>` takes the film's own frame indices;
+  `--step` does not apply. `film` refuses a folder that already holds a run, as `run` does.
+- `--no-pictures` is for a film that shows what must not be kept: the folder then holds
+  `capture.json` and `run.json` and nothing else, no frame, no sheet, no thumbnail and no copy of the
+  film. Every number is kept: per window the frames, the frames that changed with their times and
+  the boxes of their changes, what was left out and why. `gate`, `summary` and `analyze` work on it
+  as on any film run; `zoom` and `sheet` refuse it with one line, since each would make a picture.
+- What changed is decided by how connected it is. Measured on one phone capture, H.264, 60 a second,
+  1206 x 2622 (6,683 frames decoded in 113 s): no two consecutive frames were bit-identical. At rest
+  the mean change was about 0.002 levels a pixel and the 99.9th percentile 1 level; an ordinary
+  frame had about 13 pixels over 10 levels (up to 135, some of them changing by 50 to 60), about ten
+  of them in two places in at least half of all frames; a key frame (every 30 frames, each making two
+  consecutive changed pairs) had 730 to 1,340 such pixels, scattered, touching 5 to 7 % of the blocks
+  with no block at 40 %. The largest 8-connected group of pixels over the level in any rest frame was
+  32 px on an ordinary frame and 36 px on a key frame (48 px at 6 levels). A real swipe put 690,000
+  to 780,000 pixels over the level.
+- So a frame of a film changed the app's area only when it holds a connected group of pixels (8-
+  connected, each changed by more than 10 levels on some colour channel) of at least 3e-5 of the
+  picture: 95 px at 1206 x 2622, 78 px at 1080 x 2400, about twice the noise's largest group at 6
+  levels. Every smaller group is scattered: the recording's, not the app's. A frame with no pixel over
+  the level is still. Nothing depends on two frames being identical, and nothing is dropped: a frame
+  that holds no such group is simply not a change. Bursts are formed from the frames that changed.
+- The verb says what it left out, in `left out: ...` lines, in the gate's notes and in `run.json`
+  (`recording_floor`, and per window): how many frames held only scattered changes, the largest
+  scattered group beside the minimum (with a caution when it reaches 70 % of the minimum: a small
+  change of the app's may then be near the line), and, for information, the places where pixels went
+  over the level in at least a quarter of the window's frames, as boxes. When the container's header
+  states another frame count than the frames decoded (6,986 against 6,683 on the capture above), it
+  says so; the decoded frames are the ones counted.
+- A change too slow to show between neighbours (a fade of a few levels a frame, a bar that grows a
+  few pixels a frame, a line that slides) is caught by two more comparisons under the same rule. Each
+  frame is also compared with the frame 0.5 s earlier (30 frames at 60 a second; `slow_frames` in the
+  windows file sets another number), when that frame lies in the window or is the one before it, and
+  each window's last frame with its first. A frame counts as changed when either of its comparisons
+  holds a group at the minimum (`slow_min_group` in the windows file sets another minimum for the
+  slow comparisons; by default it is the same). Of a group of the 0.5 s comparison, the pixels within 3 px
+  (`explain_px` in the windows file) of a pixel counted as changed between neighbours in that half
+  second of the same window, or inside one of its regions, are that change seen again; what is left is
+  grouped again, and a group at the minimum counts. A window's ends fail `rest-video`, whatever its
+  allowance, when the pixels of their difference that are not within 3 px of a pixel counted in the
+  window (between neighbours or by the 0.5 s comparison), nor inside a region, form a group at the
+  minimum. A slow change never explains a later slow group, so a fade counts in every frame it
+  shows. The memory this needs is one whole number per pixel (13 MB at 1206 x 2622). Per window,
+  `run.json` (`slow`, `ends`, `changed_by_slow_only`) and the notes give how many frames counted only
+  by the 0.5 s comparison, whether the ends differ, and the largest scattered group of each beside the
+  minimum, with the same caution at 70 %. The measured basis is the same capture's: frames 30 apart lie
+  in different key-frame groups there, so their noise may be larger than between neighbours, which is
+  why these numbers are reported for every window. Measured on that capture with the final rule: in
+  26 s of a screen at rest the largest scattered group was 57 px between neighbouring frames, 67 px
+  between frames 0.5 s apart and 38 px between the window's ends, against a minimum of 95 px, so the
+  0.5 s comparison is the narrowest margin there (70 %, where the caution starts). A film compressed
+  harder has larger groups: made with libx264 at crf 38, one key frame of a still picture counted as
+  a change (a group of 2,586 px), where at crf 23 nothing counted.
+- A window that starts or ends beyond the film's last frame by more than one frame interval is
+  refused, and so is a window that holds fewer than two frames.
+- Each window is a rest: the gate fails `rest-video` when more frames changed the app's area than
+  its `allow.changed_frames_max` (default none), and `rest-region` as on a run; on a film a change is
+  placed by its connected groups at the minimum, so the scattered pixels never count against the
+  rest. `summary` gives per window the frames, the still ones, those that changed the app's area,
+  those with only scattered changes and the largest scattered group (keys `<window>.film_*`).
+- 0.9.0's first form of this verb decided by bit-identity, a fixed point of at most 4 pixels and a
+  key-frame period. On the capture above it counted every frame of every window as a change: no two
+  frames were identical, the flickering pixels were more than 4, and no period was found. It was
+  replaced by the rule above before release.
 
 ## Comparing two builds
 
@@ -1337,6 +1519,35 @@ without `--rehearsal`, and the refusal says what to run first.
   takes that zone (see "Counting requests"): the rest rule does not see such a request, the step's
   `expect.requests_max` does. With an uncertainty of 0.03 to 0.06 s and a rest of 5 s or more, that
   is about 1 to 2 % of the rest.
+
+- **A film is judged by its picture alone.** A change smaller than the minimum group (78 px at
+  1080 x 2400: a dot of 6 x 6 px, a thin stroke that changes alone), or fainter than 10 levels (a
+  whole-picture fade of 5 levels a frame that stops within half a second and between the window's
+  ends), is not told from the recording and is not seen. A change made of separate pieces each under
+  the minimum (a spinner of 8 x 8 px dots) is not seen either. A slow change counts once it reaches
+  the minimum over 0.5 s, or between a window's ends; one that stays under it in both is not seen.
+  A change that touches scattered noise or a flickering place joins it into one group, so the group
+  can reach the minimum where the app's part alone would not; two scattered groups that touch count
+  as one, and two of the largest measured (36 to 40 px) touching would reach it. A slow change on the
+  very pixels of an allowed change (within 3 px) within half a second of it is taken as that change.
+  The measured basis of every default: the level of 10 and the minimum of 3e-5 of the picture (twice
+  the noise's largest group at 6 levels) come from one phone capture (H.264, 60 a second, 1206 x
+  2622); the 0.5 s of the slow comparison is half its key-frame interval of 30 frames, and its
+  minimum is the same 3e-5 until a real capture's 0.5 s comparisons are measured; the caution at 70 %
+  of the minimum and the steady places at a quarter of the frames are this plugin's choices. Another
+  encoder or bit rate may leave larger groups, which the caution line is there to show. The film is
+  read as stored: a rotation in its metadata is not applied. Its system bars are the `insets_px`
+  given, or none.
+- **Regions are placed on the recording, and only the recording's count leaves the rest.** The
+  frame counts do not say where a frame was drawn, so a countdown still needs `frames_max`. A
+  change is placed by the boxes of touching changed blocks, widened by the blocks next to them, so a
+  change that comes within a block of a region's edge from inside can be counted against the rest.
+  Two changes in one block group (a countdown and a badge beside it) make one box. Outside the block
+  groups a change made only of pieces smaller than the minimum (3e-5 of the picture, 78 px at 1080 x
+  2400) is not counted against the rest.
+- **`sheet --full` writes every recorded frame of a window at full resolution.** On a busy step of
+  a long Android recording that can be many megabytes; a film's own folder keeps only the frames
+  that changed and each window's first and last.
 
 ## Project shim
 

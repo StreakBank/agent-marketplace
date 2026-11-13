@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.0 (2026-11-12)
+
+- ui-probe 0.9.0: `sheet --full --distinct` writes each step's frames at full resolution and sheets
+  of only the frames that changed, and refuses when the frame counts disagree; a rest marked
+  `"watch": true` lasts at least 70 s; `allow.regions` lets parts of a resting screen change on
+  limits of their own, with a report per region and a new gate check `rest-region`; and `film`
+  judges the untouched windows of a film no run made, counting a frame as a change only where a
+  connected group of changed pixels reaches 3e-5 of the picture, between neighbours, half a second
+  apart or between a window's ends, and saying what it left out; it never
+  copies the film, and with `--no-pictures` writes no picture at all. See
+  `plugins/ui-probe/CHANGELOG.md`.
+
 ## 0.13.3 — 2026-11-12
 
 - ui-probe 0.8.2: on Android a recorded frame that changed nothing at rest is set aside only beyond

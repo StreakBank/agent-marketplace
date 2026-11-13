@@ -603,6 +603,163 @@ stale alert at different moments with no reason written down.
 | 2026-11-12 | The gate of 0.8.1 against this version, by the lead | the released 0.8.1 as installed (the SHA-256 of the file tagged for it) and this version's script from a frozen copy: `gate` on every saved run folder of the project that uses the probe, 967 folders, Android and the iOS Simulator | the same exit status and text in 951; in 16 only notes differ; no verdict differs. Five of the 16 carry the reworded set-aside note. Eleven carry the new note for a link whose alert was not confirmed: every saved link run on the iOS Simulator. In the certified runs among them the requests the link causes were counted, so there the link had opened without the system asking, and that project will see the note on every such run |
 | 2026-11-12 | Live, by the lead, from a frozen copy of this version | the signed-out half of the consuming project's gate on an Android 14 emulator (seven scenarios, blocking, one of them a focused-field scenario whose rests carry a frames allowance) and on the iOS Simulator (five scenarios) | 7 of 7 and 5 of 5 pass, and nothing was set aside on Android 14. No run was made on Android 11 for this version: the rule is checked there on the saved captures above. The capture code is unchanged by this version: the diff of `ui_probe.py` is the version, a comment in the rehearsal, and the gate's analysis and notes |
 
+### Validation, 0.9.0
+
+**What the author of this version ran, on macOS (Python 3, ffmpeg 7.0.1), on 2026-11-12: single test
+files, planted faults in scratch copies, and the repository's coupling check. No device, emulator,
+simulator, phone or network.** The author did not run the whole suite, did not run anything live and
+never saw a real phone's film: every film and frame in the tests is synthetic, made by the tests
+(arrays, or lossless PNG streams written with ffmpeg as earlier tests do).
+
+The first form of `film` failed on a real capture. It dropped frames bit-identical to the one before,
+masked a fixed point of at most 4 pixels in a 3-pixel box, and left out key frames found by a period
+of spread changes. The lead ran it on one phone capture (H.264, 60 a second, 1206 x 2622, 113 s) and
+it counted every frame of both rests as a change (1,560 of 1,560 and 186 of 186): no two frames of
+that capture are bit-identical, about ten pixels in two places flicker in most frames (more than 4),
+and no period was found. The author's synthetic films had been made with exactly the properties that
+form assumed, so its tests proved nothing about a capture. The lead measured the capture (the
+numbers in the README's "A film no run made"); the rule was rebuilt on them, on connected groups,
+and both mechanisms were removed.
+
+A review of the rebuilt rule found that it compared a frame only with the one before, so a change
+that moves less than the minimum or the level each frame passed however far it went (a fade of 4
+levels a frame, a skeleton pulse, bars that grow 3 or 8 px a frame, an underline that slides). Each
+frame is now also compared with the frame 0.5 s earlier and each window's last frame with its first,
+under the same rule. The same review found that pixels outside a run's block groups went into one
+box, so scattered noise failed a rest that changed only inside its region, and that a refused
+re-analysis of a film run removed its stored result; both are fixed. A second reading found two ways
+an allowance still hid a slow change: a slow group that only touched a counted change (within a
+block) was taken for it, so a label fading or a bar growing beside an allowed ticking digit passed;
+and the ends failed only when no frame counted, so a large area fading 0.25 level a frame beside an
+allowed caret passed. A slow group is now a counted change seen again only when its box lies inside
+the union of the counted boxes (each widened by a block) and the window's regions, and the ends fail
+whenever their difference is not covered by that union. Inside one widened box alone was tried
+first: a growing bar's ends (the union of its segments) and a counted change merged with a digit
+inside its region then failed, so the union was used. A third reading showed the box rule itself was
+weak: four allowed counters 40 x 40 px, 30 px apart, with a label in each gap fading 1 level a frame,
+passed, since every gap lay inside the widened boxes. The rule now works on pixels: per pixel the
+last frame it was part of a change counted between neighbours; a slow group's pixels within 3 px of
+one counted in the last half second, or in a region, are explained, and what is left is grouped
+again. Writing the slow changes counted into that memory too was tried first: a fade counted once
+then explained itself for the next half second and the window's ends, and the label beside an
+allowed digit passed again, so only changes counted between neighbours explain a slow group (the
+ends are explained by both). Every test that passed before passes unchanged.
+
+What the films are made of now: 1080 x 2400 at 60 frames a second; every frame changes 20 pixels by
+one level; two places of five pixels flicker by 50 levels every frame; every 30th frame is a key frame
+that makes two consecutive changed pairs, each with about 0.03 % of the picture over the level in
+groups of up to 40 px placed anywhere, so that groups of one pattern, of neighbouring frames and of
+frames 30 apart may touch. Over 400 frames of the still film (13 key frames) the largest group was
+40 px between neighbours, 40 px 30 frames apart and 40 px between frames 12 and 95: no two groups
+touched with these seeds, so the margin between 40 and 78 px is not tested against touching noise.
+Each test adds what it needs: a caret of 6 x 60 px blinking in and out of step with the key frames, a
+digit changing once, a 6 x 6 px dot, a 12 x 12 px dot beside a flickering place, a whole-picture
+change of 5 and of 15 levels every other frame, a 100 x 100 px change of 15 levels every other frame,
+a 60 px group once, a change in the top bar only, a digit each second inside a region and a change
+across its edge; the review's slow probes (the whole picture darkening 4 levels a frame, a pulse of
+30 levels over 60 frames that returns, a bar 1 px high growing 3 px a frame, one 3 px high growing
+8 px a frame, a 2 px underline sliding 4 px a frame); a fade of 0.3 levels a frame seen only between
+a window's ends; and groups of exactly 78 px and of 77 px, between neighbours and fading in at 2
+levels a frame.
+
+| Date | What | Against | Result |
+|---|---|---|---|
+| 2026-11-12 | New tests, one file at a time | `python3 -B -m unittest <file>` in `plugins/ui-probe/tests`: `test_regions_090` (watched rests and their 10,000 ms floor, region allowances in the scenario check, the block map, the placing of changes including glyph-sized pieces and scattered pixels beside a solid one, the gate on Android and the iOS Simulator, the Android analysis placing frames at full resolution through a stand-in decoder), `test_film_090` (connected groups; the film's rule on the synthetic capture; the slow comparisons and the window's ends; a slow change beside an allowed change (a label fading and a bar growing beside a ticking digit, a fade beside a blinking caret, adjacent windows) and the ticking digit alone; four allowed counters with labels fading in their gaps; a slow group on the counted pixels and 4 px beside them, and `explain_px`; a slow change inside a region; groups at the minimum and one pixel under it; a refused re-analysis keeping `run.json` byte for byte; regions and a watched window on a film; windows past the end; the header's count; `frames-full`; `--no-pictures` (no file in the folder an image or a video by extension or by its first bytes, the same gate verdict as with pictures, `zoom` and `sheet` refused) and the film read from its path and checked; the windows file; the verb with `gate`, `summary`, `zoom` and `sheet`; `sheet --full --distinct` on a simulator run and on Android windows; the decoder's count; a real lossless film end to end) | 41 and 59 tests, each file `OK` |
+| 2026-11-12 | Existing tests, one file at a time | `test_ui_video`, `test_analysis`, `test_gate`, `test_scenario_and_parsers`, `test_simulator_040`, `test_store_050`, `test_steps_020`, `test_docs`, `test_fixes_082`, `test_rehearsal_060`, `test_input_050`, `test_review_050`, `test_profiles_030`, `test_presence_and_loss`, `test_other_layer_081`, `test_borders_070`, `test_run_and_cli`, `test_url_080`, `test_compare_summary_cli` | each file `OK`. One existing test changed: `test_fixes_082`'s docs test no longer pins the plugin's version (0.8.2); `test_film_090` pins 0.9.0, as 0.8.2 moved the pin from `test_other_layer_081` |
+| 2026-11-12 | That the tests can fail | 48 faults, one at a time, each in its own copy of the plugin, then the one test named in the table below; every named test passes on the unchanged code (33 tests, run together) | all 48 turned their test red. A first run of four of them was void: their test failed on the unchanged code (a wrong expected count); after the test was corrected they were run again and turned it red |
+| 2026-11-12 | Coupling | `scripts/check-coupling.sh ui-probe` at the repository root | passes |
+| 2026-11-13 | The whole suite, by the lead | `python3 -B -m unittest discover -s plugins/ui-probe/tests`, from an archive of the reviewed commit, on macOS and in a Linux container (Python 3.12, ffmpeg 7.1, a user that is not root) | 954 tests, `OK` on both; nothing skipped in Linux, where ffmpeg was installed so that the films made with a real encoder are decoded too |
+| 2026-11-13 | The gate of 0.8.2 against this version, by the lead | the released 0.8.2 as installed and this version's script from the same archive: `gate` on every saved run folder of the project that uses the probe, 1,007 folders, Android and the iOS Simulator | the same exit status and text in all 1,007: a run that uses none of the new keys is judged as before |
+| 2026-11-12 | One real phone capture, by the lead | an iPhone's screen recorded through a Mac, H.264, 1206 x 2622, 60 a second, 113 s; three windows: 26 s and 3 s of a screen at rest, and 3.4 s holding two swipes | the first form of this version (identical frames dropped, a fixed point masked, a key-frame period) counted every frame of all three windows as a change: no two frames of the capture are identical. The final form, run with `--no-pictures` (the folder held `capture.json` and `run.json` only): the two rests 0 of 1,560 and 0 of 186 frames changed, the swipes 198 of 202 and their ends differ, so the rests pass and the swipes fail. Largest scattered groups at rest: 57, 67 and 38 px (neighbours, 0.5 s apart, ends) against a minimum of 95 px |
+| 2026-11-13 | Independent review | a reviewer that did not write the code, default-refute, over five rounds on synthetic films with a stand-in decoder and, in the last, films encoded with libx264 | every finding was fixed and the case that showed it became a test that fails without the fix: a faint change every other frame taken for the recording, a region swallowing a thin change, a window past the film's end, a 1 ms watch minimum, slow changes under the minimum a frame, and allowed changes excusing a slow change beside them or in the gaps between them. Left as stated limits: an allowance is a budget for the whole step; a change made of pieces each under the minimum; a heavily compressed film |
+
+| Fault planted | Test that turned red |
+|---|---|
+| the film's minimum group 1 px | `test_a_rest_holds_no_change` |
+| 8-connected groups joined along rows and columns only | `test_groups_join_along_rows_and_diagonals` |
+| any pixel over the level a change, no group minimum (the first form's behaviour on a real capture) | `test_a_rest_holds_no_change` |
+| a film's level 4 instead of 10 | `test_a_faint_change_of_the_whole_picture` |
+| `frames-full` holding every frame of a window | `test_frames_full_holds_the_changes_and_the_ends_only` |
+| a header frame count that differs not reported | `test_a_header_that_differs_from_the_decoded_count_is_reported` |
+| a window past the film's end not refused | `test_a_window_past_the_films_end_is_refused` |
+| no caution near the minimum | `test_a_scattered_group_near_the_minimum_earns_a_caution` |
+| no steady places reported | `test_a_rest_holds_no_change` |
+| a watch minimum of 1 ms accepted | `test_bad_values` |
+| no gate note for a watch minimum below 70,000 ms | `test_a_low_watch_minimum_is_named_by_the_gate` |
+| a film's system bars ignored | `test_system_bands_only` |
+| a film's scattered groups placed as changes | `test_a_countdown_inside_and_a_change_across_its_edge` |
+| `sheet --full`: no refusal when fewer frames are extracted | `test_refused_when_fewer_frames_are_extracted` |
+| `sheet`: no refusal when the recording's count differs from the analysis | `test_refused_when_the_recordings_count_differs_from_the_analysis` |
+| `sheet --distinct` sheets of every frame | `test_full_and_distinct` |
+| a watched minimum of 60 s | `test_a_watched_rest_of_69_s_is_refused_and_70_s_is_not` |
+| a scenario's `watch_min_ms` ignored | `test_a_scenario_may_set_its_own_minimum` |
+| a change that crosses a region's edge counted inside it | `test_crossing_an_edge_counts_against_the_rest` |
+| a region's reason not required | `test_each_region_needs_its_reason_and_limit` |
+| Android changes inside a region still counted against the rest | `test_changes_inside_the_region_pass` |
+| a region report made for other regions accepted | `test_a_report_for_other_regions_fails` |
+| a block of 24 px whatever the width | `test_a_block_is_24_of_1080_of_the_width` |
+| the Android app's area from fixed rows instead of the run's insets | `test_inside_crossing_and_bars` |
+| a simulator frame inside the regions still counted as a recorded frame | `test_frames_inside_the_region_leave_both_rest_counts` |
+| `--no-pictures` still writing the sheets | `test_no_picture_and_the_same_verdict` |
+| `--no-pictures` still copying the film into the folder | `test_no_picture_and_the_same_verdict` |
+| `zoom` not refused on a run made without pictures | `test_no_picture_and_the_same_verdict` |
+| the film read from its path without checking its size and SHA-256 | `test_the_film_is_read_from_its_path_and_checked` |
+| no comparison with the frame 0.5 s earlier | `test_the_whole_picture_darkening_4_levels_a_frame` |
+| the ends failing only when no frame counted | `test_a_fade_beside_an_allowed_caret_fails_between_the_ends` |
+| explained within a block of a counted pixel, not within 3 px | `test_four_allowed_counters_with_labels_fading_in_the_gaps` |
+| `explain_px` ignored | `test_the_same_group_4_px_beside_is_not` |
+| a slow change explaining the later slow groups | `test_a_label_fading_beside_the_allowed_digit` |
+| the ends not explained by the slow changes counted | `test_the_whole_picture_darkening_4_levels_a_frame` |
+| the regions excusing nothing | `test_a_slow_change_inside_a_region_is_excused` |
+| the ends not explained by the pixels counted | `test_a_ticking_allowed_digit_alone_passes` |
+| a slow group explained by a change counted at any time in the window | `test_a_slow_group_on_the_counted_pixels_within_half_a_second_is_explained` |
+| `sheet --full`: no refusal when fewer frames are extracted | `test_refused_when_fewer_frames_are_extracted` |
+| `sheet`: no refusal when the recording's count differs from the analysis | `test_refused_when_the_recordings_count_differs_from_the_analysis` |
+| `sheet --distinct` sheets of every frame | `test_full_and_distinct` |
+| a watched minimum of 60 s | `test_a_watched_rest_of_69_s_is_refused_and_70_s_is_not` |
+| a scenario's `watch_min_ms` ignored | `test_a_scenario_may_set_its_own_minimum` |
+| a change that crosses a region's edge counted inside it | `test_crossing_an_edge_counts_against_the_rest` |
+| a region's reason not required | `test_each_region_needs_its_reason_and_limit` |
+| Android changes inside a region still counted against the rest | `test_changes_inside_the_region_pass` |
+| a region report made for other regions accepted | `test_a_report_for_other_regions_fails` |
+| a block of 24 px whatever the width | `test_a_block_is_24_of_1080_of_the_width` |
+| the Android app's area from fixed rows instead of the run's insets | `test_inside_crossing_and_bars` |
+| a simulator frame inside the regions still counted as a recorded frame | `test_frames_inside_the_region_leave_both_rest_counts` |
+| `--no-pictures` still writing the sheets | `test_no_picture_and_the_same_verdict` |
+| `--no-pictures` still copying the film into the folder | `test_no_picture_and_the_same_verdict` |
+| `zoom` not refused on a run made without pictures | `test_no_picture_and_the_same_verdict` |
+| the film read from its path without checking its size and SHA-256 | `test_the_film_is_read_from_its_path_and_checked` |
+| no comparison with the frame 0.5 s earlier | `test_the_whole_picture_darkening_4_levels_a_frame` |
+| a slow group explained by touching a counted change, not by lying inside it (a label) | `test_a_label_fading_beside_the_allowed_digit` |
+| the same (a bar) | `test_a_bar_growing_beside_the_allowed_digit` |
+| the ends failing only when no frame counted | `test_a_fade_beside_an_allowed_caret_fails_between_the_ends` |
+| the ends not explained by the changes the window counted | `test_a_ticking_allowed_digit_alone_passes` |
+| inside one widened box only, not the union of the boxes and the regions | `test_a_countdown_inside_and_a_change_across_its_edge` |
+| `>` for `>=` between neighbours | `test_between_neighbours` |
+| `>` for `>=` in the slow comparison (on the largest group) | `test_in_the_slow_comparisons` |
+| `slow_min_group` ignored | `test_the_slow_settings` |
+| `slow_frames` ignored | `test_the_slow_settings` |
+| the pixels outside a run's block groups one box again | `test_scattered_pixels_beside_a_solid_change_are_left_out` |
+| glyph-sized pieces outside a run's block groups left out | `test_glyphs_beside_a_solid_change_get_boxes_of_their_own` |
+| the film checked only after `run.json` is removed | `test_the_film_is_read_from_its_path_and_checked` |
+| the slow comparisons not reported in the notes | `test_a_rest_holds_no_change` |
+| no caution in the slow comparison | `test_a_scattered_group_near_the_minimum_earns_a_caution` |
+| no caution between the window's ends | `test_a_scattered_group_near_the_minimum_earns_a_caution` |
+
+Faults of earlier rounds that no longer apply to the changed code (the box rules, the per-window
+clearing of the boxes, `>` on the slow boxes) were dropped; the rows above are faults on this code.
+The per-window clearing had no observable effect: a window's slow comparison starts only once its
+frame half a second earlier lies in the window, and the pixel rule takes only changes counted from
+the window's first frame on.
+
+Time and memory, measured on the synthetic capture at 1206 x 2622 with the stand-in decoder (240
+frames, 222 judged, `--no-pictures`): 66 ms of analysis a frame, the two decodes by ffmpeg not
+included; a peak of 290 MB above the process before the analysis.
+
+Not established by this version's author: the rule on a real phone's capture (the lead's rows),
+another encoder or bit rate, the region check on a real recording, `sheet --full` on a long real
+recording.
+
 ## Pinned external tool (optional)
 
 `scripts/install-trace-processor.sh` installs the Perfetto trace processor **v59.1** from

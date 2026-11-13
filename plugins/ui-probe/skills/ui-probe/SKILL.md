@@ -148,7 +148,26 @@ alone during a run: it cannot tell clients apart.
    then `[identical]` when the frame changed nothing visible or `[bars only]` when only the system
    bars changed. Describe what you see in order; do not infer it from the numbers.
 3. A change too small for a thumbnail: `ui-probe zoom <run> <a> <b>` and read the image.
+   To read a window frame by frame, `ui-probe sheet <run> --full --distinct` writes every frame of
+   each step at full resolution (`frames-full/<step>/`) and sheets of only the frames that changed
+   the app's area (`sheets/<step>-distinct-NN.png`, 24 to a page, labelled with the time since the
+   step's start). It refuses when the recording's frame count and the analysis disagree.
 4. `ui-probe summary <dir>` for the spread across runs before saying anything about time.
+
+A screen that changes in one place by design (a countdown) gets `allow.regions` on its rest, each
+region with its own limit and reason; a change outside it, or across its edge, still fails the rest,
+and a region over its limit fails `rest-region`. A rest watched for a change made rarely is marked
+`"watch": true` and lasts at least 70 s.
+
+A film of a phone that no run made (another machine filmed the screen) is read with `ui-probe film
+<video> --windows <windows.json> --out <dir>`: give it the untouched stretches as windows (`id`,
+`start_s`, `end_s`, and `insets_px` for the system bars), then gate, summarise and zoom the folder
+it writes as a run. A frame counts as a change only where a connected group of changed pixels
+reaches the minimum (78 px at 1080 x 2400), between neighbours, against the frame half a second
+earlier or between a window's ends; smaller, scattered changes are the recording's. Its
+`left out:` lines give the largest scattered group beside the minimum and any caution: read them
+before trusting a pass. A change smaller than the minimum is not seen. It checks only the picture.
+A film that shows private content is read with `--no-pictures`: the folder then holds only numbers.
 
 What the at-rest checks mean when they fail:
 
